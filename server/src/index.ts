@@ -4,6 +4,9 @@ import session from '@fastify/session';
 import { config } from './config.js';
 import { pool } from './db/pool.js';
 import { authRoutes } from './routes/auth.js';
+import { accountRoutes } from './routes/accounts.js';
+import { connectionRoutes } from './routes/connections.js';
+import { webhookRoutes } from './routes/webhooks.js';
 
 export function buildApp() {
   const app = Fastify({ logger: true });
@@ -27,6 +30,11 @@ export function buildApp() {
   });
 
   app.register(authRoutes);
+  app.register(accountRoutes);
+  app.register(connectionRoutes);
+  // Webhooks are encapsulated in their own plugin so the raw-body content-type
+  // parser (needed for HMAC) doesn't affect the JSON routes above.
+  app.register(webhookRoutes);
 
   return app;
 }

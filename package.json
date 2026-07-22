@@ -11,14 +11,17 @@
     "start": "node dist/server/src/index.js",
     "build": "tsc -p tsconfig.json",
     "migrate": "tsx server/src/db/migrate.ts",
-    "seed": "tsx scripts/seed.ts"
+    "seed": "tsx scripts/seed.ts",
+    "worker": "tsx server/src/queue/workers.ts"
   },
   "dependencies": {
     "@fastify/cookie": "^9.4.0",
     "@fastify/session": "^10.9.0",
     "bcryptjs": "^2.4.3",
+    "bullmq": "^5.12.0",
     "dotenv": "^16.4.5",
     "fastify": "^4.28.1",
+    "ioredis": "^5.4.1",
     "pg": "^8.12.0"
   },
   "devDependencies": {

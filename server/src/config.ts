@@ -16,4 +16,15 @@ export const config = {
   port: Number(process.env.PORT ?? 3000),
   nodeEnv: process.env.NODE_ENV ?? 'development',
   isProd: (process.env.NODE_ENV ?? 'development') === 'production',
+  // Shopify. The webhook shared secret (app API secret) is used to verify
+  // incoming webhook HMACs. Optional in dev until a real app is connected.
+  shopifyApiSecret: process.env.SHOPIFY_API_SECRET ?? '',
+  shopifyApiVersion: process.env.SHOPIFY_API_VERSION ?? '2024-10',
+  // Shopify custom app installed on the store. The client_credentials grant
+  // (client_id + client_secret → short-lived Admin API access token, ~24h) is
+  // exchanged at connect time; see sync/shopify/token.ts. Empty in dev until a
+  // real app is configured.
+  shopifyShopDomain: process.env.SHOPIFY_SHOP_DOMAIN ?? '',
+  shopifyClientId: process.env.SHOPIFY_CLIENT_ID ?? '',
+  shopifyClientSecret: process.env.SHOPIFY_CLIENT_SECRET ?? '',
 };
