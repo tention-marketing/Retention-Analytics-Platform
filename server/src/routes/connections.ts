@@ -2,10 +2,13 @@ import type { FastifyInstance } from 'fastify';
 import { config } from '../config.js';
 import { query } from '../db/pool.js';
 import { requireAuth } from './auth.js';
-import { upsertShopifyAppConnection } from '../db/connections.js';
+import { upsertShopifyAppConnection, upsertRechargeConnection } from '../db/connections.js';
 import { verifyShopifyConnection } from '../sync/shopify/client.js';
-import { enqueueBackfill } from '../queue/queues.js';
+import { verifyRechargeConnection } from '../sync/recharge/client.js';
+import { enqueueBackfill, enqueueRechargeBackfill } from '../queue/queues.js';
 import { runShopifyBackfill } from '../sync/shopify/backfill.js';
+import { runRechargeBackfill } from '../sync/recharge/backfill.js';
+import { getRechargeIdentityStats } from '../identity/graph.js';
 
 // Store a Shopify connection and kick off sync. This is the plumbing behind
 // onboarding step 1 (§5); the wizard UI itself is Phase 5.
@@ -73,5 +76,54 @@ export async function connectionRoutes(app: FastifyInstance): Promise<void> {
         connected: true, shop, queued: false, note: 'stored; enqueue failed (is Redis up?)',
       });
     }
+  });
+
+  // Onboarding step 3 (§5): connect Recharge. The token comes from the request
+  // body or falls back to RECHARGE_API_TOKEN in env.
+  app.post('/connections/recharge', async (req, reply) => {
+    const { accountId, token: tokenArg, mode } = (req.body ?? {}) as {
+      accountId?: unknown; token?: unknown; mode?: unknown;
+    };
+    if (typeof accountId !== 'number') {
+      return reply.code(400).send({ error: 'accountId (number) required' });
+    }
+    const token = (typeof tokenArg === 'string' && tokenArg.trim()) || config.rechargeApiToken;
+    if (!token) {
+      return reply.code(400).send({ error: 'token required (body or RECHARGE_API_TOKEN)' });
+    }
+
+    const acct = await query('SELECT id FROM accounts WHERE id = $1', [accountId]);
+    if (acct.rowCount === 0) return reply.code(404).send({ error: 'account not found' });
+
+    let store;
+    try {
+      store = await verifyRechargeConnection({ token });
+    } catch (err) {
+      return reply.code(502).send({ connected: false, error: `Recharge verification failed: ${(err as Error).message}` });
+    }
+
+    await upsertRechargeConnection(accountId, token);
+
+    if (mode === 'sync') {
+      const result = await runRechargeBackfill(accountId);
+      return reply.code(200).send({ connected: true, store, backfill: result });
+    }
+    try {
+      await enqueueRechargeBackfill(accountId);
+      return reply.code(202).send({ connected: true, store, queued: true });
+    } catch (err) {
+      return reply.code(200).send({
+        connected: true, store, queued: false, note: 'stored; enqueue failed (is Redis up?)',
+      });
+    }
+  });
+
+  // Surface the identity-graph unmatched rate (§4.4: flag when >5%).
+  app.get('/connections/recharge/identity-status', async (req, reply) => {
+    const accountId = Number((req.query as { accountId?: string }).accountId);
+    if (!Number.isFinite(accountId)) {
+      return reply.code(400).send({ error: 'accountId query param required' });
+    }
+    return getRechargeIdentityStats(accountId);
   });
 }

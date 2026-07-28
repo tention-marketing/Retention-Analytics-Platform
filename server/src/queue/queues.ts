@@ -15,6 +15,8 @@ export const QUEUE_NAMES = {
   shopifyWebhook: 'shopify:webhook',
   shopifyInventory: 'shopify:inventory',
   shopifyReconcile: 'shopify:reconcile',
+  rechargeBackfill: 'recharge:backfill',
+  rechargePoll: 'recharge:poll',
 } as const;
 
 const defaultJobOpts = {
@@ -29,9 +31,17 @@ let _backfill: Queue | undefined;
 let _webhook: Queue<WebhookJob> | undefined;
 let _inventory: Queue | undefined;
 let _reconcile: Queue | undefined;
+let _rechargeBackfill: Queue | undefined;
+let _rechargePoll: Queue | undefined;
 
 export function backfillQueue(): Queue {
   return (_backfill ??= new Queue(QUEUE_NAMES.shopifyBackfill, { connection: redis, defaultJobOptions: defaultJobOpts }));
+}
+export function rechargeBackfillQueue(): Queue {
+  return (_rechargeBackfill ??= new Queue(QUEUE_NAMES.rechargeBackfill, { connection: redis, defaultJobOptions: defaultJobOpts }));
+}
+export function rechargePollQueue(): Queue {
+  return (_rechargePoll ??= new Queue(QUEUE_NAMES.rechargePoll, { connection: redis, defaultJobOptions: defaultJobOpts }));
 }
 export function webhookQueue(): Queue<WebhookJob> {
   return (_webhook ??= new Queue<WebhookJob>(QUEUE_NAMES.shopifyWebhook, { connection: redis, defaultJobOptions: defaultJobOpts }));
@@ -45,6 +55,10 @@ export function reconcileQueue(): Queue {
 
 export async function enqueueBackfill(accountId: number): Promise<void> {
   await backfillQueue().add('backfill', { accountId }, { jobId: `backfill:${accountId}` });
+}
+
+export async function enqueueRechargeBackfill(accountId: number): Promise<void> {
+  await rechargeBackfillQueue().add('backfill', { accountId }, { jobId: `recharge-backfill:${accountId}` });
 }
 
 export async function enqueueWebhook(job: WebhookJob): Promise<void> {

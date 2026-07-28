@@ -27,4 +27,9 @@ export const config = {
   shopifyShopDomain: process.env.SHOPIFY_SHOP_DOMAIN ?? '',
   shopifyClientId: process.env.SHOPIFY_CLIENT_ID ?? '',
   shopifyClientSecret: process.env.SHOPIFY_CLIENT_SECRET ?? '',
+  // Recharge. A single Admin API access token (per store). Stored encrypted per
+  // connection; this env value is the default the connect route reads. Empty in
+  // dev until a real store is connected.
+  rechargeApiToken: process.env.RECHARGE_API_TOKEN ?? '',
+  rechargeApiVersion: process.env.RECHARGE_API_VERSION ?? '2021-11',
 };

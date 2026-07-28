@@ -1,10 +1,12 @@
 import { Worker } from 'bullmq';
-import { redis, QUEUE_NAMES, inventoryQueue, reconcileQueue } from './queues.js';
+import { redis, QUEUE_NAMES, inventoryQueue, reconcileQueue, rechargePollQueue } from './queues.js';
 import { runShopifyBackfill } from '../sync/shopify/backfill.js';
 import { runShopifyReconcile } from '../sync/shopify/reconcile.js';
 import { getShopifyConnection } from '../db/connections.js';
 import { snapshotInventory } from '../sync/shopify/inventory.js';
 import { processShopifyWebhook, type WebhookJob } from '../sync/shopify/webhookWorker.js';
+import { runRechargeBackfill } from '../sync/recharge/backfill.js';
+import { runRechargePoll } from '../sync/recharge/poller.js';
 import { logSyncError } from '../sync/errors.js';
 import { query } from '../db/pool.js';
 
@@ -19,14 +21,20 @@ async function scheduleRepeatables(): Promise<void> {
     'reconcile-tick', {},
     { repeat: { pattern: '0 3 * * *' }, jobId: 'reconcile-nightly' }, // 03:00 nightly
   );
+  await rechargePollQueue().add(
+    'recharge-poll-tick', {},
+    { repeat: { pattern: '0 4 * * *' }, jobId: 'recharge-poll-daily' }, // 04:00 daily
+  );
 }
 
-async function connectedShopifyAccountIds(): Promise<number[]> {
+async function connectedAccountIds(provider: 'shopify' | 'recharge'): Promise<number[]> {
   const { rows } = await query<{ account_id: number }>(
-    `SELECT account_id FROM connections WHERE provider = 'shopify' AND status = 'connected'`,
+    `SELECT account_id FROM connections WHERE provider = $1 AND status = 'connected'`,
+    [provider],
   );
   return rows.map((r) => r.account_id);
 }
+const connectedShopifyAccountIds = () => connectedAccountIds('shopify');
 
 export function startWorkers(): Worker[] {
   const workers: Worker[] = [];
@@ -67,6 +75,26 @@ export function startWorkers(): Worker[] {
       async () => {
         for (const accountId of await connectedShopifyAccountIds()) {
           await runShopifyReconcile(accountId).catch((e) => logSyncError(accountId, 'shopify.reconcile', e));
+        }
+      },
+      { connection: redis, concurrency: 1 },
+    ),
+  );
+
+  workers.push(
+    new Worker(
+      QUEUE_NAMES.rechargeBackfill,
+      async (job) => runRechargeBackfill(job.data.accountId),
+      { connection: redis, concurrency: 1 },
+    ),
+  );
+
+  workers.push(
+    new Worker(
+      QUEUE_NAMES.rechargePoll,
+      async () => {
+        for (const accountId of await connectedAccountIds('recharge')) {
+          await runRechargePoll(accountId).catch((e) => logSyncError(accountId, 'recharge.poll', e));
         }
       },
       { connection: redis, concurrency: 1 },

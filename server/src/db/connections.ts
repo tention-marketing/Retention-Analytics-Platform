@@ -1,6 +1,7 @@
 import { query } from './pool.js';
 import { encrypt, decrypt } from '../crypto.js';
 import type { ShopifyConnection } from '../sync/shopify/client.js';
+import type { RechargeConnection } from '../sync/recharge/client.js';
 
 interface ConnRow {
   account_id: number;
@@ -68,6 +69,29 @@ export async function getShopifyConnection(accountId: number): Promise<ShopifyCo
     return { shopDomain: rows[0].shop_domain, token: creds.token };
   }
   return null;
+}
+
+// Recharge: a single Admin API token, stored encrypted. shop_domain is unused
+// for this provider (kept null).
+export async function upsertRechargeConnection(accountId: number, token: string): Promise<void> {
+  const enc = encrypt(JSON.stringify({ token }));
+  await query(
+    `INSERT INTO connections (account_id, provider, credentials_encrypted, status)
+     VALUES ($1, 'recharge', $2, 'connected')
+     ON CONFLICT (account_id, provider)
+     DO UPDATE SET credentials_encrypted = EXCLUDED.credentials_encrypted, status = 'connected'`,
+    [accountId, enc],
+  );
+}
+
+export async function getRechargeConnection(accountId: number): Promise<RechargeConnection | null> {
+  const { rows } = await query<ConnRow>(
+    `SELECT * FROM connections WHERE account_id = $1 AND provider = 'recharge'`,
+    [accountId],
+  );
+  if (rows.length === 0) return null;
+  const { token } = JSON.parse(decrypt(rows[0].credentials_encrypted)) as { token: string };
+  return { token };
 }
 
 export async function getAccountIdByShopDomain(shopDomain: string): Promise<number | null> {
