@@ -1,5 +1,5 @@
 import { Worker } from 'bullmq';
-import { redis, QUEUE_NAMES, inventoryQueue, reconcileQueue, rechargePollQueue } from './queues.js';
+import { redis, QUEUE_NAMES, inventoryQueue, reconcileQueue, rechargePollQueue, klaviyoPollQueue } from './queues.js';
 import { runShopifyBackfill } from '../sync/shopify/backfill.js';
 import { runShopifyReconcile } from '../sync/shopify/reconcile.js';
 import { getShopifyConnection } from '../db/connections.js';
@@ -7,6 +7,7 @@ import { snapshotInventory } from '../sync/shopify/inventory.js';
 import { processShopifyWebhook, type WebhookJob } from '../sync/shopify/webhookWorker.js';
 import { runRechargeBackfill } from '../sync/recharge/backfill.js';
 import { runRechargePoll } from '../sync/recharge/poller.js';
+import { runKlaviyoPoll } from '../sync/klaviyo/poller.js';
 import { logSyncError } from '../sync/errors.js';
 import { query } from '../db/pool.js';
 
@@ -25,9 +26,15 @@ async function scheduleRepeatables(): Promise<void> {
     'recharge-poll-tick', {},
     { repeat: { pattern: '0 4 * * *' }, jobId: 'recharge-poll-daily' }, // 04:00 daily
   );
+  // Klaviyo every 6h (§4.2) at 00/06/12/18 UTC. Pinned to UTC so the poller's
+  // once-daily identity-scan gate (hour < 6) lines up with exactly one tick.
+  await klaviyoPollQueue().add(
+    'klaviyo-poll-tick', {},
+    { repeat: { pattern: '0 */6 * * *', tz: 'UTC' }, jobId: 'klaviyo-poll-6h' },
+  );
 }
 
-async function connectedAccountIds(provider: 'shopify' | 'recharge'): Promise<number[]> {
+async function connectedAccountIds(provider: 'shopify' | 'recharge' | 'klaviyo'): Promise<number[]> {
   const { rows } = await query<{ account_id: number }>(
     `SELECT account_id FROM connections WHERE provider = $1 AND status = 'connected'`,
     [provider],
@@ -98,6 +105,24 @@ export function startWorkers(): Worker[] {
         }
       },
       { connection: redis, concurrency: 1 },
+    ),
+  );
+
+  // One queue serves both the 6h repeating tick (no accountId → fan out over all
+  // connected accounts) and a connect-time backfill job for a single account.
+  workers.push(
+    new Worker(
+      QUEUE_NAMES.klaviyoPoll,
+      async (job) => {
+        const single = job.data?.accountId;
+        if (typeof single === 'number') {
+          return runKlaviyoPoll(single, { forceIdentity: job.data?.forceIdentity === true });
+        }
+        for (const accountId of await connectedAccountIds('klaviyo')) {
+          await runKlaviyoPoll(accountId).catch((e) => logSyncError(accountId, 'klaviyo.poll', e));
+        }
+      },
+      { connection: redis, concurrency: 1 }, // report endpoints are 1/s — never parallel
     ),
   );
 

@@ -2,6 +2,7 @@ import { query } from './pool.js';
 import { encrypt, decrypt } from '../crypto.js';
 import type { ShopifyConnection } from '../sync/shopify/client.js';
 import type { RechargeConnection } from '../sync/recharge/client.js';
+import type { KlaviyoConnection } from '../sync/klaviyo/client.js';
 
 interface ConnRow {
   account_id: number;
@@ -92,6 +93,30 @@ export async function getRechargeConnection(accountId: number): Promise<Recharge
   if (rows.length === 0) return null;
   const { token } = JSON.parse(decrypt(rows[0].credentials_encrypted)) as { token: string };
   return { token };
+}
+
+// Klaviyo: a single private API key, stored encrypted. shop_domain is unused for
+// this provider (kept null). Same shape as Recharge — the connections table's
+// provider CHECK already permits 'klaviyo', so no migration is involved.
+export async function upsertKlaviyoConnection(accountId: number, apiKey: string): Promise<void> {
+  const enc = encrypt(JSON.stringify({ apiKey }));
+  await query(
+    `INSERT INTO connections (account_id, provider, credentials_encrypted, status)
+     VALUES ($1, 'klaviyo', $2, 'connected')
+     ON CONFLICT (account_id, provider)
+     DO UPDATE SET credentials_encrypted = EXCLUDED.credentials_encrypted, status = 'connected'`,
+    [accountId, enc],
+  );
+}
+
+export async function getKlaviyoConnection(accountId: number): Promise<KlaviyoConnection | null> {
+  const { rows } = await query<ConnRow>(
+    `SELECT * FROM connections WHERE account_id = $1 AND provider = 'klaviyo'`,
+    [accountId],
+  );
+  if (rows.length === 0) return null;
+  const { apiKey } = JSON.parse(decrypt(rows[0].credentials_encrypted)) as { apiKey: string };
+  return { apiKey };
 }
 
 export async function getAccountIdByShopDomain(shopDomain: string): Promise<number | null> {

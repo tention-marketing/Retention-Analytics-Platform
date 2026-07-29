@@ -2,13 +2,18 @@ import type { FastifyInstance } from 'fastify';
 import { config } from '../config.js';
 import { query } from '../db/pool.js';
 import { requireAuth } from './auth.js';
-import { upsertShopifyAppConnection, upsertRechargeConnection } from '../db/connections.js';
+import {
+  upsertShopifyAppConnection, upsertRechargeConnection,
+  upsertKlaviyoConnection, getKlaviyoConnection,
+} from '../db/connections.js';
 import { verifyShopifyConnection } from '../sync/shopify/client.js';
 import { verifyRechargeConnection } from '../sync/recharge/client.js';
-import { enqueueBackfill, enqueueRechargeBackfill } from '../queue/queues.js';
+import { verifyKlaviyoConnection } from '../sync/klaviyo/client.js';
+import { enqueueBackfill, enqueueRechargeBackfill, enqueueKlaviyoBackfill } from '../queue/queues.js';
 import { runShopifyBackfill } from '../sync/shopify/backfill.js';
 import { runRechargeBackfill } from '../sync/recharge/backfill.js';
-import { getRechargeIdentityStats } from '../identity/graph.js';
+import { runKlaviyoBackfill } from '../sync/klaviyo/poller.js';
+import { getRechargeIdentityStats, measureKlaviyoIdentityMatch } from '../identity/graph.js';
 
 // Store a Shopify connection and kick off sync. This is the plumbing behind
 // onboarding step 1 (§5); the wizard UI itself is Phase 5.
@@ -125,5 +130,70 @@ export async function connectionRoutes(app: FastifyInstance): Promise<void> {
       return reply.code(400).send({ error: 'accountId query param required' });
     }
     return getRechargeIdentityStats(accountId);
+  });
+
+  // Onboarding step 2 (§5): connect Klaviyo. The private key comes from the
+  // request body or falls back to KLAVIYO_API_KEY in env. The key is never echoed
+  // back in any response.
+  app.post('/connections/klaviyo', async (req, reply) => {
+    const { accountId, apiKey: apiKeyArg, mode } = (req.body ?? {}) as {
+      accountId?: unknown; apiKey?: unknown; mode?: unknown;
+    };
+    if (typeof accountId !== 'number') {
+      return reply.code(400).send({ error: 'accountId (number) required' });
+    }
+    const apiKey = (typeof apiKeyArg === 'string' && apiKeyArg.trim()) || config.klaviyoApiKey;
+    if (!apiKey) {
+      return reply.code(400).send({ error: 'apiKey required (body or KLAVIYO_API_KEY)' });
+    }
+
+    const acct = await query('SELECT id FROM accounts WHERE id = $1', [accountId]);
+    if (acct.rowCount === 0) return reply.code(404).send({ error: 'account not found' });
+
+    let account;
+    try {
+      account = await verifyKlaviyoConnection({ apiKey });
+    } catch (err) {
+      // client.ts redacts anything key-shaped from the message before this point.
+      return reply.code(502).send({
+        connected: false,
+        error: `Klaviyo verification failed: ${(err as Error).message}`,
+      });
+    }
+
+    await upsertKlaviyoConnection(accountId, apiKey);
+
+    if (mode === 'sync') {
+      const result = await runKlaviyoBackfill(accountId);
+      return reply.code(200).send({ connected: true, account, backfill: result });
+    }
+    try {
+      await enqueueKlaviyoBackfill(accountId);
+      return reply.code(202).send({ connected: true, account, queued: true });
+    } catch (err) {
+      return reply.code(200).send({
+        connected: true, account, queued: false, note: 'stored; enqueue failed (is Redis up?)',
+      });
+    }
+  });
+
+  // Klaviyo profile↔email match rate (§4.4). Nothing is persisted for Klaviyo, so
+  // this is an on-demand bounded scan: `partial: true` means the page budget ran
+  // out and the rate covers only the profiles scanned.
+  app.get('/connections/klaviyo/identity-status', async (req, reply) => {
+    const q = req.query as { accountId?: string; pageBudget?: string };
+    const accountId = Number(q.accountId);
+    if (!Number.isFinite(accountId)) {
+      return reply.code(400).send({ error: 'accountId query param required' });
+    }
+    const conn = await getKlaviyoConnection(accountId);
+    if (!conn) return reply.code(404).send({ error: 'no klaviyo connection for account' });
+
+    const budget = Number(q.pageBudget);
+    return measureKlaviyoIdentityMatch(
+      accountId,
+      conn,
+      Number.isFinite(budget) && budget > 0 ? budget : undefined,
+    );
   });
 }

@@ -32,4 +32,28 @@ export const config = {
   // dev until a real store is connected.
   rechargeApiToken: process.env.RECHARGE_API_TOKEN ?? '',
   rechargeApiVersion: process.env.RECHARGE_API_VERSION ?? '2021-11',
+  // Klaviyo. A single private API key (pk_…), stored encrypted per connection;
+  // this env value is the default the connect route reads. Empty in dev.
+  //
+  // Revision 2026-07-15 is the newest STABLE revision (not a `.pre` beta) and is
+  // supported by every endpoint Phase 4 touches — accounts, campaigns, flows,
+  // metrics, profiles, campaign-values-reports, flow-values-reports. Its only
+  // breaking change versus earlier revisions is the Conversations API (profile
+  // conversations became plural), which this phase does not use.
+  klaviyoApiKey: process.env.KLAVIYO_API_KEY ?? '',
+  klaviyoApiRevision: process.env.KLAVIYO_API_REVISION ?? '2026-07-15',
+  // Conversion metric for report `conversions`/`conversion_value`. Left blank,
+  // the poller auto-discovers Shopify's "Placed Order" and refuses to guess when
+  // the match is ambiguous (§0.2 spirit: never invent an input to a metric).
+  klaviyoConversionMetricId: process.env.KLAVIYO_CONVERSION_METRIC_ID ?? '',
+  // Reporting API hard limit is a 1-year window, so stats cover 12 months.
+  //
+  // `last_365_days`, NOT `last_12_months`: verified against the live API on
+  // 2026-07-29, `last_12_months` means the 12 COMPLETE calendar months and
+  // excludes the current one, so every campaign sent this month came back with no
+  // stats at all (0 of 57 July sends). A trailing window includes them.
+  klaviyoReportTimeframe: process.env.KLAVIYO_REPORT_TIMEFRAME ?? 'last_365_days',
+  // Page budget for the identity-graph profile scan (100 profiles/page). A scan
+  // that hits the budget is reported as partial rather than as a real rate.
+  klaviyoProfilePageBudget: Number(process.env.KLAVIYO_PROFILE_PAGE_BUDGET ?? 50),
 };

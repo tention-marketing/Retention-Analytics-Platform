@@ -17,6 +17,7 @@ export const QUEUE_NAMES = {
   shopifyReconcile: 'shopify:reconcile',
   rechargeBackfill: 'recharge:backfill',
   rechargePoll: 'recharge:poll',
+  klaviyoPoll: 'klaviyo:poll',
 } as const;
 
 const defaultJobOpts = {
@@ -33,6 +34,7 @@ let _inventory: Queue | undefined;
 let _reconcile: Queue | undefined;
 let _rechargeBackfill: Queue | undefined;
 let _rechargePoll: Queue | undefined;
+let _klaviyoPoll: Queue | undefined;
 
 export function backfillQueue(): Queue {
   return (_backfill ??= new Queue(QUEUE_NAMES.shopifyBackfill, { connection: redis, defaultJobOptions: defaultJobOpts }));
@@ -42,6 +44,9 @@ export function rechargeBackfillQueue(): Queue {
 }
 export function rechargePollQueue(): Queue {
   return (_rechargePoll ??= new Queue(QUEUE_NAMES.rechargePoll, { connection: redis, defaultJobOptions: defaultJobOpts }));
+}
+export function klaviyoPollQueue(): Queue {
+  return (_klaviyoPoll ??= new Queue(QUEUE_NAMES.klaviyoPoll, { connection: redis, defaultJobOptions: defaultJobOpts }));
 }
 export function webhookQueue(): Queue<WebhookJob> {
   return (_webhook ??= new Queue<WebhookJob>(QUEUE_NAMES.shopifyWebhook, { connection: redis, defaultJobOptions: defaultJobOpts }));
@@ -59,6 +64,10 @@ export async function enqueueBackfill(accountId: number): Promise<void> {
 
 export async function enqueueRechargeBackfill(accountId: number): Promise<void> {
   await rechargeBackfillQueue().add('backfill', { accountId }, { jobId: `recharge-backfill:${accountId}` });
+}
+
+export async function enqueueKlaviyoBackfill(accountId: number): Promise<void> {
+  await klaviyoPollQueue().add('backfill', { accountId, forceIdentity: true }, { jobId: `klaviyo-backfill:${accountId}` });
 }
 
 export async function enqueueWebhook(job: WebhookJob): Promise<void> {

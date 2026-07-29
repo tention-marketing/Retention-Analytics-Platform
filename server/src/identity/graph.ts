@@ -1,7 +1,10 @@
 import { query } from '../db/pool.js';
+import { config } from '../config.js';
+import { fetchAllPages, type KlaviyoConnection } from '../sync/klaviyo/client.js';
 
 /**
- * Identity graph (§4.4) — Shopify customer ↔ Recharge subscription.
+ * Identity graph (§4.4) — Shopify customer ↔ Recharge subscription
+ *                       + Shopify customer ↔ Klaviyo profile (by email).
  *
  * A subscription's Shopify customer id is resolved in two passes:
  *   1. DIRECT — Recharge's own external_customer_id.ecommerce, written at
@@ -14,8 +17,8 @@ import { query } from '../db/pool.js';
  * The unmatched rate is measured every run and surfaced (returned + logged;
  * >5% is flagged) — the churn annotations live or die on this linkage.
  *
- * Klaviyo profile ↔ email is the same idea and slots in at Phase 4; not built
- * here.
+ * KLAVIYO (Phase 4) is the same idea in MEASURE-ONLY form — see
+ * measureKlaviyoIdentityMatch below for why nothing is persisted.
  */
 
 export interface IdentityMatchStats {
@@ -86,6 +89,112 @@ export async function linkRechargeIdentities(accountId: number): Promise<Identit
     console.log(`[identity] account ${accountId}: unmatched ${unmatched}/${total} (${pct}%)`);
   }
   return stats;
+}
+
+// ---------------------------------------------------------------------------
+// Klaviyo profile ↔ email (§4.4, Phase 4)
+// ---------------------------------------------------------------------------
+
+export interface KlaviyoIdentityStats {
+  provider: 'klaviyo';
+  profilesScanned: number; // distinct usable emails seen
+  profilesWithoutEmail: number; // profiles skipped for having no email
+  matched: number; // scanned emails that exist in customers
+  unmatched: number;
+  unmatchedRate: number; // 0..1
+  overThreshold: boolean; // unmatchedRate > 0.05
+  /** True when the page budget stopped the scan early — NOT a full-list rate. */
+  partial: boolean;
+  pagesFetched: number;
+  pageBudget: number;
+}
+
+/**
+ * Measure how many Klaviyo profiles can be tied to a Shopify customer by email.
+ *
+ * MEASURE-ONLY, and deliberately so: §4.4's requirement for Klaviyo is to "log
+ * unmatched rate; surface it in the UI if >5%", and CLAUDE.md §3 (which says
+ * "migrate exactly this") defines no Klaviyo profile table. So this computes and
+ * returns the rate without persisting profiles — no schema change, and nothing
+ * stored that no V1 dashboard reads.
+ *
+ * Matching uses the SAME normalisation as the Recharge email fallback —
+ * lower(btrim(email)) on both sides (§8 trap 3).
+ *
+ * COST: profiles page at 100/request, so a full scan of a large list is
+ * expensive. It therefore runs at connect time or at most once a day (see
+ * poller.ts), bounded by `pageBudget`. A scan that exhausts its budget is flagged
+ * `partial: true` — a partial scan must never be presented as the real rate.
+ */
+export async function measureKlaviyoIdentityMatch(
+  accountId: number,
+  conn: KlaviyoConnection,
+  pageBudget: number = config.klaviyoProfilePageBudget,
+): Promise<KlaviyoIdentityStats> {
+  const page = await fetchAllPages<any>(
+    conn,
+    '/api/profiles',
+    { 'fields[profile]': 'email', 'page[size]': '100' },
+    pageBudget,
+  );
+
+  const keys = new Set<string>();
+  let profilesWithoutEmail = 0;
+  for (const p of page.items) {
+    const email = p?.attributes?.email;
+    const key = typeof email === 'string' ? email.trim().toLowerCase() : '';
+    if (!key) {
+      profilesWithoutEmail += 1;
+      continue;
+    }
+    keys.add(key);
+  }
+
+  const emailKeys = [...keys];
+  const { rows } = await query<{ matched: number }>(
+    `SELECT count(*)::int AS matched
+       FROM unnest($2::text[]) AS e(email_key)
+      WHERE EXISTS (
+        SELECT 1 FROM customers c
+         WHERE c.account_id = $1
+           AND c.email IS NOT NULL
+           AND lower(btrim(c.email)) = e.email_key
+      )`,
+    [accountId, emailKeys],
+  );
+
+  const profilesScanned = emailKeys.length;
+  const matched = rows[0]?.matched ?? 0;
+  const unmatched = profilesScanned - matched;
+  const unmatchedRate = profilesScanned > 0 ? unmatched / profilesScanned : 0;
+  const overThreshold = unmatchedRate > THRESHOLD;
+
+  const pct = (unmatchedRate * 100).toFixed(1);
+  const suffix = page.truncated
+    ? ` [PARTIAL: page budget ${pageBudget} exhausted, rate covers scanned profiles only]`
+    : '';
+  if (overThreshold) {
+    console.warn(
+      `[identity] account ${accountId}: klaviyo ${unmatched}/${profilesScanned} profiles UNMATCHED (${pct}%) — exceeds 5% threshold; surface in UI${suffix}`,
+    );
+  } else {
+    console.log(
+      `[identity] account ${accountId}: klaviyo unmatched ${unmatched}/${profilesScanned} (${pct}%)${suffix}`,
+    );
+  }
+
+  return {
+    provider: 'klaviyo',
+    profilesScanned,
+    profilesWithoutEmail,
+    matched,
+    unmatched,
+    unmatchedRate,
+    overThreshold,
+    partial: page.truncated,
+    pagesFetched: page.pagesFetched,
+    pageBudget,
+  };
 }
 
 /** Read-only stats for surfacing (route/UI). Does not mutate linkages. */
