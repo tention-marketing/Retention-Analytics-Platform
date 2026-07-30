@@ -47,6 +47,8 @@ const { decrypt } = await import('../src/crypto.js');
 const { buildApp } = await import('../src/index.js');
 const queues = await import('../src/queue/queues.js');
 const { redis } = queues;
+const { config } = await import('../src/config.js');
+const { createHmac } = await import('node:crypto');
 const links = await import('../src/onboarding/links.js');
 const { normalizeShopDomain } = await import('../src/onboarding/domain.js');
 const costs = await import('../src/onboarding/costs.js');
@@ -93,6 +95,27 @@ let ipCounter = 0;
 function nextIp(): string {
   ipCounter++;
   return `10.${Math.floor(ipCounter / 65536) % 256}.${Math.floor(ipCounter / 256) % 256}.${ipCounter % 256}`;
+}
+
+/**
+ * @fastify/rate-limit stores counters in Redis under
+ * `fastify-rate-limit-<METHOD><route>-<key>` with a TTL equal to the window.
+ *
+ * The counters therefore SURVIVE between runs of this script. Without clearing
+ * them, a rate-limit assertion that expects the limit to engage on exactly the
+ * 11th request is non-deterministic whenever the suite is run twice inside the
+ * one-minute window. Clearing the specific IP first makes the assertion mean what
+ * it says.
+ */
+const RATE_LIMIT_KEY_PREFIX = 'fastify-rate-limit-';
+
+async function clearRateLimit(ip: string): Promise<void> {
+  const keys = await redis.keys(`${RATE_LIMIT_KEY_PREFIX}*${ip}`).catch(() => []);
+  if (keys.length) await redis.del(...keys).catch(() => undefined);
+}
+
+async function rateLimitKeysFor(ip: string): Promise<string[]> {
+  return redis.keys(`${RATE_LIMIT_KEY_PREFIX}*${ip}`).catch(() => []);
 }
 
 // ---------------------------------------------------------------------------
@@ -1446,6 +1469,11 @@ async function groupG(app: App, agencyCookie: string): Promise<void> {
 
   // --- rate limiting (E7). Fixed IP so the limiter accumulates. ---
   const rlIp = '203.0.113.77';
+  // Redis counters outlive the process, so clear this IP first or the "engages on
+  // request 11" assertion silently depends on how recently the suite last ran.
+  await clearRateLimit(rlIp);
+  check('rate-limit counter for the test IP starts clean',
+    (await rateLimitKeysFor(rlIp)).length === 0);
   let sawLimit = false;
   let limitedAt = 0;
   for (let i = 1; i <= 14; i++) {
@@ -1458,6 +1486,13 @@ async function groupG(app: App, agencyCookie: string): Promise<void> {
   check('token exchange is rate limited from one IP', sawLimit, { limitedAt });
   check('the limit engages at the configured 10 requests/minute',
     limitedAt === 11, { limitedAt });
+  // Positive proof the limiter is Redis-backed rather than in-process: the counter
+  // is observable in Redis, so the limit holds across API processes.
+  const rlKeys = await rateLimitKeysFor(rlIp);
+  check('the rate-limit counter is stored in Redis, not in process memory',
+    rlKeys.length === 1 && rlKeys[0].startsWith(RATE_LIMIT_KEY_PREFIX), rlKeys);
+  check('the Redis counter has a TTL (the window expires)',
+    (await redis.ttl(rlKeys[0]).catch(() => -2)) > 0);
 
   const otherIp = await app.inject({
     method: 'POST', url: '/onboarding/session', remoteAddress: '198.51.100.5',
@@ -1654,6 +1689,349 @@ async function groupH(app: App, agencyCookie: string): Promise<void> {
 }
 
 // ===========================================================================
+// I. Fastify 5 migration regressions
+// ===========================================================================
+//
+// Added by the Fastify 4 -> 5 upgrade. Every assertion here covers something the
+// A-H suite did NOT already prove, and two of them target the specific advisories
+// the upgrade exists to close:
+//
+//   GHSA-jx2c-rxcm-jvmq  Content-Type tab character allows body-validation bypass
+//   GHSA-444r-cwp2-x5xf  request.protocol / request.host spoofable via X-Forwarded-*
+//
+// Nothing here replaces or weakens an existing check.
+
+/** Parse a Set-Cookie header list into name -> raw directive string. */
+function setCookieList(res: { headers: Record<string, unknown> }): string[] {
+  const raw = res.headers['set-cookie'];
+  return (Array.isArray(raw) ? raw : raw ? [String(raw)] : []).map(String);
+}
+function cookieDirective(res: { headers: Record<string, unknown> }, name: string): string | null {
+  return setCookieList(res).find((c) => c.startsWith(`${name}=`)) ?? null;
+}
+
+/** Forge a CORRECTLY SIGNED onboarding cookie — mirrors onboarding/session.ts. */
+function forgeOnboardingCookie(linkId: number, accountId: number): string {
+  const body = Buffer.from(
+    JSON.stringify({ l: linkId, a: accountId, i: Math.floor(Date.now() / 1000) }),
+    'utf8',
+  ).toString('base64url');
+  const mac = createHmac('sha256', config.sessionSecret).update(body).digest('base64url');
+  return `tention_onb=${body}.${mac}`;
+}
+
+async function groupI(app: App, agencyCookie: string): Promise<void> {
+  group('I', 'Fastify 5 migration regressions');
+
+  const acc = await makeAccount('fastify5');
+  const link = await mintAndExchange(app, agencyCookie, acc);
+
+  // --- session/cookie separation at issue time --------------------------
+  const freshEmail = `verify5a_f5_${Date.now()}@example.com`;
+  const loginRes = await app.inject({
+    method: 'POST', url: '/auth/register', remoteAddress: nextIp(),
+    payload: { email: freshEmail, password: 'verify5a-password' },
+  });
+  const loginCookies = setCookieList(loginRes);
+  check('agency login sets ONLY the agency cookie',
+    loginCookies.some((c) => c.startsWith('tention_sid='))
+    && !loginCookies.some((c) => c.startsWith('tention_onb=')), loginCookies);
+  // A DEDICATED agency session for the logout test below, so destroying it cannot
+  // invalidate the shared session the rest of this group needs.
+  const throwawayAgencyCookie = cookieFrom(loginRes, 'tention_sid')!;
+
+  const minted2 = await app.inject({
+    method: 'POST', url: `/accounts/${acc}/onboarding-links`,
+    headers: { cookie: agencyCookie }, remoteAddress: nextIp(), payload: {},
+  });
+  const token2 = (minted2.json() as { token: string }).token;
+  const exchangeRes = await app.inject({
+    method: 'POST', url: '/onboarding/session', remoteAddress: nextIp(),
+    payload: { token: token2 },   // deliberately NO agency cookie on this request
+  });
+  const exchangeCookies = setCookieList(exchangeRes);
+  check('token exchange sets ONLY the onboarding cookie',
+    exchangeCookies.some((c) => c.startsWith('tention_onb='))
+    && !exchangeCookies.some((c) => c.startsWith('tention_sid=')), exchangeCookies);
+
+  // --- agency logout must not disturb the onboarding session ------------
+  const both = `${throwawayAgencyCookie}; ${link.cookie}`;
+  const agencyLogout = await app.inject({
+    method: 'POST', url: '/auth/logout', headers: { cookie: both }, remoteAddress: nextIp(),
+  });
+  check('the agency logout under test actually destroyed its own session',
+    (await app.inject({
+      method: 'GET', url: '/accounts', headers: { cookie: throwawayAgencyCookie },
+      remoteAddress: nextIp(),
+    })).statusCode === 401);
+  const logoutCookies = setCookieList(agencyLogout);
+  check('agency logout never emits a clearing directive for the onboarding cookie',
+    !logoutCookies.some((c) => /^tention_onb=;/.test(c) || (/^tention_onb=/.test(c) && /Max-Age=0/i.test(c))),
+    logoutCookies);
+  check('the onboarding session still authenticates after an agency logout',
+    (await app.inject({
+      method: 'GET', url: '/onboarding/me', headers: { cookie: link.cookie },
+      remoteAddress: nextIp(),
+    })).statusCode === 200);
+
+  // --- cookie attributes survive the plugin majors ----------------------
+  const onbDirective = cookieDirective(exchangeRes, 'tention_onb')!;
+  const sidDirective = cookieDirective(loginRes, 'tention_sid')!;
+  check('onboarding cookie is HttpOnly', /HttpOnly/i.test(onbDirective), onbDirective);
+  check('agency cookie is HttpOnly', /HttpOnly/i.test(sidDirective), sidDirective);
+  check('onboarding cookie is SameSite=Lax', /SameSite=Lax/i.test(onbDirective), onbDirective);
+  check('agency cookie is SameSite=Lax', /SameSite=Lax/i.test(sidDirective), sidDirective);
+  check('onboarding cookie is Path=/', /Path=\//.test(onbDirective), onbDirective);
+  // Secure is environment-aware: both cookies derive it from config.isProd, so in
+  // this development run it must be ABSENT. A hardcoded Secure would break local
+  // HTTP; a hardcoded non-Secure would leak the cookie in production.
+  check('config.isProd is false in this run (so Secure must be absent)', config.isProd === false);
+  check('onboarding cookie omits Secure in development', !/Secure/i.test(onbDirective), onbDirective);
+  check('agency cookie omits Secure in development', !/Secure/i.test(sidDirective), sidDirective);
+
+  // --- clearCookie under @fastify/cookie v11 ---------------------------
+  // v11 changed clearCookie to set maxAge to zero. The directive must still be a
+  // real clear (empty value + an immediate-expiry signal) and keep Path=/, or the
+  // browser would retain a dead session cookie on a different path.
+  const onbLogout = await app.inject({
+    method: 'POST', url: '/onboarding/logout', headers: { cookie: link.cookie },
+    remoteAddress: nextIp(),
+  });
+  const clearDirective = cookieDirective(onbLogout, 'tention_onb') ?? '';
+  check('clearCookie emits an empty value', /^tention_onb=;/.test(clearDirective), clearDirective);
+  check('clearCookie emits an immediate-expiry signal (Max-Age=0 or past Expires)',
+    /Max-Age=0/i.test(clearDirective) || /Expires=Thu, 01 Jan 1970/i.test(clearDirective),
+    clearDirective);
+  check('clearCookie preserves Path=/ so the cookie is actually removed',
+    /Path=\//.test(clearDirective), clearDirective);
+
+  // --- signed-cookie verification, including a CORRECTLY signed forgery -
+  const live = await mintAndExchange(app, agencyCookie, acc);
+  const otherAcc = await makeAccount('fastify5_other');
+  check('a correctly SIGNED cookie whose account does not match the link is rejected',
+    (await app.inject({
+      method: 'GET', url: '/onboarding/me',
+      headers: { cookie: forgeOnboardingCookie(live.linkId, otherAcc) },
+      remoteAddress: nextIp(),
+    })).statusCode === 401);
+  check('a correctly SIGNED cookie for a nonexistent link is rejected',
+    (await app.inject({
+      method: 'GET', url: '/onboarding/me',
+      headers: { cookie: forgeOnboardingCookie(2_000_000_001, acc) },
+      remoteAddress: nextIp(),
+    })).statusCode === 401);
+  check('a correctly signed, matching cookie still authenticates (signing round-trips)',
+    (await app.inject({
+      method: 'GET', url: '/onboarding/me',
+      headers: { cookie: forgeOnboardingCookie(live.linkId, acc) },
+      remoteAddress: nextIp(),
+    })).statusCode === 200);
+
+  // --- GHSA-jx2c-rxcm-jvmq: Content-Type tab cannot bypass validation ---
+  const victim = await makeAccount('f5_ct_victim');
+  await costs.setOcas(victim, 4321, false);
+  const tabbed = await app.inject({
+    method: 'PUT', url: '/onboarding/ocas',
+    headers: { cookie: live.cookie, 'content-type': 'application/json\t' },
+    remoteAddress: nextIp(),
+    payload: JSON.stringify({ accountId: victim, ocasMonthly: 999 }),
+  });
+  check('tab-suffixed Content-Type does not yield a 2xx or 5xx',
+    tabbed.statusCode >= 400 && tabbed.statusCode < 500, tabbed.statusCode);
+  check('tab-suffixed Content-Type cannot bypass the account-identifier guard',
+    Number((await costs.getAccountCosts(victim)).ocas_monthly) === 4321);
+  const tabbedSemi = await app.inject({
+    method: 'PUT', url: '/onboarding/ocas',
+    headers: { cookie: live.cookie, 'content-type': 'application/json;\tcharset=utf-8' },
+    remoteAddress: nextIp(),
+    payload: JSON.stringify({ accountId: victim, ocasMonthly: 999 }),
+  });
+  check('tab inside Content-Type parameters cannot bypass the guard either',
+    tabbedSemi.statusCode >= 400 && tabbedSemi.statusCode < 500
+    && Number((await costs.getAccountCosts(victim)).ocas_monthly) === 4321,
+    tabbedSemi.statusCode);
+
+  // --- malformed and oversized bodies ----------------------------------
+  const badJson = await app.inject({
+    method: 'POST', url: '/onboarding/session', remoteAddress: nextIp(),
+    headers: { 'content-type': 'application/json' },
+    payload: '{"token": ',
+  });
+  check('malformed JSON returns a safe 400, not a 500', badJson.statusCode === 400, badJson.statusCode);
+  check('the malformed-JSON response leaks no stack trace',
+    !/at \w+ \(|\.ts:\d+|node_modules/.test(JSON.stringify(badJson.json())), badJson.json());
+
+  const oversized = await app.inject({
+    method: 'POST', url: '/onboarding/session', remoteAddress: nextIp(),
+    headers: { 'content-type': 'application/json' },
+    payload: `{"token":"${'x'.repeat(2 * 1024 * 1024)}"}`,
+  });
+  check('an oversized body is rejected by the body limit (413), not a 500',
+    oversized.statusCode === 413, oversized.statusCode);
+
+  // A genuinely unregistered media type must be refused outright.
+  const unsupportedCt = await app.inject({
+    method: 'PUT', url: '/onboarding/ocas',
+    headers: { cookie: live.cookie, 'content-type': 'application/xml' },
+    remoteAddress: nextIp(), payload: '<ocasMonthly>1</ocasMonthly>',
+  });
+  check('an unregistered Content-Type is refused with 415',
+    unsupportedCt.statusCode === 415, unsupportedCt.statusCode);
+
+  // text/plain IS supported (Fastify parses it into a string), so the guarantee
+  // there is different and worth asserting separately: the string body must still
+  // go through full validation rather than being trusted.
+  const plainCt = await app.inject({
+    method: 'PUT', url: '/onboarding/ocas',
+    headers: { cookie: live.cookie, 'content-type': 'text/plain' },
+    remoteAddress: nextIp(), payload: 'ocasMonthly=1',
+  });
+  check('a text/plain body is still fully validated, not trusted',
+    plainCt.statusCode === 400
+    && (plainCt.json() as { error: string }).error === 'not_a_number', plainCt.json());
+  check('the text/plain attempt wrote nothing',
+    (await costs.getAccountCosts(victim)).ocas_monthly === '4321.00'
+    || Number((await costs.getAccountCosts(victim)).ocas_monthly) === 4321);
+
+  // --- GHSA-444r-cwp2-x5xf: forwarded headers are not trusted ----------
+  // Fastify 5 no longer exposes trustProxy on initialConfig at all, so reading it
+  // would prove nothing either way. Assert the two things that DO establish the
+  // property: no source passes the option, and the behaviour is verified below.
+  check('no source file enables trustProxy', await (async () => {
+    const { readFile, readdir } = await import('node:fs/promises');
+    const { join } = await import('node:path');
+    async function walk(dir: string): Promise<string[]> {
+      const out: string[] = [];
+      for (const e of await readdir(dir, { withFileTypes: true })) {
+        const p = join(dir, e.name);
+        if (e.isDirectory()) out.push(...(await walk(p)));
+        else if (e.name.endsWith('.ts')) out.push(p);
+      }
+      return out;
+    }
+    for (const f of await walk(new URL('../src', import.meta.url).pathname)) {
+      if (/trustProxy/.test(await readFile(f, 'utf8'))) return false;
+    }
+    return true;
+  })());
+
+  // Fastify 5 disables semicolon query delimiters by default (RFC 3986). That
+  // matters here: with them enabled, `?x=1;account_id=99` could smuggle a second
+  // parameter past the account-identifier guard.
+  check('useSemicolonDelimiter is disabled (RFC 3986 query parsing)',
+    (app.initialConfig as Record<string, unknown>).useSemicolonDelimiter === false,
+    (app.initialConfig as Record<string, unknown>).useSemicolonDelimiter);
+  check('a semicolon-smuggled account_id is not parsed into a second parameter',
+    (await app.inject({
+      method: 'GET', url: '/onboarding/skus?x=1;account_id=99',
+      headers: { cookie: link.cookie }, remoteAddress: nextIp(),
+    })).statusCode === 200);
+
+  const spoofed = await app.inject({
+    method: 'POST', url: `/accounts/${acc}/onboarding-links`,
+    headers: {
+      cookie: agencyCookie,
+      'x-forwarded-host': 'evil.example.com',
+      'x-forwarded-proto': 'https',
+      host: 'evil.example.com',
+    },
+    remoteAddress: nextIp(), payload: {},
+  });
+  const spoofedUrl = (spoofed.json() as { url: string }).url;
+  check('a minted onboarding link uses APP_BASE_URL, not any forwarded host',
+    spoofedUrl.startsWith(config.appBaseUrl) && !spoofedUrl.includes('evil.example.com'),
+    spoofedUrl);
+  check('APP_BASE_URL is the authoritative source for generated links',
+    config.appBaseUrl === 'http://localhost:5173', config.appBaseUrl);
+  check('no source file builds a URL from a forwarded or request host', await (async () => {
+    const { readFile, readdir } = await import('node:fs/promises');
+    const { join } = await import('node:path');
+    async function walk(dir: string): Promise<string[]> {
+      const out: string[] = [];
+      for (const e of await readdir(dir, { withFileTypes: true })) {
+        const p = join(dir, e.name);
+        if (e.isDirectory()) out.push(...(await walk(p)));
+        else if (e.name.endsWith('.ts')) out.push(p);
+      }
+      return out;
+    }
+    for (const f of await walk(new URL('../src', import.meta.url).pathname)) {
+      const src = await readFile(f, 'utf8');
+      if (/x-forwarded|req\.host|request\.host|req\.hostname|request\.hostname/i.test(src)) return false;
+    }
+    return true;
+  })());
+
+  // With trustProxy off, Fastify must ignore X-Forwarded-* entirely.
+  const { default: Fastify } = await import('fastify');
+  const probe = Fastify({ logger: false });
+  probe.get('/p', async (req) => ({ host: req.host, protocol: req.protocol, hostname: req.hostname }));
+  await probe.ready();
+  const probed = (await probe.inject({
+    method: 'GET', url: '/p',
+    headers: { host: 'real.local', 'x-forwarded-host': 'evil.example.com', 'x-forwarded-proto': 'https' },
+  })).json() as { host: string; protocol: string; hostname: string };
+  check('request.host ignores X-Forwarded-Host when trustProxy is off',
+    probed.host === 'real.local', probed);
+  check('request.protocol ignores X-Forwarded-Proto when trustProxy is off',
+    probed.protocol === 'http', probed);
+  await probe.close();
+
+  // --- routing integrity ------------------------------------------------
+  // Fastify 5 throws FST_ERR_DUPLICATED_ROUTE at registration, so a clean boot is
+  // already evidence. Enumerate explicitly so a future duplicate is named.
+  const routeApp = buildApp();
+  const seen: string[] = [];
+  routeApp.addHook('onRoute', (r) => { seen.push(`${r.method} ${r.url}`); });
+  await routeApp.ready();
+  const flat = seen.flatMap((s) => {
+    const [m, u] = s.split(' ');
+    return m.startsWith('[') ? JSON.parse(m.replace(/'/g, '"')).map((x: string) => `${x} ${u}`) : [s];
+  });
+  const dupes = flat.filter((r, i) => flat.indexOf(r) !== i);
+  check('no duplicate route registration', dupes.length === 0, dupes);
+  check('the full route table registered', flat.length >= 35, flat.length);
+  check('no route accepts a raw token in its path',
+    !flat.some((r) => /:token|\/c\/:/.test(r)), flat.filter((r) => /token/.test(r)));
+  check('the webhook route is registered',
+    flat.some((r) => r.includes('/webhooks/shopify')), flat.filter((r) => r.includes('webhook')));
+  await routeApp.close();
+
+  // The raw-body content-type parser (needed for HMAC) must still work: a bad HMAC
+  // has to reach the handler and be rejected with 401, not blow up in the parser.
+  const badHmac = await app.inject({
+    method: 'POST', url: '/webhooks/shopify', remoteAddress: nextIp(),
+    headers: {
+      'content-type': 'application/json',
+      'x-shopify-hmac-sha256': 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=',
+      'x-shopify-topic': 'orders/create',
+      'x-shopify-shop-domain': 'nobody.myshopify.com',
+    },
+    payload: JSON.stringify({ id: 1 }),
+  });
+  check('webhook raw-body parser still runs and a bad HMAC yields 401',
+    badHmac.statusCode === 401, badHmac.statusCode);
+
+  // --- rate-limit response hygiene -------------------------------------
+  const rlIp = '203.0.113.99';
+  await clearRateLimit(rlIp);
+  let limited: { statusCode: number; body: string } | null = null;
+  for (let i = 1; i <= 14; i++) {
+    const res = await app.inject({
+      method: 'POST', url: '/onboarding/session', remoteAddress: rlIp,
+      payload: { token: token2 },
+    });
+    if (res.statusCode === 429) { limited = { statusCode: 429, body: res.body }; break; }
+  }
+  check('a 429 is reachable on the token-exchange route', limited !== null);
+  check('the 429 body contains no onboarding token',
+    limited !== null && !limited.body.includes(token2), limited?.body);
+  check('the 429 body contains no workspace name or account id',
+    limited !== null && !limited.body.includes('__verify5a') && !limited.body.includes(String(acc)),
+    limited?.body);
+}
+
+// ===========================================================================
 // Main
 // ===========================================================================
 async function main(): Promise<void> {
@@ -1674,6 +2052,7 @@ async function main(): Promise<void> {
     await groupF(app, agencyCookie);
     await groupG(app, agencyCookie);
     await groupH(app, agencyCookie);
+    await groupI(app, agencyCookie);
   } finally {
     console.log('\nCleanup');
     await cleanupAccounts();
@@ -1693,6 +2072,12 @@ async function main(): Promise<void> {
         await redis.del(`bull:${queueName}:${k}`).catch(() => undefined);
       }
     }
+    // Rate-limit counters this run created. They carry a TTL and would expire on
+    // their own, but leaving them behind means Redis is not returned to the state
+    // the run found it in.
+    const rlKeys = await redis.keys(`${RATE_LIMIT_KEY_PREFIX}*`).catch(() => []);
+    if (rlKeys.length) await redis.del(...rlKeys).catch(() => undefined);
+    console.log(`  cleared ${rlKeys.length} rate-limit counters`);
     console.log(`  cleaned ${createdAccounts.length} throwaway accounts`);
     await app.close();
   }
@@ -1703,6 +2088,7 @@ async function main(): Promise<void> {
     A: 'Pure unit', B: 'Provider fixtures', C: 'Database integration',
     D: 'Session isolation', E: 'Cross-tenant', F: 'Credential fallback',
     G: 'Link states + rate limit', H: 'Later connection',
+    I: 'Fastify 5 regressions',
   };
   for (const [letter, t] of Object.entries(groupTotals)) {
     const mark = t.fail === 0 ? '✓' : '✗';
