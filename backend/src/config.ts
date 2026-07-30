@@ -16,6 +16,10 @@ export const config = {
   port: Number(process.env.PORT ?? 3000),
   nodeEnv: process.env.NODE_ENV ?? 'development',
   isProd: (process.env.NODE_ENV ?? 'development') === 'production',
+  // Base URL the client-facing onboarding link is built from. The token is placed
+  // in the URL FRAGMENT (`/onboarding#token=…`), which browsers never transmit,
+  // so it cannot reach server access logs, proxy logs, or a referer header.
+  appBaseUrl: (process.env.APP_BASE_URL ?? 'http://localhost:5173').replace(/\/+$/, ''),
   // Shopify. The webhook shared secret (app API secret) is used to verify
   // incoming webhook HMACs. Optional in dev until a real app is connected.
   shopifyApiSecret: process.env.SHOPIFY_API_SECRET ?? '',

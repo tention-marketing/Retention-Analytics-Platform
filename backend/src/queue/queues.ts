@@ -10,14 +10,28 @@ export const redis = new IORedis(config.redisUrl, {
   lazyConnect: true,
 });
 
+// HYPHENS, NOT COLONS.
+//
+// BullMQ 5 rejects a queue name containing ':' (QueueBase throws "Queue name
+// cannot contain :"), because it builds its Redis keys as `bull:<name>:<...>` and
+// a colon in the name would make those keys ambiguous. The original names were
+// colon-separated, so EVERY `new Queue(...)` threw on construction and every
+// enqueue*() call failed — silently, because the callers treated the throw as
+// "Redis is unavailable" and carried on with `queued: false`. Phases 2-4 never
+// noticed: their verification runs backfills inline via `mode: 'sync'`, which
+// bypasses the queues entirely.
+//
+// Renaming is safe: Redis held no `bull:*` keys, so there were no jobs or
+// repeatables under the old names to orphan (there could not be — the
+// constructor never succeeded).
 export const QUEUE_NAMES = {
-  shopifyBackfill: 'shopify:backfill',
-  shopifyWebhook: 'shopify:webhook',
-  shopifyInventory: 'shopify:inventory',
-  shopifyReconcile: 'shopify:reconcile',
-  rechargeBackfill: 'recharge:backfill',
-  rechargePoll: 'recharge:poll',
-  klaviyoPoll: 'klaviyo:poll',
+  shopifyBackfill: 'shopify-backfill',
+  shopifyWebhook: 'shopify-webhook',
+  shopifyInventory: 'shopify-inventory',
+  shopifyReconcile: 'shopify-reconcile',
+  rechargeBackfill: 'recharge-backfill',
+  rechargePoll: 'recharge-poll',
+  klaviyoPoll: 'klaviyo-poll',
 } as const;
 
 const defaultJobOpts = {
@@ -58,16 +72,26 @@ export function reconcileQueue(): Queue {
   return (_reconcile ??= new Queue(QUEUE_NAMES.shopifyReconcile, { connection: redis, defaultJobOptions: defaultJobOpts }));
 }
 
+// Job ids are hyphenated for the same reason as the queue names above: BullMQ
+// rejects a custom id containing ':' ("Custom Id cannot contain :"). Exported so
+// onboarding/progress.ts looks a job up by exactly the id that created it —
+// duplicating the format in two places is how progress silently reports "no job".
+export const backfillJobId = (accountId: number) => `backfill-${accountId}`;
+export const rechargeBackfillJobId = (accountId: number) => `recharge-backfill-${accountId}`;
+export const klaviyoBackfillJobId = (accountId: number) => `klaviyo-backfill-${accountId}`;
+
 export async function enqueueBackfill(accountId: number): Promise<void> {
-  await backfillQueue().add('backfill', { accountId }, { jobId: `backfill:${accountId}` });
+  await backfillQueue().add('backfill', { accountId }, { jobId: backfillJobId(accountId) });
 }
 
 export async function enqueueRechargeBackfill(accountId: number): Promise<void> {
-  await rechargeBackfillQueue().add('backfill', { accountId }, { jobId: `recharge-backfill:${accountId}` });
+  await rechargeBackfillQueue().add('backfill', { accountId }, { jobId: rechargeBackfillJobId(accountId) });
 }
 
 export async function enqueueKlaviyoBackfill(accountId: number): Promise<void> {
-  await klaviyoPollQueue().add('backfill', { accountId, forceIdentity: true }, { jobId: `klaviyo-backfill:${accountId}` });
+  await klaviyoPollQueue().add(
+    'backfill', { accountId, forceIdentity: true }, { jobId: klaviyoBackfillJobId(accountId) },
+  );
 }
 
 export async function enqueueWebhook(job: WebhookJob): Promise<void> {

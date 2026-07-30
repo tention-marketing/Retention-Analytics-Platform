@@ -65,6 +65,12 @@ export async function shopifyGraphQL<T = any>(
 export interface ShopInfo {
   name: string;
   myshopifyDomain: string;
+  // Phase 5 (E6). currencyCode is the authoritative source for the account
+  // currency — V1 never guesses one. ianaTimezone populates
+  // accounts.store_timezone, which trap #4's churn day-math depends on; before
+  // this, every store silently kept the America/Los_Angeles column default.
+  currencyCode?: string;
+  ianaTimezone?: string;
 }
 
 // Cheap round-trip that proves the token works and the app has read scope.
@@ -72,7 +78,7 @@ export interface ShopInfo {
 export async function verifyShopifyConnection(conn: ShopifyConnection): Promise<ShopInfo> {
   const data = await shopifyGraphQL<{ shop: ShopInfo }>(
     conn,
-    `query { shop { name myshopifyDomain } }`,
+    `query { shop { name myshopifyDomain currencyCode ianaTimezone } }`,
   );
   return data.shop;
 }

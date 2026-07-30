@@ -1,0 +1,41 @@
+{
+  "name": "@tention-pulse/backend",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "start": "node dist/src/index.js",
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "migrate": "tsx src/db/migrate.ts",
+    "seed": "tsx scripts/seed.ts",
+    "worker": "tsx src/queue/workers.ts",
+    "verify:recharge": "tsx scripts/verify-recharge.ts",
+    "verify:klaviyo": "tsx scripts/verify-klaviyo.ts",
+    "verify:identity": "tsx scripts/verify-identity-scale.ts",
+    "verify:klaviyo-live": "tsx scripts/verify-klaviyo-live.ts",
+    "verify:onboarding": "tsx scripts/verify-onboarding.ts"
+  },
+  "dependencies": {
+    "@fastify/cookie": "^9.4.0",
+    "@fastify/rate-limit": "^9.1.0",
+    "@fastify/session": "^10.9.0",
+    "bcryptjs": "^2.4.3",
+    "bullmq": "^5.12.0",
+    "dotenv": "^16.4.5",
+    "fastify": "^4.28.1",
+    "ioredis": "^5.4.1",
+    "pg": "^8.12.0"
+  },
+  "devDependencies": {
+    "@types/bcryptjs": "^2.4.6",
+    "@types/node": "^22.5.0",
+    "@types/pg": "^8.11.6",
+    "tsx": "^4.19.0",
+    "typescript": "^5.5.4"
+  }
+}

@@ -33,18 +33,18 @@ process.env.KLAVIYO_REPORT_TIMEFRAME = 'last_365_days'; // production default
 process.env.KLAVIYO_CONVERSION_METRIC_ID = '';
 process.env.KLAVIYO_PROFILE_PAGE_BUDGET = '50';
 
-const { pool, query } = await import('../server/src/db/pool.js');
+const { pool, query } = await import('../src/db/pool.js');
 const {
   transformCampaign, transformFlow, rollUpReport, toStatsRow, withRecipients,
   pickConversionMetric, AmbiguousConversionMetricError,
   V1_CHANNELS, REPORT_STATISTICS,
-} = await import('../server/src/sync/klaviyo/transform.js');
+} = await import('../src/sync/klaviyo/transform.js');
 const {
   fetchAllPages, fetchReport, verifyKlaviyoConnection, redactKey,
-} = await import('../server/src/sync/klaviyo/client.js');
-const { syncKlaviyo } = await import('../server/src/sync/klaviyo/poller.js');
-const { upsertKlaviyoConnection } = await import('../server/src/db/connections.js');
-const { config } = await import('../server/src/config.js');
+} = await import('../src/sync/klaviyo/client.js');
+const { syncKlaviyo } = await import('../src/sync/klaviyo/poller.js');
+const { upsertKlaviyoConnection } = await import('../src/db/connections.js');
+const { config } = await import('../src/config.js');
 
 const FAKE_KEY = 'pk_fixture0000000000000000000000000000';
 
@@ -481,7 +481,7 @@ async function endToEndChecks() {
       statsAfter.rowCount === 1 && statsAfter.rows[0].opens === 4800, statsAfter.rows);
 
     // --- partial identity scan flagging ----------------------------------
-    const { measureKlaviyoIdentityMatch } = await import('../server/src/identity/graph.js');
+    const { measureKlaviyoIdentityMatch } = await import('../src/identity/graph.js');
     (globalThis as any).fetch = async () => fakeResponse({
       data: [{ id: 'p', attributes: { email: 'alice@example.com' } }],
       links: { next: 'https://a.klaviyo.com/api/profiles?page[cursor]=MORE' },

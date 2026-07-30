@@ -11,7 +11,7 @@
  */
 import bcrypt from 'bcryptjs';
 import type { PoolClient } from 'pg';
-import { pool, withTransaction } from '../server/src/db/pool.js';
+import { pool, withTransaction } from '../src/db/pool.js';
 
 // ---- deterministic RNG (mulberry32) --------------------------------------
 function makeRng(seed: number): () => number {

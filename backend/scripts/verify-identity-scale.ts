@@ -5,8 +5,8 @@
  *
  * Run: `npx tsx scripts/verify-identity-scale.ts`
  */
-import { pool, query } from '../server/src/db/pool.js';
-import { linkRechargeIdentities, getRechargeIdentityStats } from '../server/src/identity/graph.js';
+import { pool, query } from '../src/db/pool.js';
+import { linkRechargeIdentities, getRechargeIdentityStats } from '../src/identity/graph.js';
 
 async function main() {
   const acc = await query<{ account_id: number; n: string }>(

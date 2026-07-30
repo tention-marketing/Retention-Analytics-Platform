@@ -10,13 +10,13 @@
  *
  * Run: `npx tsx scripts/verify-recharge.ts`
  */
-import { pool, query } from '../server/src/db/pool.js';
+import { pool, query } from '../src/db/pool.js';
 import {
   derivePlanType, transformCustomer, transformSubscription,
   subscriptionLifecycleEvents, chargeEvents, orderEvents,
-} from '../server/src/sync/recharge/transform.js';
-import { runRechargeBackfill } from '../server/src/sync/recharge/backfill.js';
-import { getRechargeIdentityStats } from '../server/src/identity/graph.js';
+} from '../src/sync/recharge/transform.js';
+import { runRechargeBackfill } from '../src/sync/recharge/backfill.js';
+import { getRechargeIdentityStats } from '../src/identity/graph.js';
 
 let failures = 0;
 function check(name: string, cond: boolean, detail?: unknown) {

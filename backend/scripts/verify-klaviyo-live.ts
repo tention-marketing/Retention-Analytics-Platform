@@ -67,14 +67,14 @@ import { readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { pool, query } from '../server/src/db/pool.js';
-import { config } from '../server/src/config.js';
+import { pool, query } from '../src/db/pool.js';
+import { config } from '../src/config.js';
 import {
   fetchAllPages, verifyKlaviyoConnection, redactKey, type KlaviyoConnection,
-} from '../server/src/sync/klaviyo/client.js';
-import { runKlaviyoBackfill } from '../server/src/sync/klaviyo/poller.js';
-import { V1_CHANNELS } from '../server/src/sync/klaviyo/transform.js';
-import { upsertKlaviyoConnection } from '../server/src/db/connections.js';
+} from '../src/sync/klaviyo/client.js';
+import { runKlaviyoBackfill } from '../src/sync/klaviyo/poller.js';
+import { V1_CHANNELS } from '../src/sync/klaviyo/transform.js';
+import { upsertKlaviyoConnection } from '../src/db/connections.js';
 
 const ENV_PATH = resolve(dirname(fileURLToPath(import.meta.url)), '..', '.env');
 const RECONCILE_COUNT = 3;

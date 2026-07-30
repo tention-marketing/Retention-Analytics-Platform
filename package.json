@@ -6,29 +6,20 @@
   "engines": {
     "node": ">=20"
   },
+  "workspaces": [
+    "backend"
+  ],
   "scripts": {
-    "dev": "tsx watch server/src/index.ts",
-    "start": "node dist/server/src/index.js",
-    "build": "tsc -p tsconfig.json",
-    "migrate": "tsx server/src/db/migrate.ts",
-    "seed": "tsx scripts/seed.ts",
-    "worker": "tsx server/src/queue/workers.ts"
-  },
-  "dependencies": {
-    "@fastify/cookie": "^9.4.0",
-    "@fastify/session": "^10.9.0",
-    "bcryptjs": "^2.4.3",
-    "bullmq": "^5.12.0",
-    "dotenv": "^16.4.5",
-    "fastify": "^4.28.1",
-    "ioredis": "^5.4.1",
-    "pg": "^8.12.0"
-  },
-  "devDependencies": {
-    "@types/bcryptjs": "^2.4.6",
-    "@types/node": "^22.5.0",
-    "@types/pg": "^8.11.6",
-    "tsx": "^4.19.0",
-    "typescript": "^5.5.4"
+    "dev": "npm run dev -w @tention-pulse/backend",
+    "start": "npm run start -w @tention-pulse/backend",
+    "build": "npm run build -w @tention-pulse/backend",
+    "typecheck": "npm run typecheck -w @tention-pulse/backend",
+    "migrate": "npm run migrate -w @tention-pulse/backend",
+    "seed": "npm run seed -w @tention-pulse/backend",
+    "worker": "npm run worker -w @tention-pulse/backend",
+    "verify:recharge": "npm run verify:recharge -w @tention-pulse/backend",
+    "verify:klaviyo": "npm run verify:klaviyo -w @tention-pulse/backend",
+    "verify:identity": "npm run verify:identity -w @tention-pulse/backend",
+    "verify:onboarding": "npm run verify:onboarding -w @tention-pulse/backend"
   }
 }

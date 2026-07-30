@@ -1,11 +1,11 @@
 // Full connection path against a live DB: create/find an account, persist the
 // Shopify app connection (encrypted), read it back, verify, and backfill.
 // Run: `npx tsx scripts/connect-shopify-db.ts`
-import { config } from '../server/src/config.js';
-import { pool, query } from '../server/src/db/pool.js';
-import { upsertShopifyAppConnection, getShopifyConnection } from '../server/src/db/connections.js';
-import { verifyShopifyConnection } from '../server/src/sync/shopify/client.js';
-import { runShopifyBackfill } from '../server/src/sync/shopify/backfill.js';
+import { config } from '../src/config.js';
+import { pool, query } from '../src/db/pool.js';
+import { upsertShopifyAppConnection, getShopifyConnection } from '../src/db/connections.js';
+import { verifyShopifyConnection } from '../src/sync/shopify/client.js';
+import { runShopifyBackfill } from '../src/sync/shopify/backfill.js';
 
 async function main() {
   const shopDomain = config.shopifyShopDomain;

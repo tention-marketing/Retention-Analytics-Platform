@@ -1,9 +1,9 @@
 // Standalone Shopify connection check — exercises the client_credentials token
 // exchange and an authenticated Admin GraphQL call against the configured store,
 // WITHOUT needing Postgres/Redis. Run: `npx tsx scripts/connect-shopify.ts`.
-import { config } from '../server/src/config.js';
-import { getAccessToken } from '../server/src/sync/shopify/token.js';
-import { verifyShopifyConnection, type ShopifyConnection } from '../server/src/sync/shopify/client.js';
+import { config } from '../src/config.js';
+import { getAccessToken } from '../src/sync/shopify/token.js';
+import { verifyShopifyConnection, type ShopifyConnection } from '../src/sync/shopify/client.js';
 
 async function main() {
   const { shopifyShopDomain: shopDomain, shopifyClientId: clientId, shopifyClientSecret: clientSecret } = config;
