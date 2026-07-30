@@ -18,7 +18,8 @@
     "verify:klaviyo": "tsx scripts/verify-klaviyo.ts",
     "verify:identity": "tsx scripts/verify-identity-scale.ts",
     "verify:klaviyo-live": "tsx scripts/verify-klaviyo-live.ts",
-    "verify:onboarding": "tsx scripts/verify-onboarding.ts"
+    "verify:onboarding": "tsx scripts/verify-onboarding.ts",
+    "verify:shutdown": "tsx scripts/verify-shutdown.ts"
   },
   "dependencies": {
     "@fastify/cookie": "^11.1.2",

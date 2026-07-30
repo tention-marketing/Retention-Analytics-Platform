@@ -12,6 +12,7 @@ import { webhookRoutes } from './routes/webhooks.js';
 import { agencyOnboardingRoutes } from './routes/agencyOnboarding.js';
 import { onboardingRoutes } from './routes/onboarding.js';
 import { registerOnboardingSessionSupport } from './onboarding/session.js';
+import { installGracefulShutdown, closeRedis } from './shutdown.js';
 
 export function buildApp() {
   const app = Fastify({ logger: true });
@@ -73,6 +74,19 @@ export function buildApp() {
 
 async function start(): Promise<void> {
   const app = buildApp();
+
+  // Graceful shutdown. Order matters: close the HTTP server first so it stops
+  // accepting connections and drains in-flight requests, and only then tear down
+  // the Postgres pool and Redis connection those handlers were using.
+  installGracefulShutdown(
+    [
+      { name: 'http server', close: () => app.close() },
+      { name: 'postgres pool', close: () => pool.end() },
+      { name: 'redis', close: () => closeRedis(redis) },
+    ],
+    { log: (msg, err) => (err ? app.log.error({ err }, msg) : app.log.info(msg)) },
+  );
+
   try {
     await app.listen({ port: config.port, host: '0.0.0.0' });
   } catch (err) {

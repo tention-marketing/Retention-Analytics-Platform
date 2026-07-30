@@ -10,6 +10,7 @@ import { runRechargePoll } from '../sync/recharge/poller.js';
 import { runKlaviyoPoll } from '../sync/klaviyo/poller.js';
 import { logSyncError } from '../sync/errors.js';
 import { query } from '../db/pool.js';
+import { installGracefulShutdown, closeRedis } from '../shutdown.js';
 
 // Daily inventory snapshot + nightly 48h reconcile as repeatable jobs, fanned
 // out to one child job per connected Shopify account.
@@ -140,12 +141,15 @@ if (import.meta.url === `file://${process.argv[1]}`) {
     await scheduleRepeatables();
     const workers = startWorkers();
     console.log(`Workers started: ${workers.map((w) => w.name).join(', ')}`);
-    const shutdown = async () => {
-      await Promise.all(workers.map((w) => w.close()));
-      await redis.quit();
-      process.exit(0);
-    };
-    process.on('SIGINT', shutdown);
-    process.on('SIGTERM', shutdown);
+    // Same graceful-shutdown contract as the API server: re-entry guarded, closers
+    // run in order, hard timeout, and the process exits by its own process.exit so
+    // an orchestrator sees (code 0, signal null) rather than a signal kill.
+    //
+    // Workers close first — each waits for its active job to finish — and only
+    // then the shared Redis connection those workers depend on.
+    installGracefulShutdown([
+      { name: `${workers.length} worker(s)`, close: () => Promise.all(workers.map((w) => w.close())) },
+      { name: 'redis', close: () => closeRedis(redis) },
+    ]);
   })();
 }
