@@ -31,11 +31,35 @@ replaces the PostCSS pipeline, and design tokens live in an `@theme` block in
 [`src/styles/index.css`](src/styles/index.css). This is the supported v4 setup, not a
 workaround.
 
-**React Router 8 raises the Node floor for this workspace to 22.22.0.** React Router 7.12–8.2
-carry a high-severity advisory (RSC-mode CSRF bypass, GHSA-qwww-vcr4-c8h2); 8.3.0 is the
-patched release, and it declares `engines.node >= 22.22.0`. v8 also folded `react-router-dom`
-into `react-router`, so imports come from `react-router`. The backend workspace still runs on
-Node 20 — only frontend tooling needs 22.22+.
+**React Router 8 is the patched release.** React Router 7.12–8.2 carry a high-severity
+advisory (RSC-mode CSRF bypass, GHSA-qwww-vcr4-c8h2); 8.3.0 sits above that range. v8 also
+folded `react-router-dom` into `react-router`, so imports come from `react-router`.
+
+## Node version
+
+This workspace requires **one of**:
+
+- **Node 22.22.2 or newer** on the Node 22 release line
+- **Node 24.15.0 or newer** on the Node 24 release line
+- **Node 26 or newer**
+
+Verify with `node --version`. The currently verified local version is **Node 22.22.3**.
+CI and frontend build environments must use a supported version.
+
+Declared as `^22.22.2 || ^24.15.0 || >=26.0.0` rather than a bare minimum, because a
+minimum would falsely advertise Node 23 and 25. Two packages set it:
+
+- `jsdom@30` (dev, via Vitest) declares exactly this range — **the binding
+  constraint**. It excludes the odd-numbered non-LTS lines 23.x and 25.x, so stay on
+  an even-numbered LTS.
+- `react-router@8.3.0` declares `>=22.22.0`, which the range above already satisfies.
+
+Node 20 is not supported anywhere in this repository any more. That is not only a
+frontend change: the backend's `@fastify/cookie@11` pulls in `cookie@2`, a production
+dependency requiring Node >= 22. The backend therefore declares `>=22` on its own —
+lower than this workspace, since 22.22.2 and the odd-line exclusions are frontend
+test-toolchain constraints. A root `npm install` covers both and takes the narrower
+range.
 
 ## Installation
 
