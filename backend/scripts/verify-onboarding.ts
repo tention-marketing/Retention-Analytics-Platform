@@ -117,6 +117,38 @@ function nextIp(): string {
  */
 const RATE_LIMIT_KEY_PREFIX = 'fastify-rate-limit-';
 
+/**
+ * Read every backend source file with comments removed.
+ *
+ * The group I source scans below look for forbidden API usage (`trustProxy`,
+ * `X-Forwarded-*`, `request.host`). Scanning raw text makes them match their own
+ * subject matter: a comment that says "this is NEVER derived from
+ * X-Forwarded-Host" is documentation of the correct behaviour, and flagging it
+ * turns a security assertion into a ban on describing the threat. Stripping
+ * comments first makes the checks strictly sharper — they still fail on any real
+ * code usage, and no longer fail on prose.
+ */
+async function backendSources(): Promise<[string, string][]> {
+  const { readFile, readdir } = await import('node:fs/promises');
+  const { join } = await import('node:path');
+  async function walk(dir: string): Promise<string[]> {
+    const out: string[] = [];
+    for (const e of await readdir(dir, { withFileTypes: true })) {
+      const p = join(dir, e.name);
+      if (e.isDirectory()) out.push(...(await walk(p)));
+      else if (e.name.endsWith('.ts')) out.push(p);
+    }
+    return out;
+  }
+  const stripComments = (s: string): string =>
+    s.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:])\/\/.*$/gm, '$1');
+
+  const files = await walk(new URL('../src', import.meta.url).pathname);
+  return Promise.all(
+    files.map(async (f) => [f, stripComments(await readFile(f, 'utf8'))] as [string, string]),
+  );
+}
+
 async function clearRateLimit(ip: string): Promise<void> {
   const keys = await redis.keys(`${RATE_LIMIT_KEY_PREFIX}*${ip}`).catch(() => []);
   if (keys.length) await redis.del(...keys).catch(() => undefined);
@@ -1953,19 +1985,8 @@ async function groupI(app: App, agencyCookie: string): Promise<void> {
   // would prove nothing either way. Assert the two things that DO establish the
   // property: no source passes the option, and the behaviour is verified below.
   check('no source file enables trustProxy', await (async () => {
-    const { readFile, readdir } = await import('node:fs/promises');
-    const { join } = await import('node:path');
-    async function walk(dir: string): Promise<string[]> {
-      const out: string[] = [];
-      for (const e of await readdir(dir, { withFileTypes: true })) {
-        const p = join(dir, e.name);
-        if (e.isDirectory()) out.push(...(await walk(p)));
-        else if (e.name.endsWith('.ts')) out.push(p);
-      }
-      return out;
-    }
-    for (const f of await walk(new URL('../src', import.meta.url).pathname)) {
-      if (/trustProxy/.test(await readFile(f, 'utf8'))) return false;
+    for (const [, code] of await backendSources()) {
+      if (/trustProxy/.test(code)) return false;
     }
     return true;
   })());
@@ -1999,20 +2020,8 @@ async function groupI(app: App, agencyCookie: string): Promise<void> {
   check('APP_BASE_URL is the authoritative source for generated links',
     config.appBaseUrl === 'http://localhost:5173', config.appBaseUrl);
   check('no source file builds a URL from a forwarded or request host', await (async () => {
-    const { readFile, readdir } = await import('node:fs/promises');
-    const { join } = await import('node:path');
-    async function walk(dir: string): Promise<string[]> {
-      const out: string[] = [];
-      for (const e of await readdir(dir, { withFileTypes: true })) {
-        const p = join(dir, e.name);
-        if (e.isDirectory()) out.push(...(await walk(p)));
-        else if (e.name.endsWith('.ts')) out.push(p);
-      }
-      return out;
-    }
-    for (const f of await walk(new URL('../src', import.meta.url).pathname)) {
-      const src = await readFile(f, 'utf8');
-      if (/x-forwarded|req\.host|request\.host|req\.hostname|request\.hostname/i.test(src)) return false;
+    for (const [, code] of await backendSources()) {
+      if (/x-forwarded|req\.host|request\.host|req\.hostname|request\.hostname/i.test(code)) return false;
     }
     return true;
   })());

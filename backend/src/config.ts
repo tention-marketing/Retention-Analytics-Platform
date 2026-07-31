@@ -20,6 +20,26 @@ export function parseStrictBooleanFlag(raw: string | undefined): boolean {
   return raw === 'true';
 }
 
+const appBaseUrl = (process.env.APP_BASE_URL ?? 'http://localhost:5173').replace(/\/+$/, '');
+
+/**
+ * Origin of the first-party application URL, validated at boot.
+ *
+ * This is the ONLY browser origin trusted for state-changing authentication
+ * requests (routes/auth.ts). It is derived from configuration rather than from
+ * `request.host` or `X-Forwarded-Host`, which a caller controls — deriving a
+ * trust decision from an attacker-supplied header is the classic way an origin
+ * check ends up validating nothing. Failing at boot beats discovering a
+ * malformed APP_BASE_URL on the first login attempt.
+ */
+function originOf(url: string): string {
+  try {
+    return new URL(url).origin;
+  } catch {
+    throw new Error(`APP_BASE_URL must be an absolute URL (e.g. https://app.example.com), got: ${url}`);
+  }
+}
+
 export const config = {
   databaseUrl: required('DATABASE_URL', 'postgres://tention:tention@localhost:5432/tention'),
   redisUrl: required('REDIS_URL', 'redis://localhost:6379'),
@@ -41,7 +61,9 @@ export const config = {
   // Base URL the client-facing onboarding link is built from. The token is placed
   // in the URL FRAGMENT (`/onboarding#token=…`), which browsers never transmit,
   // so it cannot reach server access logs, proxy logs, or a referer header.
-  appBaseUrl: (process.env.APP_BASE_URL ?? 'http://localhost:5173').replace(/\/+$/, ''),
+  appBaseUrl,
+  /** Scheme+host+port of appBaseUrl. The only trusted browser origin. */
+  appOrigin: originOf(appBaseUrl),
   // Shopify. The webhook shared secret (app API secret) is used to verify
   // incoming webhook HMACs. Optional in dev until a real app is connected.
   shopifyApiSecret: process.env.SHOPIFY_API_SECRET ?? '',

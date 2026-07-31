@@ -2,6 +2,10 @@ import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import bcrypt from 'bcryptjs';
 import { query } from '../db/pool.js';
 import { config } from '../config.js';
+import {
+  BCRYPT_COST, classifyRequestOrigin, isJsonContentType, requestHasBody, setNoStore,
+  verifyCredential,
+} from '../auth/security.js';
 
 // Session shape (agency staff only — session email+password per §0 auth).
 declare module '@fastify/session' {
@@ -48,6 +52,12 @@ const GENERIC_LOGIN_FAILURE = { error: 'invalid credentials' } as const;
 /** Uniform response while registration is closed (see config.allowAgencyRegistration). */
 const REGISTRATION_CLOSED = { error: 'not_found' } as const;
 
+/** A state-changing auth request from an origin that is not the application. */
+const FORBIDDEN_ORIGIN = { error: 'forbidden_origin' } as const;
+
+/** A body that is not declared as JSON. */
+const UNSUPPORTED_MEDIA_TYPE = { error: 'unsupported_media_type' } as const;
+
 // Guard usable by later phases' routes.
 export async function requireAuth(req: FastifyRequest, reply: FastifyReply): Promise<void> {
   if (!req.session.userId) {
@@ -56,6 +66,55 @@ export async function requireAuth(req: FastifyRequest, reply: FastifyReply): Pro
 }
 
 export async function authRoutes(app: FastifyInstance): Promise<void> {
+  /**
+   * Cross-origin and content-type gate for every auth route in this plugin.
+   *
+   * Runs at onRequest, so it rejects before body parsing, before the database is
+   * touched, and before any password comparison — a refused request costs
+   * nothing and cannot consume the login rate-limit budget by doing real work.
+   *
+   * The two checks close different halves of the same problem. Origin stops a
+   * cross-origin page from driving the browser's ambient cookies at these
+   * routes. The JSON requirement stops that page from dodging a CORS preflight
+   * in the first place: urlencoded, multipart and text/plain are "simple
+   * requests" that browsers send without asking permission, and text/plain in
+   * particular used to reach the login handler because Fastify ships a built-in
+   * parser for it.
+   */
+  app.addHook('onRequest', async (req, reply) => {
+    const stateChanging = req.method !== 'GET' && req.method !== 'HEAD';
+
+    if (stateChanging) {
+      const origin = classifyRequestOrigin(req.headers as Record<string, unknown>);
+      if (!origin.allowed) {
+        setNoStore(reply);
+        // No echo of the offending origin: the response tells the caller nothing
+        // it did not already know, and nothing about who is signed in.
+        return reply.code(403).send(FORBIDDEN_ORIGIN);
+      }
+    }
+
+    if (stateChanging && requestHasBody(req.headers as Record<string, unknown>)) {
+      if (!isJsonContentType(req.headers['content-type'])) {
+        setNoStore(reply);
+        return reply.code(415).send(UNSUPPORTED_MEDIA_TYPE);
+      }
+    }
+  });
+
+  /**
+   * Nothing describing an authenticated identity may be stored by any cache.
+   *
+   * Applied as an onSend hook rather than per handler so it covers responses
+   * this file never constructs: the rate limiter's 429, Fastify's malformed-JSON
+   * 400, and any future error path. Verified to cover the 429 while leaving its
+   * Retry-After header intact.
+   */
+  app.addHook('onSend', async (_req, reply, payload) => {
+    setNoStore(reply);
+    return payload;
+  });
+
   /**
    * Agency registration — CLOSED BY DEFAULT.
    *
@@ -86,12 +145,15 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
     if (existing.rowCount && existing.rowCount > 0) {
       return reply.code(409).send({ error: 'email already registered' });
     }
-    const hash = await bcrypt.hash(creds.password, 10);
+    const hash = await bcrypt.hash(creds.password, BCRYPT_COST);
     const { rows } = await query<{ id: number; email: string }>(
       'INSERT INTO users (email, password_hash) VALUES ($1, $2) RETURNING id, email',
       [creds.email, hash],
     );
     const user = rows[0];
+    // Same rotation discipline as login: a fresh session id is issued before any
+    // authenticated identity is written to it.
+    await req.session.regenerate();
     req.session.userId = user.id;
     req.session.email = user.email;
     return reply.code(201).send({ id: user.id, email: user.email });
@@ -140,13 +202,24 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
         [creds.email],
       );
       const user = rows[0];
-      // Compare even when the user is missing to avoid leaking existence via timing.
-      const ok = user
-        ? await bcrypt.compare(creds.password, user.password_hash)
-        : await bcrypt.compare(creds.password, '$2a$10$invalidinvalidinvalidinvalidinvalidinvalidinv');
+
+      // ONE bcrypt comparison, on every path, known email or not.
+      //
+      // Note there is no `user ? … : …` here on purpose. Branching on user
+      // existence before the comparison is exactly what produced the previous
+      // timing oracle; verifyCredential takes the null and substitutes an
+      // equally expensive dummy hash internally. See auth/security.ts.
+      const ok = await verifyCredential(creds.password, user?.password_hash ?? null);
       if (!user || !ok) {
         return reply.code(401).send(GENERIC_LOGIN_FAILURE);
       }
+
+      // SESSION FIXATION: rotate the session id, then write the identity into
+      // the NEW session. Order matters — setting userId first and rotating
+      // afterwards would authenticate the pre-login id for the length of the
+      // request, and rotating without a prior identity write means a session id
+      // an attacker managed to plant can never become an authenticated one.
+      await req.session.regenerate();
       req.session.userId = user.id;
       req.session.email = user.email;
       return reply.send({ id: user.id, email: user.email });

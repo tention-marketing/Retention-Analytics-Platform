@@ -104,6 +104,7 @@ the `-w` indirection. Each also has an explicit `:backend` alias
 | `npm run verify:klaviyo` | Phase 4 fixture verification (offline) |
 | `npm run verify:identity` | Identity graph at seed scale |
 | `npm run verify:onboarding` | Phase 5A onboarding + agency hardening (offline) |
+| `npm run verify:auth-security` | Agency authentication security: credential-timing equality, session rotation, no-store, content-type, cross-origin (offline) |
 | `npm run verify:shutdown` | Graceful shutdown verification |
 
 ### Frontend

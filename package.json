@@ -31,6 +31,7 @@
     "verify:klaviyo": "npm run verify:klaviyo -w @tention-pulse/backend",
     "verify:identity": "npm run verify:identity -w @tention-pulse/backend",
     "verify:onboarding": "npm run verify:onboarding -w @tention-pulse/backend",
+    "verify:auth-security": "npm run verify:auth-security -w @tention-pulse/backend",
     "verify:shutdown": "npm run verify:shutdown -w @tention-pulse/backend"
   }
 }
