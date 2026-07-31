@@ -98,6 +98,133 @@ describe('the login form', () => {
   });
 });
 
+describe('the show/hide password toggle', () => {
+  it('starts hidden, with the toggle offering to show', async () => {
+    arrange({ status: 401, json: {} });
+    expect(await screen.findByLabelText('Password')).toHaveAttribute('type', 'password');
+    expect(screen.getByRole('button', { name: 'Show password' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Hide password' })).not.toBeInTheDocument();
+  });
+
+  it('reveals the value on click and changes the accessible name', async () => {
+    const { user } = arrange({ status: 401, json: {} });
+    await user.type(await screen.findByLabelText('Password'), PASSWORD);
+
+    await user.click(screen.getByRole('button', { name: 'Show password' }));
+
+    expect(screen.getByLabelText('Password')).toHaveAttribute('type', 'text');
+    expect(screen.getByLabelText('Password')).toHaveValue(PASSWORD);
+    expect(screen.getByRole('button', { name: 'Hide password' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Show password' })).not.toBeInTheDocument();
+  });
+
+  it('hides it again on a second click', async () => {
+    const { user } = arrange({ status: 401, json: {} });
+    await user.type(await screen.findByLabelText('Password'), PASSWORD);
+
+    await user.click(screen.getByRole('button', { name: 'Show password' }));
+    await user.click(screen.getByRole('button', { name: 'Hide password' }));
+
+    expect(screen.getByLabelText('Password')).toHaveAttribute('type', 'password');
+    expect(screen.getByLabelText('Password')).toHaveValue(PASSWORD);
+    expect(screen.getByRole('button', { name: 'Show password' })).toBeInTheDocument();
+  });
+
+  it('reports its state through aria-pressed as well as its name', async () => {
+    const { user } = arrange({ status: 401, json: {} });
+    await screen.findByLabelText('Password');
+
+    expect(screen.getByRole('button', { name: 'Show password' }))
+      .toHaveAttribute('aria-pressed', 'false');
+    await user.click(screen.getByRole('button', { name: 'Show password' }));
+    expect(screen.getByRole('button', { name: 'Hide password' }))
+      .toHaveAttribute('aria-pressed', 'true');
+  });
+
+  it('is a type="button", so it never submits the form', async () => {
+    const { user } = arrange({ status: 200, json: USER });
+    await screen.findByLabelText('Email address');
+
+    const toggle = screen.getByRole('button', { name: 'Show password' });
+    expect(toggle).toHaveAttribute('type', 'button');
+
+    await user.click(toggle);
+
+    // No request, and no validation run — the form was never submitted.
+    expect(callCountFor('POST', '/api/auth/login')).toBe(0);
+    expect(screen.queryByText('Enter your email address.')).not.toBeInTheDocument();
+    expect(screen.queryByText('Enter your password.')).not.toBeInTheDocument();
+  });
+
+  it('is reachable and operable by keyboard', async () => {
+    const { user } = arrange({ status: 401, json: {} });
+    await screen.findByLabelText('Email address');
+
+    // Tab order: email -> password -> toggle -> submit.
+    await user.tab();
+    expect(screen.getByLabelText('Email address')).toHaveFocus();
+    await user.tab();
+    expect(screen.getByLabelText('Password')).toHaveFocus();
+    await user.tab();
+    expect(screen.getByRole('button', { name: 'Show password' })).toHaveFocus();
+
+    await user.keyboard('{Enter}');
+    expect(screen.getByLabelText('Password')).toHaveAttribute('type', 'text');
+
+    await user.keyboard(' ');
+    expect(screen.getByLabelText('Password')).toHaveAttribute('type', 'password');
+
+    // Neither key press submitted the form.
+    expect(callCountFor('POST', '/api/auth/login')).toBe(0);
+    await user.tab();
+    expect(screen.getByRole('button', { name: 'Sign in' })).toHaveFocus();
+  });
+
+  it('still returns focus to the password field after a failed login', async () => {
+    const { user } = arrange({ status: 401, json: { error: 'invalid credentials' } });
+    await user.type(await screen.findByLabelText('Email address'), EMAIL);
+    await user.type(screen.getByLabelText('Password'), PASSWORD);
+    await user.click(screen.getByRole('button', { name: 'Show password' }));
+    await user.click(screen.getByRole('button', { name: 'Sign in' }));
+
+    await screen.findByRole('alert');
+    // Focus lands on the field to retype, not on the toggle.
+    await waitFor(() => expect(screen.getByLabelText('Password')).toHaveFocus());
+    expect(screen.getByLabelText('Password')).toHaveValue('');
+  });
+
+  it('leaks the password nowhere while revealed', async () => {
+    const spies = (['log', 'warn', 'error', 'debug', 'info'] as const).map((m) =>
+      vi.spyOn(console, m).mockImplementation(() => undefined),
+    );
+    const setItem = vi.spyOn(Storage.prototype, 'setItem');
+    const cookieSetter = vi.spyOn(document, 'cookie', 'set');
+
+    const { user, queryClient } = arrange({ status: 401, json: {} });
+    await user.type(await screen.findByLabelText('Password'), PASSWORD);
+    await user.click(screen.getByRole('button', { name: 'Show password' }));
+
+    expect(setItem).not.toHaveBeenCalled();
+    expect(cookieSetter).not.toHaveBeenCalled();
+    expect(window.localStorage.length).toBe(0);
+    expect(window.sessionStorage.length).toBe(0);
+    for (const spy of spies) expect(spy).not.toHaveBeenCalled();
+
+    // Revealing must not copy the value into the query cache or a request.
+    const cache = JSON.stringify(queryClient.getQueryCache().getAll().map((q) => ({
+      key: q.queryKey, data: q.state.data,
+    })));
+    expect(cache).not.toContain(PASSWORD);
+    for (const call of calls) {
+      expect(call.url).not.toContain(PASSWORD);
+      expect(call.body ?? '').not.toContain(PASSWORD);
+    }
+
+    // The value lives in exactly one place: the input the user typed it into.
+    expect(screen.getByLabelText('Password')).toHaveValue(PASSWORD);
+  });
+});
+
 describe('successful login', () => {
   it('signs in, seeds the auth cache, and lands on the shell', async () => {
     const { user, queryClient } = arrange({ status: 200, json: USER });
