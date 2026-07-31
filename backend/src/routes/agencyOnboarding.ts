@@ -83,12 +83,31 @@ export async function agencyOnboardingRoutes(app: FastifyInstance): Promise<void
     return reply.send(await listLinks(accountId));
   });
 
-  app.delete('/onboarding-links/:linkId', async (req, reply) => {
+  /**
+   * Revoke a link — ACCOUNT-SCOPED.
+   *
+   * This replaced an unscoped `DELETE /onboarding-links/:linkId`, which let any
+   * authenticated caller revoke any link in the system by guessing a small
+   * integer. E8 does treat every authenticated user as trusted agency staff, so
+   * that was not a privilege escalation — but it made the account in the URL
+   * decorative, and "the frontend only ever sends ids it read from this
+   * account" is not an access control. The old route is gone rather than kept
+   * as a deprecated alias: no consumer existed (the Phase 5B frontend is not
+   * built yet), so this is the cheapest moment in the project's life to fix the
+   * shape.
+   *
+   * A link belonging to another account is indistinguishable from one that
+   * never existed — both are 404 `link_not_found` — so this route cannot be
+   * used to probe which link ids are real.
+   */
+  app.delete('/accounts/:id/onboarding-links/:linkId', async (req, reply) => {
+    const accountId = await accountIdParam(req, reply);
+    if (accountId === null) return;
     const linkId = Number((req.params as { linkId?: string }).linkId);
     if (!Number.isInteger(linkId) || linkId <= 0) {
       return reply.code(400).send({ error: 'bad_link_id' });
     }
-    const ok = await revokeLink(linkId);
+    const ok = await revokeLink(accountId, linkId);
     if (!ok) return reply.code(404).send({ error: 'link_not_found' });
     return reply.send({ revoked: true, id: linkId });
   });

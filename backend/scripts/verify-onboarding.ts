@@ -18,6 +18,12 @@
  *   G. Link states: valid / expired / revoked / malformed / never existed / wrong
  *      account, plus token-exchange rate limiting and Redis-outage behaviour.
  *   H. Later connection: the exact Day-1 / Day-10 sequence from D13.
+ *   I. Fastify 5 migration regressions.
+ *   J. Agency API hardening (Phase 5B preflight): registration closed by
+ *      default, login rate limiting and its Redis-outage behaviour, /auth/me
+ *      and logout semantics, account-scoped link revocation, and the guarantee
+ *      that no stack trace, filesystem path or provider credential reaches a
+ *      browser-facing progress or status response.
  *
  * Non-destructive: every account created here is a throwaway, deleted on the way
  * out. No live provider credential is used and no live provider is contacted —
@@ -42,12 +48,14 @@ const ENV_SENTINELS = {
 for (const [k, v] of Object.entries(ENV_SENTINELS)) process.env[k] = v;
 process.env.APP_BASE_URL = 'http://localhost:5173';
 
+const { default: bcrypt } = await import('bcryptjs');
 const { pool, query } = await import('../src/db/pool.js');
 const { decrypt } = await import('../src/crypto.js');
 const { buildApp } = await import('../src/index.js');
 const queues = await import('../src/queue/queues.js');
 const { redis } = queues;
-const { config } = await import('../src/config.js');
+const { config, parseStrictBooleanFlag } = await import('../src/config.js');
+const { classifyFailure } = await import('../src/onboarding/failures.js');
 const { createHmac } = await import('node:crypto');
 const links = await import('../src/onboarding/links.js');
 const { normalizeShopDomain } = await import('../src/onboarding/domain.js');
@@ -117,6 +125,24 @@ async function clearRateLimit(ip: string): Promise<void> {
 async function rateLimitKeysFor(ip: string): Promise<string[]> {
   return redis.keys(`${RATE_LIMIT_KEY_PREFIX}*${ip}`).catch(() => []);
 }
+
+// ---------------------------------------------------------------------------
+// Poisoned error fixture for group J.
+//
+// Modelled on what logSyncError() actually writes — `${message}\n${stack}` — so
+// the sanitization assertions run against the real shape rather than a
+// convenient one: deploy-host absolute paths, internal module frames, and a
+// credential-shaped string that a provider client could plausibly have included
+// in an error body.
+// ---------------------------------------------------------------------------
+const POISON_CREDENTIAL = 'pk_live_POISONCREDENTIAL0000000000000000';
+const STACK_TRACE_FIXTURE = [
+  'TypeError: fetch failed',
+  `    at request (/Users/deployuser/app/node_modules/undici/lib/core/request.js:112:15)`,
+  '    at async node:internal/deps/undici/undici:14976:13',
+  `    at async KlaviyoClient.get (/Users/deployuser/app/backend/dist/src/sync/klaviyo/client.js:44:20)`,
+  `  request headers: { authorization: 'Klaviyo-API-Key ${POISON_CREDENTIAL}' }`,
+].join('\n');
 
 // ---------------------------------------------------------------------------
 // Provider fixtures — no live API is ever contacted
@@ -257,14 +283,44 @@ function cookieFrom(res: { headers: Record<string, unknown> }, name: string): st
   return null;
 }
 
-async function agencyLogin(app: App): Promise<string> {
-  const email = `verify5a_${Date.now()}@example.com`;
-  const res = await app.inject({
-    method: 'POST', url: '/auth/register', remoteAddress: nextIp(),
-    payload: { email, password: 'verify5a-password' },
+/**
+ * Seed an agency user straight into Postgres.
+ *
+ * POST /auth/register is closed by default now, so the suite can no longer use
+ * it to obtain a session. Seeding the row and then exercising POST /auth/login
+ * is strictly better anyway: it drives the real login path once per run instead
+ * of the registration side door.
+ *
+ * The email prefix matters — cleanup deletes `verify5a_%`.
+ */
+const AGENCY_TEST_PASSWORD = 'verify5a-password';
+let agencyUserSeq = 0;
+
+async function seedAgencyUser(password = AGENCY_TEST_PASSWORD): Promise<string> {
+  agencyUserSeq++;
+  const email = `verify5a_${Date.now()}_${agencyUserSeq}@example.com`;
+  const hash = await bcrypt.hash(password, 10);
+  await query(
+    `INSERT INTO users (email, password_hash) VALUES ($1, $2)
+     ON CONFLICT (email) DO UPDATE SET password_hash = EXCLUDED.password_hash`,
+    [email, hash],
+  );
+  return email;
+}
+
+/** Log in over HTTP with a freshly seeded user, returning the raw reply. */
+async function agencyLoginRes(app: App, email: string, password = AGENCY_TEST_PASSWORD) {
+  return app.inject({
+    method: 'POST', url: '/auth/login', remoteAddress: nextIp(),
+    payload: { email, password },
   });
+}
+
+async function agencyLogin(app: App): Promise<string> {
+  const email = await seedAgencyUser();
+  const res = await agencyLoginRes(app, email);
   const cookie = cookieFrom(res, 'tention_sid');
-  if (!cookie) throw new Error(`agency registration did not set a session cookie (${res.statusCode})`);
+  if (!cookie) throw new Error(`agency login did not set a session cookie (${res.statusCode})`);
   return cookie;
 }
 
@@ -644,7 +700,7 @@ async function groupC(app: App, agencyCookie: string): Promise<void> {
   check('link: listing exposes neither token nor hash',
     !JSON.stringify(listed).includes(minted.token)
     && !JSON.stringify(listed).includes(links.hashToken(minted.token)));
-  await links.revokeLink(minted.id);
+  await links.revokeLink(acc, minted.id);
   const afterRevoke = await links.resolveToken(minted.token);
   check('link: revocation is visible immediately',
     afterRevoke.ok && !links.linkLiveness(afterRevoke.link).ok);
@@ -1169,10 +1225,12 @@ async function groupD(app: App, agencyCookie: string): Promise<void> {
       method: 'GET', url: '/onboarding/me', headers: { cookie: revLink.cookie },
       remoteAddress: nextIp(),
     })).statusCode === 200);
-  await app.inject({
-    method: 'DELETE', url: `/onboarding-links/${revLink.linkId}`,
+  const revRes = await app.inject({
+    method: 'DELETE', url: `/accounts/${revAcc}/onboarding-links/${revLink.linkId}`,
     headers: { cookie: agencyCookie }, remoteAddress: nextIp(),
   });
+  check('mid-session: the account-scoped revoke route accepted the request',
+    revRes.statusCode === 200, { status: revRes.statusCode, body: revRes.body });
   check('mid-session: revocation takes effect on the very next request',
     (await app.inject({
       method: 'GET', url: '/onboarding/me', headers: { cookie: revLink.cookie },
@@ -1414,7 +1472,7 @@ async function groupG(app: App, agencyCookie: string): Promise<void> {
   await query(`UPDATE onboarding_links SET expires_at = now() - interval '1 day' WHERE id = $1`,
     [expired.id]);
   const revoked = await links.mintOnboardingLink(acc, null);
-  await links.revokeLink(revoked.id);
+  await links.revokeLink(acc, revoked.id);
 
   const okRes = await app.inject({
     method: 'POST', url: '/onboarding/session', remoteAddress: nextIp(),
@@ -1727,11 +1785,8 @@ async function groupI(app: App, agencyCookie: string): Promise<void> {
   const link = await mintAndExchange(app, agencyCookie, acc);
 
   // --- session/cookie separation at issue time --------------------------
-  const freshEmail = `verify5a_f5_${Date.now()}@example.com`;
-  const loginRes = await app.inject({
-    method: 'POST', url: '/auth/register', remoteAddress: nextIp(),
-    payload: { email: freshEmail, password: 'verify5a-password' },
-  });
+  const freshEmail = await seedAgencyUser();
+  const loginRes = await agencyLoginRes(app, freshEmail);
   const loginCookies = setCookieList(loginRes);
   check('agency login sets ONLY the agency cookie',
     loginCookies.some((c) => c.startsWith('tention_sid='))
@@ -2032,6 +2087,412 @@ async function groupI(app: App, agencyCookie: string): Promise<void> {
 }
 
 // ===========================================================================
+// J. Agency API hardening (preflight for Phase 5B)
+// ===========================================================================
+async function groupJ(app: App, agencyCookie: string): Promise<void> {
+  group('J', 'Agency API hardening');
+
+  // --- registration is closed by default --------------------------------
+  check('config.allowAgencyRegistration defaults to false (env unset in this run)',
+    config.allowAgencyRegistration === false, config.allowAgencyRegistration);
+
+  // The env rule itself, not merely its effect: only the exact string opens it.
+  for (const raw of [undefined, '', '0', '1', 'yes', 'on', 'TRUE', 'True', ' true', 'true ']) {
+    check(`ALLOW_AGENCY_REGISTRATION=${JSON.stringify(raw)} does NOT enable registration`,
+      parseStrictBooleanFlag(raw) === false, raw);
+  }
+  check("ALLOW_AGENCY_REGISTRATION='true' is the one value that enables registration",
+    parseStrictBooleanFlag('true') === true);
+
+  const novelEmail = `verify5a_closed_${Date.now()}@example.com`;
+  const existingEmail = await seedAgencyUser();
+
+  const closedNovel = await app.inject({
+    method: 'POST', url: '/auth/register', remoteAddress: nextIp(),
+    payload: { email: novelEmail, password: 'a-long-enough-password' },
+  });
+  const closedExisting = await app.inject({
+    method: 'POST', url: '/auth/register', remoteAddress: nextIp(),
+    payload: { email: existingEmail, password: 'a-long-enough-password' },
+  });
+  const closedGarbage = await app.inject({
+    method: 'POST', url: '/auth/register', remoteAddress: nextIp(), payload: { nope: 1 },
+  });
+
+  check('closed registration returns 404', closedNovel.statusCode === 404, closedNovel.statusCode);
+  check('closed registration created NO user',
+    (await query('SELECT 1 FROM users WHERE email = $1', [novelEmail])).rowCount === 0);
+  check('closed registration: an EXISTING email gets the identical status',
+    closedExisting.statusCode === closedNovel.statusCode);
+  check('closed registration: an EXISTING email gets the identical body — no enumeration oracle',
+    closedExisting.body === closedNovel.body, {
+      novel: closedNovel.body, existing: closedExisting.body,
+    });
+  check('closed registration: a malformed payload is also indistinguishable',
+    closedGarbage.statusCode === closedNovel.statusCode && closedGarbage.body === closedNovel.body,
+    closedGarbage.body);
+  check('closed registration body leaks no email',
+    !closedExisting.body.includes(existingEmail), closedExisting.body);
+
+  // --- the gate is wired to the config value, and nothing else ----------
+  const bootstrapEmail = `verify5a_bootstrap_${Date.now()}@example.com`;
+  const bootstrapRes = await (async () => {
+    config.allowAgencyRegistration = true;
+    try {
+      return await app.inject({
+        method: 'POST', url: '/auth/register', remoteAddress: nextIp(),
+        payload: { email: bootstrapEmail, password: 'a-long-enough-password' },
+      });
+    } finally {
+      config.allowAgencyRegistration = false;
+    }
+  })();
+  check('bootstrap mode: registration succeeds ONLY when explicitly configured',
+    bootstrapRes.statusCode === 201, bootstrapRes.statusCode);
+  check('bootstrap mode: the user was actually created',
+    (await query('SELECT 1 FROM users WHERE email = $1', [bootstrapEmail])).rowCount === 1);
+  check('bootstrap mode: sets only the agency cookie',
+    setCookieList(bootstrapRes).some((c) => c.startsWith('tention_sid='))
+    && !setCookieList(bootstrapRes).some((c) => c.startsWith('tention_onb=')));
+  check('bootstrap mode: the response never echoes the password',
+    !bootstrapRes.body.includes('a-long-enough-password'), bootstrapRes.body);
+  const reClosed = await app.inject({
+    method: 'POST', url: '/auth/register', remoteAddress: nextIp(),
+    payload: { email: `verify5a_reclosed_${Date.now()}@example.com`, password: 'a-long-enough-password' },
+  });
+  check('registration closes again as soon as the flag is back to false',
+    reClosed.statusCode === 404, reClosed.statusCode);
+
+  // --- login --------------------------------------------------------------
+  const loginEmail = await seedAgencyUser();
+
+  // Capture stdout across the login attempts: the app logs with pino at
+  // level 30, and a password reaching the log is as bad as one reaching a body.
+  const logBuffer: string[] = [];
+  const realWrite = process.stdout.write.bind(process.stdout);
+  (process.stdout as { write: unknown }).write = ((chunk: unknown, ...rest: unknown[]) => {
+    logBuffer.push(String(chunk));
+    return (realWrite as (...a: unknown[]) => boolean)(chunk, ...rest);
+  }) as typeof process.stdout.write;
+
+  const [goodLogin, wrongPassword, unknownEmail, shortPassword, malformed] =
+    await (async () => {
+      try {
+        return [
+          await agencyLoginRes(app, loginEmail),
+          await agencyLoginRes(app, loginEmail, 'definitely-not-the-password'),
+          await agencyLoginRes(app, `verify5a_ghost_${Date.now()}@example.com`, 'irrelevant-password'),
+          await agencyLoginRes(app, loginEmail, 'short'),
+          await app.inject({
+            method: 'POST', url: '/auth/login', remoteAddress: nextIp(),
+            payload: { email: loginEmail },
+          }),
+        ] as const;
+      } finally {
+        (process.stdout as { write: unknown }).write = realWrite;
+      }
+    })();
+
+  check('login: correct credentials succeed', goodLogin.statusCode === 200, goodLogin.statusCode);
+  check('login: success sets the agency cookie', cookieFrom(goodLogin, 'tention_sid') !== null);
+  check('login: success body carries only id and email',
+    JSON.stringify(Object.keys(goodLogin.json() as object).sort()) === '["email","id"]',
+    goodLogin.json());
+  check('login: success body contains no password hash',
+    !goodLogin.body.includes('$2a$') && !goodLogin.body.includes('password'), goodLogin.body);
+
+  check('login: a wrong password returns 401', wrongPassword.statusCode === 401);
+  check('login: an unknown email returns 401', unknownEmail.statusCode === 401);
+  check('login: wrong password and unknown email are byte-identical — no user enumeration',
+    wrongPassword.body === unknownEmail.body, {
+      wrongPassword: wrongPassword.body, unknownEmail: unknownEmail.body,
+    });
+  // Regression on the oracle this task removed: a too-short password used to be
+  // a 400 while a long wrong one was a 401, which varied the response with the
+  // submitted secret.
+  check('login: a SHORT wrong password gets the same 401, not a 400',
+    shortPassword.statusCode === 401, shortPassword.statusCode);
+  check('login: a short wrong password is byte-identical to any other wrong credential',
+    shortPassword.body === wrongPassword.body, shortPassword.body);
+  check('login: a missing field is still a 400 (malformed request, not a credential verdict)',
+    malformed.statusCode === 400, malformed.statusCode);
+
+  const allLoginBodies = [goodLogin, wrongPassword, unknownEmail, shortPassword, malformed]
+    .map((r) => r.body).join('\n');
+  check('login: no response body echoes a submitted password',
+    !allLoginBodies.includes(AGENCY_TEST_PASSWORD)
+    && !allLoginBodies.includes('definitely-not-the-password')
+    && !allLoginBodies.includes('irrelevant-password'), allLoginBodies);
+  const logText = logBuffer.join('');
+  check('login: no submitted password reached the process log',
+    !logText.includes(AGENCY_TEST_PASSWORD)
+    && !logText.includes('definitely-not-the-password')
+    && !logText.includes('irrelevant-password'));
+  check('login: no bcrypt hash reached the process log', !logText.includes('$2a$'));
+
+  // --- cookie attributes on the login path ------------------------------
+  const sidDirective = cookieDirective(goodLogin, 'tention_sid')!;
+  check('login cookie is HttpOnly', /HttpOnly/i.test(sidDirective), sidDirective);
+  check('login cookie is SameSite=Lax', /SameSite=Lax/i.test(sidDirective), sidDirective);
+  check('login cookie is Path=/', /Path=\//.test(sidDirective), sidDirective);
+  check('login cookie Secure stays environment-aware (absent in this dev run)',
+    config.isProd === false && !/Secure/i.test(sidDirective), sidDirective);
+
+  // --- login rate limiting ----------------------------------------------
+  const rlIp = '198.51.100.7';
+  const otherIp = '198.51.100.8';
+  await clearRateLimit(rlIp);
+  await clearRateLimit(otherIp);
+
+  let firstLimited = 0;
+  for (let i = 1; i <= 15; i++) {
+    const res = await app.inject({
+      method: 'POST', url: '/auth/login', remoteAddress: rlIp,
+      payload: { email: loginEmail, password: 'wrong-on-purpose' },
+    });
+    if (res.statusCode === 429) { firstLimited = i; break; }
+  }
+  check('login: repeated attempts from one source reach 429', firstLimited > 0, firstLimited);
+  check('login: the limit allows a realistic number of human retries before engaging',
+    firstLimited >= 10, firstLimited);
+
+  const limitedRes = await app.inject({
+    method: 'POST', url: '/auth/login', remoteAddress: rlIp,
+    payload: { email: loginEmail, password: AGENCY_TEST_PASSWORD },
+  });
+  check('login: the 429 body echoes neither the email nor the password',
+    !limitedRes.body.includes(loginEmail) && !limitedRes.body.includes(AGENCY_TEST_PASSWORD),
+    limitedRes.body);
+  check('login: even a CORRECT password is throttled once the limit engages',
+    limitedRes.statusCode === 429, limitedRes.statusCode);
+
+  const untouched = await app.inject({
+    method: 'POST', url: '/auth/login', remoteAddress: otherIp,
+    payload: { email: loginEmail, password: AGENCY_TEST_PASSWORD },
+  });
+  check('login: a different source is NOT collaterally blocked',
+    untouched.statusCode === 200, untouched.statusCode);
+
+  check('login: the rate-limit counter lives in Redis, so the limit holds across processes',
+    (await rateLimitKeysFor(rlIp)).length > 0);
+  check('login: the Redis counter carries a TTL, so the block is temporary not permanent',
+    (await redis.ttl((await rateLimitKeysFor(rlIp))[0]).catch(() => -2)) > 0);
+
+  // Redis outage on the login limiter: skipOnError must fail OPEN. Failing closed
+  // would turn a Redis blip into an agency-wide lockout with no way in to fix it.
+  const { default: Fastify } = await import('fastify');
+  const { default: rateLimitPlugin } = await import('@fastify/rate-limit');
+  const { default: IORedis } = await import('ioredis');
+  const deadRedis = new IORedis('redis://127.0.0.1:6390', {
+    lazyConnect: true, enableOfflineQueue: false, maxRetriesPerRequest: 1,
+    retryStrategy: () => null,
+  });
+  deadRedis.on('error', () => undefined);
+  const outageApp = Fastify({ logger: false });
+  await outageApp.register(rateLimitPlugin, {
+    global: false, redis: deadRedis as never, skipOnError: true, keyGenerator: (r) => r.ip,
+  });
+  outageApp.post('/login-probe', { config: { rateLimit: { max: 10, timeWindow: '5 minutes' } } },
+    async () => ({ ok: true }));
+  await outageApp.ready();
+  const outageCodes: number[] = [];
+  for (let i = 0; i < 12; i++) {
+    outageCodes.push((await outageApp.inject({
+      method: 'POST', url: '/login-probe', remoteAddress: '10.9.9.8',
+    })).statusCode);
+  }
+  check('login limiter under a Redis outage fails OPEN rather than locking the agency out',
+    outageCodes.every((c) => c === 200), outageCodes);
+  await outageApp.close();
+  deadRedis.disconnect();
+
+  // --- GET /auth/me -------------------------------------------------------
+  const meAnon = await app.inject({ method: 'GET', url: '/auth/me', remoteAddress: nextIp() });
+  check('/auth/me rejects an unauthenticated request', meAnon.statusCode === 401, meAnon.statusCode);
+
+  const meAuthed = await app.inject({
+    method: 'GET', url: '/auth/me', headers: { cookie: agencyCookie }, remoteAddress: nextIp(),
+  });
+  check('/auth/me accepts a valid agency cookie', meAuthed.statusCode === 200, meAuthed.statusCode);
+  check('/auth/me returns only safe agency-user fields',
+    JSON.stringify(Object.keys(meAuthed.json() as object).sort()) === '["email","id"]',
+    meAuthed.json());
+  check('/auth/me never returns a password hash',
+    !meAuthed.body.includes('$2a$') && !meAuthed.body.includes('password_hash'), meAuthed.body);
+
+  const meAcc = await makeAccount('auth_me');
+  const meLink = await mintAndExchange(app, agencyCookie, meAcc);
+  const meOnboarding = await app.inject({
+    method: 'GET', url: '/auth/me', headers: { cookie: meLink.cookie }, remoteAddress: nextIp(),
+  });
+  check('/auth/me rejects an onboarding-only session',
+    meOnboarding.statusCode === 401, meOnboarding.statusCode);
+
+  // --- logout -------------------------------------------------------------
+  const logoutEmail = await seedAgencyUser();
+  const logoutLoginRes = await agencyLoginRes(app, logoutEmail);
+  const logoutCookie = cookieFrom(logoutLoginRes, 'tention_sid')!;
+  const logoutRes = await app.inject({
+    method: 'POST', url: '/auth/logout',
+    headers: { cookie: `${logoutCookie}; ${meLink.cookie}` }, remoteAddress: nextIp(),
+  });
+  const logoutSetCookies = setCookieList(logoutRes);
+  check('logout: emits no directive touching the onboarding cookie',
+    !logoutSetCookies.some((c) => c.startsWith('tention_onb=')), logoutSetCookies);
+  check('logout: /auth/me rejects the destroyed agency session',
+    (await app.inject({
+      method: 'GET', url: '/auth/me', headers: { cookie: logoutCookie }, remoteAddress: nextIp(),
+    })).statusCode === 401);
+  check('logout: the onboarding session is untouched and still authenticates',
+    (await app.inject({
+      method: 'GET', url: '/onboarding/me', headers: { cookie: meLink.cookie },
+      remoteAddress: nextIp(),
+    })).statusCode === 200);
+
+  // --- account-scoped link revocation ------------------------------------
+  const accA = await makeAccount('revoke_scope_a');
+  const accB = await makeAccount('revoke_scope_b');
+  const linkA = await links.mintOnboardingLink(accA, null);
+  const linkB = await links.mintOnboardingLink(accB, null);
+
+  const foreign = await app.inject({
+    method: 'DELETE', url: `/accounts/${accA}/onboarding-links/${linkB.id}`,
+    headers: { cookie: agencyCookie }, remoteAddress: nextIp(),
+  });
+  check("revoke: account A cannot revoke account B's link", foreign.statusCode === 404, foreign.statusCode);
+  check("revoke: the foreign link is still live after the attempt",
+    (await links.getLinkById(linkB.id))?.revoked_at === null);
+
+  const missing = await app.inject({
+    method: 'DELETE', url: `/accounts/${accA}/onboarding-links/999999999`,
+    headers: { cookie: agencyCookie }, remoteAddress: nextIp(),
+  });
+  check('revoke: a link that never existed gets the same 404 as a foreign one',
+    missing.statusCode === 404 && missing.body === foreign.body,
+    { missing: missing.body, foreign: foreign.body });
+
+  const ownRevoke = await app.inject({
+    method: 'DELETE', url: `/accounts/${accA}/onboarding-links/${linkA.id}`,
+    headers: { cookie: agencyCookie }, remoteAddress: nextIp(),
+  });
+  check('revoke: same-account revocation succeeds', ownRevoke.statusCode === 200, ownRevoke.statusCode);
+  check('revoke: the link is revoked in the database',
+    (await links.getLinkById(linkA.id))?.revoked_at !== null);
+  check('revoke: the revoked token stops resolving immediately',
+    !links.linkLiveness((await links.getLinkById(linkA.id))!).ok);
+  check('revoke: exchanging the revoked token now fails',
+    (await app.inject({
+      method: 'POST', url: '/onboarding/session', remoteAddress: nextIp(),
+      payload: { token: linkA.token },
+    })).statusCode === 401);
+  check('revoke: is idempotent — a second call still succeeds',
+    (await app.inject({
+      method: 'DELETE', url: `/accounts/${accA}/onboarding-links/${linkA.id}`,
+      headers: { cookie: agencyCookie }, remoteAddress: nextIp(),
+    })).statusCode === 200);
+
+  const unscoped = await app.inject({
+    method: 'DELETE', url: `/onboarding-links/${linkB.id}`,
+    headers: { cookie: agencyCookie }, remoteAddress: nextIp(),
+  });
+  check('revoke: the old UNSCOPED route is gone', unscoped.statusCode === 404, unscoped.statusCode);
+  check("revoke: and it did not revoke anything on its way out",
+    (await links.getLinkById(linkB.id))?.revoked_at === null);
+
+  const anonRevoke = await app.inject({
+    method: 'DELETE', url: `/accounts/${accB}/onboarding-links/${linkB.id}`,
+    remoteAddress: nextIp(),
+  });
+  check('revoke: an unauthenticated caller is rejected', anonRevoke.statusCode === 401);
+  check('revoke: an onboarding-only session is rejected',
+    (await app.inject({
+      method: 'DELETE', url: `/accounts/${accB}/onboarding-links/${linkB.id}`,
+      headers: { cookie: meLink.cookie }, remoteAddress: nextIp(),
+    })).statusCode === 401);
+
+  // --- error sanitization -------------------------------------------------
+  check('classifier: a stack trace is classified, never echoed', (() => {
+    const f = classifyFailure(STACK_TRACE_FIXTURE, 'klaviyo', 'klaviyo.backfill');
+    return !JSON.stringify(f).includes('/Users/')
+      && !JSON.stringify(f).includes('undici')
+      && !JSON.stringify(f).includes('at async');
+  })());
+  for (const [label, raw, code, category, retryable] of [
+    ['401 unauthorized', 'Klaviyo API 401 Unauthorized: invalid api key', 'provider_auth_failed', 'auth', false],
+    ['429 throttle', 'Request failed: 429 Too Many Requests', 'provider_rate_limited', 'rate_limit', true],
+    ['network', 'TypeError: fetch failed\n  at node:internal/deps/undici', 'provider_unreachable', 'network', true],
+    ['502 upstream', 'Shopify responded 502 Bad Gateway', 'provider_error', 'provider', true],
+    ['unrecognised', 'something nobody anticipated', 'sync_failed', 'internal', true],
+  ] as [string, string, string, string, boolean][]) {
+    const f = classifyFailure(raw, 'shopify', 'shopify.backfill');
+    check(`classifier: ${label} → ${code}/${category} retryable=${retryable}`,
+      f.code === code && f.category === category && f.retryable === retryable, f);
+    check(`classifier: ${label} publicMessage contains no raw text`,
+      !f.publicMessage.includes('undici') && !f.publicMessage.includes('api key')
+      && !f.publicMessage.includes('Bad Gateway'), f.publicMessage);
+  }
+  check('classifier: a null reason still yields a usable safe failure', (() => {
+    const f = classifyFailure(null, 'recharge', 'recharge.backfill');
+    return f.code === 'sync_failed' && f.provider === 'recharge'
+      && f.publicMessage.includes('Recharge') && f.publicMessage.length > 0;
+  })());
+
+  // Plant a realistic poisoned sync_errors row — a full stack trace with deploy
+  // paths AND a credential-shaped string — then read it back over HTTP.
+  const errAcc = await makeAccount('error_sanitization');
+  await query(
+    `INSERT INTO sync_errors (account_id, job_type, error) VALUES ($1, $2, $3)`,
+    [errAcc, 'klaviyo.backfill', STACK_TRACE_FIXTURE],
+  );
+
+  const progressRes = await app.inject({
+    method: 'GET', url: `/accounts/${errAcc}/progress`,
+    headers: { cookie: agencyCookie }, remoteAddress: nextIp(),
+  });
+  const statusRes = await app.inject({
+    method: 'GET', url: `/accounts/${errAcc}/onboarding/status`,
+    headers: { cookie: agencyCookie }, remoteAddress: nextIp(),
+  });
+  check('progress: responds 200', progressRes.statusCode === 200, progressRes.statusCode);
+
+  for (const [label, body] of [
+    ['progress', progressRes.body], ['onboarding status', statusRes.body],
+  ] as [string, string][]) {
+    check(`${label}: exposes no stack frame`, !body.includes('at async') && !body.includes('at Object.'), label);
+    check(`${label}: exposes no filesystem path`,
+      !body.includes('/Users/') && !body.includes('node_modules') && !body.includes('node:internal'));
+    check(`${label}: exposes no provider credential`, !body.includes(POISON_CREDENTIAL));
+    check(`${label}: exposes no raw exception text`, !body.includes('TypeError: fetch failed'));
+    check(`${label}: the raw failedReason field is gone`, !body.includes('failedReason'));
+    check(`${label}: the raw recentErrors field is gone`, !body.includes('recentErrors'));
+  }
+
+  const klaviyoDetail = (progressRes.json() as {
+    provider: string; recentFailures: { code: string; category: string; stage: string;
+      retryable: boolean; publicMessage: string }[];
+  }[]).find((p) => p.provider === 'klaviyo');
+  check('progress: the planted failure still surfaces, classified',
+    (klaviyoDetail?.recentFailures.length ?? 0) === 1, klaviyoDetail?.recentFailures);
+  const safe = klaviyoDetail!.recentFailures[0];
+  check('progress: the classified failure keeps a stable machine code',
+    safe.code === 'provider_unreachable', safe);
+  check('progress: the classified failure keeps its category', safe.category === 'network');
+  check('progress: the classified failure keeps the actionable stage',
+    safe.stage === 'klaviyo.backfill', safe.stage);
+  check('progress: the classified failure states whether a retry is worthwhile',
+    safe.retryable === true);
+  check('progress: the public message is a fixed, renderable sentence',
+    safe.publicMessage === 'Klaviyo could not be reached. The sync will be retried.',
+    safe.publicMessage);
+
+  // The raw text must survive where it is actually useful.
+  const retained = await query<{ error: string }>(
+    `SELECT error FROM sync_errors WHERE account_id = $1`, [errAcc]);
+  check('sanitization removed nothing from backend troubleshooting: sync_errors still has the trace',
+    retained.rows[0]?.error === STACK_TRACE_FIXTURE);
+}
+
+// ===========================================================================
 // Main
 // ===========================================================================
 async function main(): Promise<void> {
@@ -2053,6 +2514,7 @@ async function main(): Promise<void> {
     await groupG(app, agencyCookie);
     await groupH(app, agencyCookie);
     await groupI(app, agencyCookie);
+    await groupJ(app, agencyCookie);
   } finally {
     console.log('\nCleanup');
     await cleanupAccounts();
@@ -2088,7 +2550,7 @@ async function main(): Promise<void> {
     A: 'Pure unit', B: 'Provider fixtures', C: 'Database integration',
     D: 'Session isolation', E: 'Cross-tenant', F: 'Credential fallback',
     G: 'Link states + rate limit', H: 'Later connection',
-    I: 'Fastify 5 regressions',
+    I: 'Fastify 5 regressions', J: 'Agency API hardening',
   };
   for (const [letter, t] of Object.entries(groupTotals)) {
     const mark = t.fail === 0 ? '✓' : '✗';

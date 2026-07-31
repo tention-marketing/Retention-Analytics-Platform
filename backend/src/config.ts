@@ -8,6 +8,18 @@ function required(name: string, fallback?: string): string {
   return val;
 }
 
+/**
+ * Strict boolean flag parsing for security-relevant switches.
+ *
+ * Only the exact string 'true' enables. '1', 'yes', 'TRUE', ' true ' and an
+ * empty value all read as false, so a plausible-looking typo in a deploy
+ * environment fails CLOSED rather than open. Exported so the rule itself is
+ * covered by tests rather than only its effect.
+ */
+export function parseStrictBooleanFlag(raw: string | undefined): boolean {
+  return raw === 'true';
+}
+
 export const config = {
   databaseUrl: required('DATABASE_URL', 'postgres://tention:tention@localhost:5432/tention'),
   redisUrl: required('REDIS_URL', 'redis://localhost:6379'),
@@ -16,6 +28,16 @@ export const config = {
   port: Number(process.env.PORT ?? 3000),
   nodeEnv: process.env.NODE_ENV ?? 'development',
   isProd: (process.env.NODE_ENV ?? 'development') === 'production',
+  // POST /auth/register creates an agency staff user with access to EVERY
+  // account, so it is closed unless this is set to the exact string 'true'.
+  // Any other value — unset, empty, '1', 'yes', 'TRUE' — leaves it closed, so a
+  // typo can never accidentally open public signup in production.
+  //
+  // The frontend has no say in this: it is read from the process environment at
+  // boot and never echoed to a browser. The production-safe way to create the
+  // first user is `npm run bootstrap:user`, which writes to Postgres directly
+  // and needs no HTTP route open at all.
+  allowAgencyRegistration: parseStrictBooleanFlag(process.env.ALLOW_AGENCY_REGISTRATION),
   // Base URL the client-facing onboarding link is built from. The token is placed
   // in the URL FRAGMENT (`/onboarding#token=…`), which browsers never transmit,
   // so it cannot reach server access logs, proxy logs, or a referer header.

@@ -16,6 +16,7 @@
     "typecheck": "npm run typecheck -w @tention-pulse/backend",
     "migrate": "npm run migrate -w @tention-pulse/backend",
     "seed": "npm run seed -w @tention-pulse/backend",
+    "bootstrap:user": "npm run bootstrap:user -w @tention-pulse/backend",
     "worker": "npm run worker -w @tention-pulse/backend",
     "verify:recharge": "npm run verify:recharge -w @tention-pulse/backend",
     "verify:klaviyo": "npm run verify:klaviyo -w @tention-pulse/backend",

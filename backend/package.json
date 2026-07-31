@@ -13,6 +13,7 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "migrate": "tsx src/db/migrate.ts",
     "seed": "tsx scripts/seed.ts",
+    "bootstrap:user": "tsx scripts/create-agency-user.ts",
     "worker": "tsx src/queue/workers.ts",
     "verify:recharge": "tsx scripts/verify-recharge.ts",
     "verify:klaviyo": "tsx scripts/verify-klaviyo.ts",

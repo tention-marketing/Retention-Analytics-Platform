@@ -4,6 +4,7 @@ import {
   backfillJobId, rechargeBackfillJobId, klaviyoBackfillJobId,
 } from '../queue/queues.js';
 import { getProviderStatuses, type Provider } from './choices.js';
+import { classifyFailure, delayedFailure, type SafeFailure } from './failures.js';
 
 // Sync progress, DERIVED (D6).
 //
@@ -46,8 +47,22 @@ export interface AgencyProviderDetail extends ProviderProgress {
   jobId: string | null;
   jobState: string | null;
   attemptsMade: number | null;
-  failedReason: string | null;
-  recentErrors: { job_type: string; error: string; created_at: Date }[];
+  /**
+   * The current job's failure, CLASSIFIED — see onboarding/failures.ts.
+   *
+   * This replaced `failedReason: string`, which was BullMQ's raw thrown-error
+   * message and reached the browser verbatim.
+   */
+  failure: SafeFailure | null;
+  /**
+   * The five most recent sync_errors rows for this provider, CLASSIFIED.
+   *
+   * This replaced `recentErrors: {job_type, error, created_at}[]`, whose
+   * `error` was `${message}\n${stack}` as written by logSyncError — full stack
+   * traces with deploy-host filesystem paths, rendered in an agency browser.
+   * The rows themselves are untouched in Postgres for troubleshooting.
+   */
+  recentFailures: SafeFailure[];
 }
 
 const SAFE_FAILURE_MESSAGE =
@@ -220,13 +235,21 @@ export async function getAgencyProgress(accountId: number): Promise<AgencyProvid
         ORDER BY created_at DESC LIMIT 5`,
       [accountId, `${p.provider}%`],
     );
+    // `job.failedReason` and `row.error` are read here and go no further: both
+    // are classified into fixed-vocabulary SafeFailures, and neither string is
+    // carried into the response.
     out.push({
       ...p,
       jobId: job.id,
       jobState: job.state,
       attemptsMade: job.attemptsMade,
-      failedReason: job.failedReason,
-      recentErrors: errors,
+      failure: job.failedReason
+        ? classifyFailure(job.failedReason, p.provider, `${p.provider}.backfill`)
+        : p.state === 'sync_delayed'
+          ? delayedFailure(p.provider, `${p.provider}.backfill`)
+          : null,
+      recentFailures: errors.map((e) =>
+        classifyFailure(e.error, p.provider, e.job_type, e.created_at)),
     });
   }
   return out;

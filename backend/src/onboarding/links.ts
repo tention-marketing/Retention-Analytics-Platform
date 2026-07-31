@@ -133,11 +133,24 @@ export async function markLinkCompleted(linkId: number): Promise<void> {
   );
 }
 
-/** Revoke. Idempotent; returns false when the link does not exist. */
-export async function revokeLink(linkId: number): Promise<boolean> {
+/**
+ * Revoke a link, scoped to its owning account.
+ *
+ * account_id is part of the WHERE clause rather than checked in the route,
+ * so ownership is enforced by the statement that does the write and cannot be
+ * bypassed by a caller that forgets to check first. There is deliberately no
+ * unscoped variant of this function: an id-only revoke is exactly the shape a
+ * future caller would reach for and get wrong.
+ *
+ * Idempotent (`COALESCE(revoked_at, now())` — re-revoking keeps the original
+ * timestamp). Returns false both when the link does not exist and when it
+ * belongs to another account, so callers cannot distinguish the two.
+ */
+export async function revokeLink(accountId: number, linkId: number): Promise<boolean> {
   const { rowCount } = await query(
-    `UPDATE onboarding_links SET revoked_at = COALESCE(revoked_at, now()) WHERE id = $1`,
-    [linkId],
+    `UPDATE onboarding_links SET revoked_at = COALESCE(revoked_at, now())
+      WHERE id = $1 AND account_id = $2`,
+    [linkId, accountId],
   );
   return (rowCount ?? 0) > 0;
 }
