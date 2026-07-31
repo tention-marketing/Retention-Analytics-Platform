@@ -1,0 +1,84 @@
+@import 'tailwindcss';
+
+/*
+  Foundation styling for an internal agency tool.
+
+  Restrained on purpose: neutral surfaces, strong contrast, one accent used only
+  for focus and primary actions. No gradients, no glass, no decorative motion —
+  this is a tool people will read numbers off for an hour at a time.
+
+  Tailwind v4 is configured in CSS rather than tailwind.config.js; see
+  frontend/README.md for why there is no JS config file.
+*/
+
+@theme {
+  --color-surface: #ffffff;
+  --color-surface-muted: #f6f7f9;
+  --color-surface-sunken: #eceef2;
+  --color-border-subtle: #d9dde3;
+  --color-border-strong: #b6bdc7;
+
+  --color-ink: #10151c;
+  --color-ink-muted: #4d5765;
+
+  --color-accent: #1c5fd6;
+  --color-accent-strong: #17439a;
+
+  --color-danger: #a8231c;
+  --color-danger-surface: #fdf1f0;
+  --color-danger-border: #f0c4c1;
+
+  --color-warn: #7a4a05;
+  --color-warn-surface: #fdf6e9;
+  --color-warn-border: #eddcb8;
+
+  --color-ok: #16603c;
+  --color-ok-surface: #eef7f1;
+  --color-ok-border: #c2ddcc;
+}
+
+@layer base {
+  html {
+    -webkit-text-size-adjust: 100%;
+  }
+
+  body {
+    background-color: var(--color-surface-muted);
+    color: var(--color-ink);
+    font-family: ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, Arial, sans-serif;
+    font-size: 0.9375rem;
+    line-height: 1.55;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  /*
+    Focus is never removed, only replaced. A keyboard-only user must always be
+    able to see where they are — the default outline is swapped for a
+    higher-contrast ring, not hidden.
+  */
+  :focus-visible {
+    outline: 2px solid var(--color-accent);
+    outline-offset: 2px;
+    border-radius: 2px;
+  }
+
+  [disabled],
+  [aria-disabled='true'] {
+    cursor: not-allowed;
+  }
+
+  /*
+    Reduced-motion. There is no decorative animation in this app; the only
+    moving thing is the loading skeleton's pulse, which stops here.
+  */
+  @media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.01ms !important;
+      scroll-behavior: auto !important;
+    }
+  }
+}

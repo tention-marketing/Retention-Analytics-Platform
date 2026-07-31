@@ -10,13 +10,19 @@ One repository, two top-level application folders:
 backend/            Fastify API, Postgres migrations, BullMQ queues/workers,
                     Shopify + Klaviyo + Recharge integrations, onboarding
                     backend, verification scripts
-frontend/           React + Vite + Tailwind (created at Phase 5B — does not
-                    exist yet)
+frontend/           Internal agency web interface: React + Vite + Tailwind.
+                    Phase 5B-2A foundation only — see frontend/README.md for
+                    what is and is not built yet
 docker-compose.yml  Postgres 16 + Redis 7 for local development
 ```
 
-`backend/` is an npm workspace. Root `package.json` holds only workspace-level
-command aliases; all runtime dependencies live in `backend/package.json`.
+`backend/` and `frontend/` are npm workspaces. Root `package.json` holds only
+workspace-level command aliases; runtime dependencies live in each workspace's
+own `package.json`.
+
+Unprefixed root commands (`npm run dev`, `build`, `typecheck`) still mean the
+**backend**, exactly as before the frontend existed. Use the `:backend` and
+`:frontend` variants when you need to be explicit.
 
 ## Local development
 
@@ -28,15 +34,23 @@ npm run migrate               # apply backend/src/db/migrations/*.sql in order
 npm run seed                  # 1 fake brand: 2yrs orders + subs + campaigns
 npm run dev                   # API on :3000
 npm run worker                # BullMQ workers (separate process)
+npm run dev:frontend          # agency UI on :5173 (needs the API running)
 ```
+
+The frontend calls the API through a same-origin `/api` prefix that the Vite dev
+server proxies to `:3000`, stripping the prefix. Nothing is cross-origin, so the
+backend needs no CORS configuration. See [frontend/README.md](frontend/README.md).
 
 Environment variables are read from `backend/.env` (npm workspace scripts run
 with `backend/` as their working directory).
 
 ## Commands
 
+### Backend
+
 Every command below can be run from the repo root, or from `backend/` without
-the `-w` indirection.
+the `-w` indirection. Each also has an explicit `:backend` alias
+(`dev:backend`, `build:backend`, `typecheck:backend`).
 
 | Command | Purpose |
 |---|---|
@@ -44,11 +58,23 @@ the `-w` indirection.
 | `npm run worker` | BullMQ workers |
 | `npm run migrate` | Apply pending SQL migrations (idempotent) |
 | `npm run seed` | Reseed the demo brand (**destructive** to that brand's rows) |
+| `npm run bootstrap:user` | Create an agency staff user (`-- you@agency.com`) |
 | `npm run build` | Type-check and emit to `backend/dist/` |
 | `npm run typecheck` | Type-check only, no emit |
 | `npm run verify:recharge` | Phase 3 fixture verification (offline) |
 | `npm run verify:klaviyo` | Phase 4 fixture verification (offline) |
 | `npm run verify:identity` | Identity graph at seed scale |
+| `npm run verify:onboarding` | Phase 5A onboarding + agency hardening (offline) |
+| `npm run verify:shutdown` | Graceful shutdown verification |
+
+### Frontend
+
+| Command | Purpose |
+|---|---|
+| `npm run dev:frontend` | Vite dev server on :5173 (proxies `/api` to :3000) |
+| `npm run build:frontend` | Type-check and build to `frontend/dist/` |
+| `npm run typecheck:frontend` | Type-check only, no emit |
+| `npm run test:frontend` | Vitest unit and component tests |
 
 ### Scripts that need live credentials or mutate data
 

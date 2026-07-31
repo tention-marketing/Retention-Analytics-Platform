@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+
+    <!--
+      Document security policy.
+
+      Referrer-Policy: no-referrer — enforced here as the equivalent <meta name="referrer">
+      so it applies to a statically served build with no server header configuration.
+      This matters more than it looks: Phase 5C will receive a client onboarding token
+      in the URL fragment. Fragments are never transmitted by browsers, but a referer
+      header from any page of this app is one more channel that simply should not exist.
+      Set at the foundation so no later page has to remember it.
+    -->
+    <meta name="referrer" content="no-referrer" />
+
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <title>Tention Pulse — Agency</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
