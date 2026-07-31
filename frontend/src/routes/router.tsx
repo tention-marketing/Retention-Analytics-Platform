@@ -1,24 +1,38 @@
 import { Route, Routes } from 'react-router';
-import { FoundationPage } from '@/pages/FoundationPage';
+import { ProtectedRoute, PublicOnlyRoute } from '@/features/auth/guards';
+import { AgencyHomePage } from '@/pages/AgencyHomePage';
+import { LoginPage } from '@/pages/LoginPage';
 import { NotFoundPage } from '@/pages/NotFoundPage';
 
 /**
  * Route table.
  *
- * Two routes, both temporary. The real map — /login, /accounts, /accounts/new,
- * /accounts/:accountId, /accounts/:accountId/onboarding — arrives with the
- * checkpoints that implement those pages. Declaring them now would mean five
- * routes rendering placeholders, which reads as progress and is not.
+ * Two zones. `/login` is the only route reachable while signed out; everything
+ * else sits behind ProtectedRoute, including the catch-all.
  *
- * `<Routes>` rather than a data router: no loaders or actions are wanted here.
- * Data fetching goes through TanStack Query so that caching, invalidation and
- * retry policy live in exactly one place.
+ * The catch-all is INSIDE the protected zone on purpose. A 404 rendered outside
+ * it would be a page that answers before authentication resolves, and the shape
+ * of that answer tells an unauthenticated visitor which paths exist. Behind the
+ * guard, an unknown path is a not-found page inside the shell for a signed-in
+ * user, and a redirect to /login for everyone else.
  */
 export function AppRoutes() {
   return (
     <Routes>
-      <Route path="/" element={<FoundationPage />} />
-      <Route path="*" element={<NotFoundPage />} />
+      <Route
+        path="/login"
+        element={
+          <PublicOnlyRoute>
+            <LoginPage />
+          </PublicOnlyRoute>
+        }
+      />
+
+      {/* Layout route: the shell and its Outlet mount only once auth resolves. */}
+      <Route element={<ProtectedRoute />}>
+        <Route path="/" element={<AgencyHomePage />} />
+        <Route path="*" element={<NotFoundPage />} />
+      </Route>
     </Routes>
   );
 }

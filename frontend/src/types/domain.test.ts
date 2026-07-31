@@ -75,15 +75,21 @@ describe('backend vocabularies', () => {
 });
 
 describe('AgencyUser', () => {
-  it('models email as possibly absent, matching the session-derived backend field', () => {
-    const withEmail: AgencyUser = { id: 1, email: 'staff@agency.test' };
-    const withoutEmail: AgencyUser = { id: 1, email: undefined };
-    expect(withEmail.email).toBe('staff@agency.test');
-    expect(withoutEmail.email).toBeUndefined();
-  });
-
-  it('carries no password or session field', () => {
+  it('is exactly { id: number, email: string }', () => {
     const user: AgencyUser = { id: 1, email: 'staff@agency.test' };
     expect(Object.keys(user)).toEqual(['id', 'email']);
+    expect(typeof user.id).toBe('number');
+    expect(typeof user.email).toBe('string');
+  });
+
+  it('carries no role, permission, account, token or session field', () => {
+    const user: AgencyUser = { id: 1, email: 'staff@agency.test' };
+    const keys = Object.keys(user);
+    for (const forbidden of [
+      'role', 'roles', 'permissions', 'accountIds', 'organization',
+      'accessToken', 'refreshToken', 'sessionId', 'cookie', 'password',
+    ]) {
+      expect(keys).not.toContain(forbidden);
+    }
   });
 });

@@ -1,76 +1,91 @@
 import { describe, expect, it } from 'vitest';
-import { screen, waitFor } from '@testing-library/react';
+import { screen } from '@testing-library/react';
 import { AppRoutes } from './router';
 import { renderWithProviders } from '@/test/render';
-import { calls, lastCall, stubFetch } from '@/test/server';
+import { calls, stubFetchRoutes, type RouteStub } from '@/test/server';
 
-describe('routing', () => {
-  it('renders the foundation page at /', () => {
-    renderWithProviders(<AppRoutes />, { route: '/' });
-    expect(screen.getByRole('heading', { level: 1, name: 'Frontend foundation ready' })).toBeInTheDocument();
+// Route-table shape. The behaviour of each guard state lives in
+// features/auth/guards.test.tsx; this file is about which routes exist, which
+// zone they belong to, and what the table refuses to expose.
+
+const EMAIL = 'synthetic.agent@example.invalid';
+const ME = 'GET /api/auth/me';
+const SIGNED_IN: RouteStub = { status: 200, json: { id: 4242, email: EMAIL } };
+const SIGNED_OUT: RouteStub = { status: 401, json: { error: 'unauthorized' } };
+
+function renderAt(route: string, me: RouteStub) {
+  stubFetchRoutes({ [ME]: me });
+  return renderWithProviders(<AppRoutes />, { route });
+}
+
+describe('the public zone', () => {
+  it('serves /login to a signed-out visitor', async () => {
+    renderAt('/login', SIGNED_OUT);
+    expect(await screen.findByLabelText('Email address')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Sign in' })).toBeInTheDocument();
   });
 
-  it('renders the 404 page for an unknown route', () => {
-    renderWithProviders(<AppRoutes />, { route: '/definitely-not-a-route' });
-    expect(screen.getByRole('heading', { level: 1, name: 'Page not found' })).toBeInTheDocument();
-  });
-
-  it('renders 404 for a route that a later checkpoint will add', () => {
-    // /accounts is planned but not built. It must 404 today rather than render
-    // a placeholder that reads as a working page.
-    renderWithProviders(<AppRoutes />, { route: '/accounts' });
-    expect(screen.getByRole('heading', { level: 1, name: 'Page not found' })).toBeInTheDocument();
-  });
-
-  it('gives the 404 page a route home without listing what else exists', () => {
-    renderWithProviders(<AppRoutes />, { route: '/nope' });
-    const main = screen.getByRole('main');
-    expect(screen.getByRole('link', { name: 'Return to the start page' })).toHaveAttribute('href', '/');
-    expect(main).not.toHaveTextContent('/accounts');
-    expect(main).not.toHaveTextContent('/login');
+  it('is the only route reachable while signed out', async () => {
+    renderAt('/', SIGNED_OUT);
+    expect(await screen.findByLabelText('Email address')).toBeInTheDocument();
   });
 });
 
-describe('foundation page', () => {
-  it('states that requests go through the /api prefix', () => {
-    renderWithProviders(<AppRoutes />, { route: '/' });
-    expect(screen.getAllByText(/\/api/).length).toBeGreaterThan(0);
+describe('the protected zone', () => {
+  it('serves the agency home at /', async () => {
+    renderAt('/', SIGNED_IN);
+    expect(await screen.findByRole('heading', { name: 'Agency home' })).toBeInTheDocument();
   });
 
-  it('shows no business data, statistics, or placeholder account', () => {
-    renderWithProviders(<AppRoutes />, { route: '/' });
+  it('renders unknown routes as a not-found page inside the shell', async () => {
+    renderAt('/no-such-route', SIGNED_IN);
+    expect(await screen.findByRole('heading', { name: 'Page not found' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Sign out' })).toBeInTheDocument();
+  });
+
+  it('gives the not-found page a route home without listing what exists', async () => {
+    renderAt('/no-such-route', SIGNED_IN);
+    await screen.findByRole('heading', { name: 'Page not found' });
+    expect(screen.getByRole('link', { name: 'Return to agency home' })).toHaveAttribute('href', '/');
     const main = screen.getByRole('main');
-    for (const forbidden of ['Acme', 'Revenue', 'RCM', 'Churn', 'customers', 'Tier']) {
-      expect(main).not.toHaveTextContent(forbidden);
+    expect(main).not.toHaveTextContent('/accounts');
+    expect(main).not.toHaveTextContent('/login');
+  });
+
+  it('shows no invented metrics, totals, or provider state', async () => {
+    renderAt('/', SIGNED_IN);
+    await screen.findByRole('heading', { name: 'Agency home' });
+    const main = screen.getByRole('main');
+    for (const invented of [
+      'Revenue', 'RCM', 'Churn', 'Tier', 'Shopify', 'Klaviyo', 'Recharge',
+      'accounts connected', 'Total', 'customers',
+    ]) {
+      expect(main).not.toHaveTextContent(invented);
     }
   });
 
-  it('issues no request until the connectivity check is pressed', () => {
-    stubFetch({ json: { ok: true } });
-    renderWithProviders(<AppRoutes />, { route: '/' });
-    expect(calls).toHaveLength(0);
+  it('states plainly that later features are not built', async () => {
+    renderAt('/', SIGNED_IN);
+    expect(await screen.findByRole('heading', { name: 'Not built yet' })).toBeInTheDocument();
+  });
+});
+
+describe('the route table talks only to /api', () => {
+  it('resolves authentication through the same-origin proxy prefix', async () => {
+    renderAt('/', SIGNED_IN);
+    await screen.findByRole('heading', { name: 'Agency home' });
+    expect(calls.length).toBeGreaterThan(0);
+    for (const call of calls) {
+      expect(call.url.startsWith('/api/')).toBe(true);
+      expect(call.credentials).toBe('include');
+    }
   });
 
-  it('calls /api/health with credentials when the check is pressed', async () => {
-    stubFetch({ json: { ok: true } });
-    const { user } = renderWithProviders(<AppRoutes />, { route: '/' });
-
-    await user.click(screen.getByRole('button', { name: 'Check API connectivity' }));
-
-    await waitFor(() => expect(calls).toHaveLength(1));
-    expect(lastCall().url).toBe('/api/health');
-    expect(lastCall().credentials).toBe('include');
-    expect(await screen.findByText('Backend reachable')).toBeInTheDocument();
-  });
-
-  it('shows a safe error panel when the API is unreachable', async () => {
-    stubFetch({ status: 500, json: { message: 'at /Users/deployuser/app/index.js' } });
-    const { user } = renderWithProviders(<AppRoutes />, { route: '/' });
-
-    await user.click(screen.getByRole('button', { name: 'Check API connectivity' }));
-
-    const alert = await screen.findByRole('alert');
-    expect(alert).toHaveTextContent('Could not reach the API');
-    expect(alert).not.toHaveTextContent('/Users/');
+  it('never calls a client-scoped onboarding route', async () => {
+    renderAt('/', SIGNED_IN);
+    await screen.findByRole('heading', { name: 'Agency home' });
+    for (const call of calls) {
+      expect(call.url.startsWith('/api/onboarding')).toBe(false);
+    }
   });
 });

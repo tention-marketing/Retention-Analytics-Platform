@@ -127,6 +127,42 @@ export function stubFetchSequence(stubs: StubResponse[]): void {
   );
 }
 
+/**
+ * Dispatch by `METHOD /path`, so one test can answer /auth/me and /auth/login
+ * differently. A route may be a fixed stub, or a function receiving the
+ * zero-based call index for that route — which is how "fails, then succeeds on
+ * retry" is expressed.
+ */
+export type RouteStub = StubResponse | ((attempt: number) => StubResponse);
+
+export function stubFetchRoutes(routes: Record<string, RouteStub>): void {
+  const attempts = new Map<string, number>();
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      record(input, init);
+      const method = (init?.method ?? 'GET').toUpperCase();
+      const path = String(input).split('?')[0];
+      const key = `${method} ${path}`;
+      const route = routes[key];
+      if (route === undefined) {
+        // An unrouted call is a test bug, not a 404 to be silently swallowed.
+        throw new Error(`No stub registered for ${key}`);
+      }
+      const attempt = attempts.get(key) ?? 0;
+      attempts.set(key, attempt + 1);
+      return buildResponse(typeof route === 'function' ? route(attempt) : route);
+    }),
+  );
+}
+
+/** How many times a given `METHOD /path` was requested. */
+export function callCountFor(method: string, path: string): number {
+  return calls.filter(
+    (c) => c.method.toUpperCase() === method.toUpperCase() && c.url.split('?')[0] === path,
+  ).length;
+}
+
 export function resetCalls(): void {
   calls.length = 0;
 }

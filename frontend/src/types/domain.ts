@@ -65,12 +65,20 @@ export interface SafeFailure {
 }
 
 /**
- * GET /auth/me — backend/src/routes/auth.ts.
+ * The authenticated agency user. Source: GET /auth/me and POST /auth/login.
  *
- * `email` is read from the session and is typed optional there, so it is
- * optional here too rather than being asserted into existence.
+ * Exactly two fields. There is no role, permission set, account list,
+ * organization, token or session identifier — the backend does not return any
+ * of those (its own verification asserts both routes return exactly
+ * `{id, email}`), and inventing one here would create a client-side
+ * authorization model that no server check stands behind.
+ *
+ * `email` is required. The backend's session type marks it optional, but both
+ * writers set it together with `userId`, and a response missing it is a
+ * malformed payload rather than a valid anonymous-ish user — so api/auth.ts
+ * validates the shape at the boundary instead of pushing `undefined` into the UI.
  */
 export interface AgencyUser {
   id: number;
-  email: string | undefined;
+  email: string;
 }

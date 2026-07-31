@@ -103,4 +103,46 @@ describe('source-level security discipline', () => {
       expect(code, path).not.toMatch(/console\.\w+\(/);
     }
   });
+
+  // The backend now decides whether a login is allowed partly from Origin and
+  // Sec-Fetch-Site. Those are browser-controlled forbidden header names: fetch
+  // silently drops any attempt to set them, so spoofing cannot work — but code
+  // that tries is code that misunderstands the control, and it would read as
+  // though the frontend were asserting its own trustworthiness. The browser
+  // generates them; this app never touches them.
+  //
+  // Matches a quoted object key or a setRequestHeader argument only, so
+  // `window.location.origin` and `url.origin` are correctly ignored.
+  const FORBIDDEN_HEADERS = ['origin', 'referer', 'referrer', 'host', 'sec-fetch-site',
+    'sec-fetch-mode', 'sec-fetch-dest', 'sec-fetch-user'] as const;
+
+  it.each(FORBIDDEN_HEADERS)('never sets the browser-controlled "%s" header', (header) => {
+    const asObjectKey = new RegExp(`['"\`]${header}['"\`]\\s*:`, 'i');
+    const asSetHeader = new RegExp(`setRequestHeader\\s*\\(\\s*['"\`]${header}['"\`]`, 'i');
+    const asHeadersApi = new RegExp(`\\.(?:set|append)\\s*\\(\\s*['"\`]${header}['"\`]`, 'i');
+    for (const [path, code] of sourceEntries()) {
+      expect(code, `${path} sets ${header}`).not.toMatch(asObjectKey);
+      expect(code, `${path} sets ${header}`).not.toMatch(asSetHeader);
+      expect(code, `${path} sets ${header}`).not.toMatch(asHeadersApi);
+    }
+  });
+
+  it('sets only Accept and Content-Type in the API client', () => {
+    const client = sourceEntries().find(([path]) => path.endsWith('/api/client.ts'))?.[1] ?? '';
+    expect(client).not.toBe('');
+
+    // Both forms the client uses: an object key (`Accept: '…'`) and a bracket
+    // assignment (`headers['Content-Type'] = '…'`).
+    const names = [
+      ...[...client.matchAll(/^\s*(?:'([^']+)'|"([^"]+)"|([A-Za-z][\w-]*)):\s*['"`]/gm)]
+        .map((m) => m[1] ?? m[2] ?? m[3] ?? ''),
+      ...[...client.matchAll(/headers\[\s*['"`]([^'"`]+)['"`]\s*\]\s*=/g)].map((m) => m[1] ?? ''),
+    ].map((n) => n.toLowerCase());
+
+    expect(names).toContain('accept');
+    expect(names).toContain('content-type');
+    for (const forbidden of FORBIDDEN_HEADERS) {
+      expect(names, `client.ts sets ${forbidden}`).not.toContain(forbidden);
+    }
+  });
 });
