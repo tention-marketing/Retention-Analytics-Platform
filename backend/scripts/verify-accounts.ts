@@ -396,20 +396,20 @@ async function groupC(app: App, cookie: string): Promise<void> {
 
   // And nothing at all was written by the whole group.
   const leftovers = await query<{ n: string }>(
-    `SELECT count(*) n FROM accounts WHERE name LIKE $1`, [`${TEST_PREFIX}reject_%`],
+    `SELECT count(*) n FROM accounts WHERE starts_with(name, $1)`, [`${TEST_PREFIX}reject_`],
   );
   check('the rejection cases left no rows behind', Number(leftovers.rows[0]!.n) === 0,
     leftovers.rows[0]);
   const sameLeftovers = await query<{ n: string }>(
-    `SELECT count(*) n FROM accounts WHERE name LIKE $1`, [`${TEST_PREFIX}same_%`],
+    `SELECT count(*) n FROM accounts WHERE starts_with(name, $1)`, [`${TEST_PREFIX}same_`],
   );
   check('the byte-identity cases left no rows behind', Number(sameLeftovers.rows[0]!.n) === 0);
 
   // No invalid timezone reached the column by any route this suite exercised.
   const bad = await query<{ n: string }>(
     `SELECT count(*) n FROM accounts
-      WHERE name LIKE $1 AND store_timezone NOT IN
-            ('Europe/London','Asia/Tokyo','America/Los_Angeles')`, [`${TEST_PREFIX}%`],
+      WHERE starts_with(name, $1) AND store_timezone NOT IN
+            ('Europe/London','Asia/Tokyo','America/Los_Angeles')`, [TEST_PREFIX],
   );
   check('no synthetic account holds an unexpected timezone', Number(bad.rows[0]!.n) === 0,
     bad.rows[0]);
@@ -487,12 +487,16 @@ async function groupD(app: App, agencyCookie: string, keep: number[]): Promise<v
 // ---------------------------------------------------------------------------
 async function cleanup(): Promise<void> {
   console.log('\nCleanup');
+  // starts_with, NOT LIKE. `_` is a LIKE wildcard matching any single
+  // character, so `LIKE '__acctsec_%'` would also match an account named
+  // "XYacctsecZ…". An over-broad DELETE against the accounts table is not a risk
+  // worth carrying in a script that runs against a real database.
   const links = await query(
     `DELETE FROM onboarding_links WHERE account_id IN
-       (SELECT id FROM accounts WHERE name LIKE $1)`, [`${TEST_PREFIX}%`],
+       (SELECT id FROM accounts WHERE starts_with(name, $1))`, [TEST_PREFIX],
   ).catch(() => ({ rowCount: 0 }));
-  const accts = await query(`DELETE FROM accounts WHERE name LIKE $1`, [`${TEST_PREFIX}%`]);
-  const users = await query(`DELETE FROM users WHERE email LIKE $1`, [`${TEST_PREFIX}%`]);
+  const accts = await query(`DELETE FROM accounts WHERE starts_with(name, $1)`, [TEST_PREFIX]);
+  const users = await query(`DELETE FROM users WHERE starts_with(email, $1)`, [TEST_PREFIX]);
   console.log(`  removed ${links.rowCount ?? 0} onboarding link(s)`);
   console.log(`  removed ${accts.rowCount ?? 0} synthetic account(s)`);
   console.log(`  removed ${users.rowCount ?? 0} synthetic user(s)`);
