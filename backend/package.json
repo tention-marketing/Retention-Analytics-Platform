@@ -20,6 +20,7 @@
     "verify:identity": "tsx scripts/verify-identity-scale.ts",
     "verify:klaviyo-live": "tsx scripts/verify-klaviyo-live.ts",
     "verify:accounts": "tsx scripts/verify-accounts.ts",
+    "verify:connections": "tsx scripts/verify-connections.ts",
     "verify:onboarding": "tsx scripts/verify-onboarding.ts",
     "verify:auth-security": "tsx scripts/verify-auth-security.ts",
     "verify:shutdown": "tsx scripts/verify-shutdown.ts"

@@ -1,12 +1,14 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import {
+  connectKlaviyoForAccount, connectRechargeForAccount, connectShopifyForAccount,
   createOnboardingLink, getAgencyOnboardingStatus, getOnboardingLinks, revokeOnboardingLink,
+  skipProviderForAccount, type ShopifyCredentialsInput,
 } from '@/api/onboarding';
 import { queryKeys } from '@/api/queryKeys';
 import { useSessionExpiryReporter } from '@/features/auth/useAuth';
 import type {
-  AgencyOnboardingStatus, IssuedOnboardingLink, OnboardingLinkSummary,
+  AgencyOnboardingStatus, IssuedOnboardingLink, OnboardingLinkSummary, Provider, SyncState,
 } from '@/types/domain';
 
 // Onboarding state for one account.
@@ -31,6 +33,29 @@ export interface UseOnboardingStatusResult {
   error: unknown;
   refresh: () => void;
   isRefreshing: boolean;
+  /** True while a provider sync is active and the query is on its interval. */
+  isPolling: boolean;
+}
+
+/**
+ * The sync states that mean work is genuinely in flight.
+ *
+ * Taken from ClientSyncState in backend/src/onboarding/progress.ts, and matching
+ * exactly what isSyncRunning() there treats as running. The other six —
+ * not_started, completed, connected, failed, skipped, requested — are terminal
+ * or idle, and polling through them would be a request every five seconds
+ * forever on a page nobody is watching.
+ */
+const ACTIVE_SYNC_STATES: readonly SyncState[] = [
+  'waiting', 'syncing', 'retrying', 'sync_delayed',
+];
+
+/** How often to re-ask while a sync is genuinely running. */
+const POLL_INTERVAL_MS = 5000;
+
+export function isSyncActive(status: AgencyOnboardingStatus | undefined | null): boolean {
+  if (!status) return false;
+  return status.progress.some((p) => ACTIVE_SYNC_STATES.includes(p.state));
 }
 
 export function useOnboardingStatus(accountId: number): UseOnboardingStatusResult {
@@ -38,6 +63,24 @@ export function useOnboardingStatus(accountId: number): UseOnboardingStatusResul
   const query = useQuery<AgencyOnboardingStatus>({
     queryKey: queryKeys.accounts.onboardingStatus(accountId),
     queryFn: ({ signal }) => getAgencyOnboardingStatus(accountId, signal),
+
+    // POLLING, DRIVEN BY THE DATA ITSELF.
+    //
+    // A function rather than a number, so the decision is re-made from the
+    // latest response every time: the moment the last active provider reaches a
+    // terminal state, this returns false and the interval stops. There is no
+    // setInterval anywhere in this feature — a hand-rolled timer is a second
+    // lifecycle to get wrong, and it would keep firing after the query was
+    // disabled, after an error, and after the component unmounted.
+    //
+    // TanStack clears the interval on unmount, so leaving the page, switching
+    // account (the control centre is keyed on the id and remounts) and the
+    // sign-out that unmounts the tree all stop it with no extra code.
+    refetchInterval: (q) => (isSyncActive(q.state.data) ? POLL_INTERVAL_MS : false),
+    // Never poll a tab nobody is looking at. A backgrounded workspace left open
+    // overnight would otherwise make ~17,000 requests, each one fanning out to
+    // Redis per provider, to update a screen no one can see.
+    refetchIntervalInBackground: false,
   });
 
   useEffect(() => {
@@ -48,11 +91,11 @@ export function useOnboardingStatus(accountId: number): UseOnboardingStatusResul
     status: query.isPending ? 'loading' : query.isError ? 'error' : 'ready',
     data: query.data ?? null,
     error: query.error,
-    // MANUAL only. There is no polling in this checkpoint: a background refetch
-    // of an agency page nobody is watching costs a Redis round trip per provider
-    // per interval, and the sync it would be watching takes minutes to hours.
+    // Manual refresh stays, and is the only way to update once everything has
+    // settled.
     refresh: () => void query.refetch(),
     isRefreshing: query.isFetching,
+    isPolling: isSyncActive(query.data),
   };
 }
 
@@ -258,6 +301,192 @@ export function useRevokeOnboardingLink(accountId: number): UseRevokeOnboardingL
       mutation.mutate(linkId);
     },
     pendingLinkId: mutation.isPending ? pendingLinkId : null,
+    error: mutation.error,
+    reset: mutation.reset,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Provider connections — the credential path
+// ---------------------------------------------------------------------------
+
+export interface UseConnectProviderResult<TCredentials> {
+  submit: (credentials: TCredentials) => void;
+  isSubmitting: boolean;
+  error: unknown;
+  /** Set once after a successful connect, for the confirmation message. */
+  succeeded: { queued: boolean } | null;
+  reset: () => void;
+}
+
+/**
+ * Submit provider credentials.
+ *
+ * DELIBERATELY NOT useMutation, and for a sharper reason than the one-time link
+ * was. A mutation retains not only its last `data` but its last VARIABLES — and
+ * the variables here ARE the credential. `mutation.state.variables` would hold a
+ * Shopify client secret, a Klaviyo private key or a Recharge admin token in a
+ * global store, readable from devtools and from any component with the query
+ * client, until the mutation was garbage-collected. There is no configuration
+ * that turns that off; the only fix is not to use the mechanism.
+ *
+ * So the request is a plain awaited call. The credential exists in the form's
+ * state, in the argument to this function, and in the request body — and
+ * nowhere else. The caller clears its own fields the moment this settles,
+ * success or failure.
+ *
+ * Nothing here retries. A rejected credential cannot become correct by being
+ * sent again, and a silent replay of a credential submission is one more copy of
+ * a secret on the wire.
+ *
+ * NOTHING HERE LOGS. Not the credential, not the response, not the error. The
+ * caught value is passed to the shared 401 reporter and to the caller's fixed
+ * message mapper, and is never given to console.
+ */
+function useConnectProvider<TCredentials>(
+  accountId: number,
+  action: 'connect-shopify' | 'connect-klaviyo' | 'connect-recharge',
+  send: (accountId: number, credentials: TCredentials) => Promise<{ queued: boolean }>,
+): UseConnectProviderResult<TCredentials> {
+  const queryClient = useQueryClient();
+  const reportSessionExpiry = useSessionExpiryReporter();
+
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [error, setError] = useState<unknown>(null);
+  const [succeeded, setSucceeded] = useState<{ queued: boolean } | null>(null);
+
+  // A ref, not the state: two clicks in one tick would both read
+  // `isSubmitting === false` and both fire, and a duplicate connect is a second
+  // verification round-trip with the same secret.
+  const inFlight = useRef(false);
+  const mounted = useRef(true);
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+    };
+  }, []);
+
+  // Switching account must not carry one brand's submission state onto another's.
+  useEffect(() => {
+    setError(null);
+    setSucceeded(null);
+  }, [accountId]);
+
+  const submit = useCallback((credentials: TCredentials) => {
+    if (inFlight.current) return;
+    inFlight.current = true;
+    setIsSubmitting(true);
+    setError(null);
+    setSucceeded(null);
+
+    void (async () => {
+      try {
+        const outcome = await send(accountId, credentials);
+        if (mounted.current) setSucceeded({ queued: outcome.queued });
+
+        // Provider state lives in the status query, so that is what has to be
+        // re-read. Link queries are untouched: connecting a platform has nothing
+        // to do with setup links, and invalidating them would be an extra
+        // request that answers a question nobody asked.
+        void queryClient
+          .invalidateQueries({ queryKey: queryKeys.accounts.onboardingStatus(accountId) })
+          .catch(() => undefined);
+
+        // Shopify's verification also writes the account's store timezone and
+        // currency (E6), so the directory row this account renders from is now
+        // stale. The other two providers touch nothing on the account record.
+        if (action === 'connect-shopify') {
+          void queryClient
+            .invalidateQueries({ queryKey: queryKeys.accounts.list() })
+            .catch(() => undefined);
+        }
+      } catch (cause) {
+        reportSessionExpiry(cause);
+        if (mounted.current) setError(cause);
+      } finally {
+        inFlight.current = false;
+        if (mounted.current) setIsSubmitting(false);
+      }
+    })();
+  }, [accountId, action, queryClient, reportSessionExpiry, send]);
+
+  const reset = useCallback(() => {
+    setError(null);
+    setSucceeded(null);
+  }, []);
+
+  return { submit, isSubmitting, error, succeeded, reset };
+}
+
+export function useConnectShopify(accountId: number) {
+  return useConnectProvider<ShopifyCredentialsInput>(
+    accountId, 'connect-shopify', connectShopifyForAccount,
+  );
+}
+
+export function useConnectKlaviyo(accountId: number) {
+  return useConnectProvider<{ apiKey: string }>(
+    accountId, 'connect-klaviyo', connectKlaviyoForAccount,
+  );
+}
+
+export function useConnectRecharge(accountId: number) {
+  return useConnectProvider<{ token: string }>(
+    accountId, 'connect-recharge', connectRechargeForAccount,
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Skipping a provider
+// ---------------------------------------------------------------------------
+
+export interface UseSkipProviderResult {
+  skip: (provider: Provider) => void;
+  /** Which provider is being skipped, so only that card shows a busy state. */
+  pendingProvider: Provider | null;
+  error: unknown;
+  reset: () => void;
+}
+
+/**
+ * Record that a brand does not use a platform.
+ *
+ * useMutation is fine here where it was not for credentials: the variable is a
+ * provider name, which is not a secret, and the response carries no credential.
+ *
+ * NO OPTIMISTIC UPDATE. Painting a card as skipped before the server agrees
+ * would show an agency a decision that had not been recorded — and this decision
+ * is what stops a platform blocking setup completion.
+ */
+export function useSkipProvider(accountId: number): UseSkipProviderResult {
+  const queryClient = useQueryClient();
+  const reportSessionExpiry = useSessionExpiryReporter();
+  const [pendingProvider, setPendingProvider] = useState<Provider | null>(null);
+
+  const mutation = useMutation({
+    mutationFn: (provider: Provider) => skipProviderForAccount(accountId, provider),
+    retry: false,
+    onSettled: async () => {
+      setPendingProvider(null);
+      // Refetched even after a failure: a skip that 400'd because the card was
+      // showing stale state is exactly when the state most needs re-reading.
+      await queryClient
+        .invalidateQueries({ queryKey: queryKeys.accounts.onboardingStatus(accountId) })
+        .catch(() => undefined);
+    },
+    onError: (cause) => {
+      reportSessionExpiry(cause);
+    },
+  });
+
+  return {
+    skip: (provider: Provider) => {
+      if (mutation.isPending) return;
+      setPendingProvider(provider);
+      mutation.mutate(provider);
+    },
+    pendingProvider: mutation.isPending ? pendingProvider : null,
     error: mutation.error,
     reset: mutation.reset,
   };

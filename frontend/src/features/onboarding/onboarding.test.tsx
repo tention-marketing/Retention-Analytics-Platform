@@ -300,15 +300,23 @@ describe('the setup overview', () => {
 // Providers
 // ===========================================================================
 describe('the platform section', () => {
-  it('shows each provider read-only, with no action', async () => {
+  it('shows all three providers', async () => {
+    await openWorkspace();
+    await screen.findByRole('heading', { name: 'Shopify', level: 3 });
+    expect(screen.getByRole('heading', { name: 'Klaviyo', level: 3 })).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: 'Recharge', level: 3 })).toBeInTheDocument();
+  });
+
+  it('offers no action the backend cannot carry out', async () => {
+    // Replaces 5B-2D's blanket "no actions at all". Connect and skip now exist;
+    // these three must never appear, because there is no endpoint behind any of
+    // them and a control that cannot act is worse than an absent one. Retry is
+    // included because there is no provider retry endpoint to invent.
     await openWorkspace();
     await screen.findByRole('heading', { name: 'Shopify', level: 3 });
 
-    expect(screen.getByRole('heading', { name: 'Klaviyo', level: 3 })).toBeInTheDocument();
-    expect(screen.getByRole('heading', { name: 'Recharge', level: 3 })).toBeInTheDocument();
-
-    for (const action of ['Connect', 'Reconnect', 'Skip', 'Retry sync', 'Disconnect']) {
-      expect(screen.queryByRole('button', { name: new RegExp(action, 'i') })).toBeNull();
+    for (const action of [/disconnect/i, /^delete/i, /remove .*(platform|connection)/i, /retry sync/i]) {
+      expect(screen.queryByRole('button', { name: action })).toBeNull();
     }
   });
 

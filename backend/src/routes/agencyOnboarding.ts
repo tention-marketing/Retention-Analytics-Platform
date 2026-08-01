@@ -6,7 +6,7 @@ import { canCompleteOnboarding, getRcmReadiness, markOnboardingComplete, isOnboa
 import { getCapabilities } from '../onboarding/capabilities.js';
 import { getAgencyProgress, isSyncRunning } from '../onboarding/progress.js';
 import { getProviderStatuses, isProvider, setSkipped } from '../onboarding/choices.js';
-import { connectShopify } from '../onboarding/connect.js';
+import { connectShopify, connectKlaviyo, connectRecharge } from '../onboarding/connect.js';
 import { config } from '../config.js';
 import {
   getSkuCoverage, getAccountCosts, setCogsMethod, setBlendedMargin, upsertSkuCosts, setOcas,
@@ -228,9 +228,58 @@ export async function agencyOnboardingRoutes(app: FastifyInstance): Promise<void
     return reply.code(result.queued ? 202 : 200).send(result);
   });
 
-  // Klaviyo and Recharge are connected through the existing agency routes
-  // (POST /connections/klaviyo, POST /connections/recharge), which now delegate to
-  // the same shared services. They are deliberately NOT duplicated here.
+  /**
+   * Klaviyo and Recharge, account-scoped.
+   *
+   * These used to be reachable only through POST /connections/klaviyo and
+   * POST /connections/recharge, which take the account id FROM THE REQUEST BODY.
+   * That was tolerable while the only callers were verification scripts, and it
+   * is not tolerable for a browser: the account being written to should be the
+   * one in the protected path, not a number the caller puts in a JSON field, and
+   * every other agency route in this file already works that way.
+   *
+   * THIN DELEGATES, deliberately. They add no connection logic — verification,
+   * encryption, the upsert and the enqueue all stay in onboarding/connect.ts,
+   * shared with the client wizard, so the two surfaces cannot drift apart. The
+   * status mapping is copied from the Shopify route directly above so all three
+   * providers answer alike.
+   *
+   * NO ENV FALLBACK, and no `mode`. The legacy routes accept
+   * `useEnvCredentials: true`, which substitutes a single .env credential for a
+   * blank field — on a per-brand route that is the cross-tenant hazard trap 8
+   * describes, and there is no browser flow that should ever want it. `mode` is
+   * likewise absent: 'sync' runs a full backfill inline inside the request, which
+   * is a verification-script affordance, not something a UI should be able to ask
+   * for. Both are simply not read here, so neither can be turned on by a caller.
+   */
+  app.post('/accounts/:id/connections/klaviyo', async (req, reply) => {
+    const accountId = await accountIdParam(req, reply);
+    if (accountId === null) return;
+
+    const { apiKey } = (req.body ?? {}) as { apiKey?: unknown };
+    const result = await connectKlaviyo(accountId, {
+      apiKey: typeof apiKey === 'string' ? apiKey : '',
+    });
+    if (!result.ok) {
+      // The Klaviyo client redacts anything key-shaped before this point.
+      return reply.code(result.code === 'verification_failed' ? 502 : 400).send(result);
+    }
+    return reply.code(result.queued ? 202 : 200).send(result);
+  });
+
+  app.post('/accounts/:id/connections/recharge', async (req, reply) => {
+    const accountId = await accountIdParam(req, reply);
+    if (accountId === null) return;
+
+    const { token } = (req.body ?? {}) as { token?: unknown };
+    const result = await connectRecharge(accountId, {
+      token: typeof token === 'string' ? token : '',
+    });
+    if (!result.ok) {
+      return reply.code(result.code === 'verification_failed' ? 502 : 400).send(result);
+    }
+    return reply.code(result.queued ? 202 : 200).send(result);
+  });
 
   app.post('/accounts/:id/connections/:provider/skip', async (req, reply) => {
     const accountId = await accountIdParam(req, reply);

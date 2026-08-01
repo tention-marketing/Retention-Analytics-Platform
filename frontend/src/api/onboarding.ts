@@ -6,7 +6,8 @@ import {
   type OnboardingBlockerDetail, type OnboardingLinkSummary, type OnboardingLinkStatus,
   type Provider, type ProviderState, type ProviderStatusSummary, type ProviderSyncProgress,
   type RcmReadiness, type SafeFailure, type SyncState, type FailureCategory,
-  type OnboardingUiStates,
+  type OnboardingUiStates, type ProviderConnectionOutcome, type ProviderSkipOutcome,
+  type ShopifyConnectionOutcome,
 } from '@/types/domain';
 
 // The four agency onboarding calls.
@@ -381,5 +382,160 @@ export async function getAgencyOnboardingStatus(
     providers: body.providers.map(parseProviderStatus),
     progress: body.progress.map(parseProgress),
     uiStates: parseUiStates(body.uiStates),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Provider connections
+// ---------------------------------------------------------------------------
+
+/**
+ * Field names that mean a credential came back in a response.
+ *
+ * A THIRD TRIPWIRE, and the most important one. These routes are the only place
+ * in the product where a browser sends a provider secret, so a response echoing
+ * one back is the single worst outcome available here — it would be in the
+ * network tab, in any HAR someone exports, and in whatever the UI did with it
+ * next. The backend does not do this today (asserted in verify:connections), and
+ * if that ever changes the response is refused rather than rendered around.
+ *
+ * `token` is on the list even though a link summary uses the same word: nothing
+ * on a connection response should carry a field by that name either.
+ */
+const CREDENTIAL_KEYS = [
+  'clientSecret', 'client_secret', 'clientId', 'client_id',
+  'apiKey', 'api_key', 'token', 'accessToken', 'access_token',
+  'credentials', 'credentials_encrypted', 'password', 'secret',
+] as const;
+
+/** Recursively refuse a payload carrying a credential-shaped key at any depth. */
+function assertNoCredentialEcho(value: unknown, depth = 0): void {
+  if (depth > 6 || value === null || typeof value !== 'object') return;
+  if (Array.isArray(value)) {
+    for (const item of value) assertNoCredentialEcho(item, depth + 1);
+    return;
+  }
+  for (const [key, nested] of Object.entries(value)) {
+    if ((CREDENTIAL_KEYS as readonly string[]).includes(key)) {
+      malformed('connection_response_contains_credential');
+    }
+    assertNoCredentialEcho(nested, depth + 1);
+  }
+}
+
+/**
+ * The shared shape of a successful connect, stripped to what may be shown.
+ *
+ * `shop`, `account`, `store` and `backfill` are read past deliberately: they are
+ * raw provider payloads. Nothing constructs them into the result, so nothing can
+ * render them.
+ */
+function parseConnectionOutcome(body: unknown): ProviderConnectionOutcome {
+  if (!isRecord(body)) malformed('malformed_connection_response');
+  assertNoCredentialEcho(body);
+  if (body.ok !== true) malformed('malformed_connection_response');
+  if (typeof body.queued !== 'boolean') malformed('malformed_connection_response');
+  return { ok: true, queued: body.queued };
+}
+
+export interface ShopifyCredentialsInput {
+  shopDomain: string;
+  clientId: string;
+  clientSecret: string;
+}
+
+/**
+ * POST /accounts/:id/connections/shopify/credentials.
+ *
+ * THE REQUEST CARRIES EXACTLY THREE FIELDS. No `accountId` — the account is the
+ * path segment, which is the thing the session is authorised against. No
+ * `useEnvCredentials`, which on a per-brand route would bind one brand's stored
+ * .env credential to another. No `mode`, whose 'sync' value runs an entire
+ * backfill inline inside the request. None of the three is optional-but-omitted;
+ * they are absent from the type, so no call site can pass one.
+ */
+export async function connectShopifyForAccount(
+  accountId: number,
+  credentials: ShopifyCredentialsInput,
+): Promise<ShopifyConnectionOutcome> {
+  const body = await api.post<unknown>(`/accounts/${accountId}/connections/shopify/credentials`, {
+    shopDomain: credentials.shopDomain,
+    clientId: credentials.clientId,
+    clientSecret: credentials.clientSecret,
+  });
+
+  const base = parseConnectionOutcome(body);
+  const row = body as Record<string, unknown>;
+  if (typeof row.shopDomain !== 'string' || row.shopDomain === '') {
+    malformed('malformed_connection_response');
+  }
+  if (typeof row.timezoneApplied !== 'boolean') malformed('malformed_connection_response');
+
+  // `currency` is `{ outcome, currency, detected } | null`. Only the detected
+  // code is taken, and only when it looks like one — currency handling proper
+  // belongs to the checkpoint that builds it.
+  let detectedCurrency: string | null = null;
+  if (isRecord(row.currency)) {
+    const detected = row.currency.detected;
+    if (typeof detected === 'string' && /^[A-Z]{3}$/.test(detected)) detectedCurrency = detected;
+  }
+
+  return {
+    ok: true,
+    queued: base.queued,
+    shopDomain: row.shopDomain,
+    timezoneApplied: row.timezoneApplied,
+    detectedCurrency,
+  };
+}
+
+/** POST /accounts/:id/connections/klaviyo. One field, and only that field. */
+export async function connectKlaviyoForAccount(
+  accountId: number,
+  credentials: { apiKey: string },
+): Promise<ProviderConnectionOutcome> {
+  const body = await api.post<unknown>(`/accounts/${accountId}/connections/klaviyo`, {
+    apiKey: credentials.apiKey,
+  });
+  return parseConnectionOutcome(body);
+}
+
+/** POST /accounts/:id/connections/recharge. One field, and only that field. */
+export async function connectRechargeForAccount(
+  accountId: number,
+  credentials: { token: string },
+): Promise<ProviderConnectionOutcome> {
+  const body = await api.post<unknown>(`/accounts/${accountId}/connections/recharge`, {
+    token: credentials.token,
+  });
+  return parseConnectionOutcome(body);
+}
+
+/**
+ * POST /accounts/:id/connections/:provider/skip.
+ *
+ * BODYLESS. Fastify rejects a request that declares `application/json` and then
+ * sends nothing (`FST_ERR_CTP_EMPTY_JSON_BODY`, confirmed against the running
+ * server), and the shared client only sets Content-Type when there is a body —
+ * so passing no body is both correct and the only thing that works.
+ *
+ * Records an intent. It creates no connection row and deletes nothing, which is
+ * exactly what the confirmation copy tells the user.
+ */
+export async function skipProviderForAccount(
+  accountId: number,
+  provider: Provider,
+): Promise<ProviderSkipOutcome> {
+  const body = await api.post<unknown>(`/accounts/${accountId}/connections/${provider}/skip`);
+
+  if (!isRecord(body)) malformed('malformed_skip_response');
+  if (!isMember<Provider>(PROVIDERS, body.provider)) malformed('malformed_skip_response');
+  if (body.state !== 'skipped') malformed('malformed_skip_response');
+  if (!Array.isArray(body.providers)) malformed('malformed_skip_response');
+
+  return {
+    provider: body.provider,
+    state: 'skipped',
+    providers: body.providers.map(parseProviderStatus),
   };
 }

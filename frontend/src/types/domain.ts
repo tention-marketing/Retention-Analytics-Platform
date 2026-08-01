@@ -323,3 +323,75 @@ export interface AgencyOnboardingStatus {
   progress: ProviderSyncProgress[];
   uiStates: OnboardingUiStates;
 }
+
+// ---------------------------------------------------------------------------
+// Provider connections
+// ---------------------------------------------------------------------------
+
+/**
+ * backend/src/onboarding/connect.ts — ConnectFailure codes.
+ *
+ * These are what the UI branches on. The accompanying `message` is NEVER
+ * rendered: for `verification_failed` the backend interpolates the provider's
+ * own exception text into it (verified — a bad domain came back as
+ * "Shopify verification failed: Shopify client_credentials token exchange failed
+ * for … : HTTP 404"), which is a provider response body on an agency screen.
+ */
+export const CONNECTION_FAILURE_CODES = [
+  'missing_credentials',
+  'account_not_found',
+  'invalid_domain',
+  'domain_conflict',
+  'verification_failed',
+] as const;
+export type ConnectionFailureCode = (typeof CONNECTION_FAILURE_CODES)[number];
+
+/**
+ * What a successful connection tells the UI, AFTER the response has been
+ * stripped to its safe parts.
+ *
+ * The wire carries much more: Shopify's raw `shop` object, Klaviyo's `account`,
+ * Recharge's `store`, and a `backfill` result in sync mode. None of it is
+ * modelled, so none of it can be rendered — those are provider payloads whose
+ * shape this product does not control and whose contents nobody has reviewed.
+ *
+ * `queued` is the honest distinction the UI must preserve: `true` means the
+ * initial import was accepted onto the queue, `false` means the credential is
+ * saved but nothing has started (Redis was unreachable when the job was
+ * enqueued). Reporting the second as if it were the first would tell an agency
+ * that data was on its way when it was not.
+ *
+ * `queueNote` is deliberately absent even though the backend sends one: its text
+ * is "stored; enqueue failed (is Redis up?)", which is an operator's sentence,
+ * not a user's. Its PRESENCE is already captured by `queued: false`.
+ */
+export interface ProviderConnectionOutcome {
+  ok: true;
+  queued: boolean;
+}
+
+/**
+ * Shopify adds three facts worth showing, all derived from the same verification
+ * round-trip rather than an extra API call.
+ *
+ * `currencyOutcome` is reported but not acted on here — currency conflict
+ * resolution is its own screen in a later checkpoint, and this checkpoint must
+ * not start editing currency.
+ */
+export interface ShopifyConnectionOutcome extends ProviderConnectionOutcome {
+  /** The normalized permanent domain the backend actually stored. */
+  shopDomain: string;
+  /** Whether Shopify's own store timezone was applied to the account. */
+  timezoneApplied: boolean;
+  /** The currency Shopify reports, when it reported one. */
+  detectedCurrency: string | null;
+}
+
+/** POST /accounts/:id/connections/:provider/skip. */
+export interface ProviderSkipOutcome {
+  provider: Provider;
+  /** Always 'skipped' on success; validated rather than assumed. */
+  state: 'skipped';
+  /** The refreshed provider list the backend returns alongside. */
+  providers: ProviderStatusSummary[];
+}

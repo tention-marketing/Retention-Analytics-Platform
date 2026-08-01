@@ -1,12 +1,24 @@
+import { useState } from 'react';
+import { Alert } from '@/components/Alert';
+import { Button } from '@/components/Button';
+import {
+  KlaviyoConnectForm, RechargeConnectForm, ShopifyConnectForm,
+} from './ProviderConnectForms';
+import { describeOnboardingFailure, onboardingFailureTitle } from './onboardingErrors';
+import { useSkipProvider } from './useOnboarding';
 import type {
   Provider, ProviderState, ProviderStatusSummary, ProviderSyncProgress, SyncState,
 } from '@/types/domain';
 
-// Read-only provider status.
+// Provider status, and the actions that change it.
 //
-// NO BUTTONS. There is no connect, no skip, no reconnect and no retry here: the
-// credential forms and the skip action belong to a later checkpoint, and a
-// control that looks live but does nothing is worse than no control.
+// THE ACTIONS ARE DERIVED FROM THE BACKEND'S STATE, never from local guesswork.
+// A connected provider offers only "Update credentials": there is no disconnect
+// endpoint and no delete endpoint, so there is no button for either — an action
+// that cannot be carried out is worse than an absent one. A connected provider
+// also offers no skip, because skipping records an intent and would not undo the
+// connection, and a control that reads as "turn this off" but leaves the sync
+// running is a lie about what happened.
 //
 // THE WORDING RULE: say what the backend says, and nothing stronger. The backend
 // reports `connected`; it does not report `healthy`, and it has no opinion about
@@ -61,12 +73,61 @@ function formatDateTime(iso: string): string | null {
   });
 }
 
+/** The two-step confirmation for recording that a brand does not use a platform. */
+function SkipConfirmation({
+  providerLabel, onConfirm, onCancel, isPending,
+}: {
+  providerLabel: string;
+  onConfirm: () => void;
+  onCancel: () => void;
+  isPending: boolean;
+}) {
+  return (
+    <div
+      role="group"
+      aria-label={`Confirm marking ${providerLabel} as not used`}
+      className="mt-3 rounded-md border border-[var(--color-border-strong)]
+                 bg-[var(--color-surface-sunken)] px-3 py-3"
+    >
+      <p className="text-sm">
+        This records that the brand does not use {providerLabel}, so it stops holding up
+        setup. It does not create a connection, it does not delete anything, and you can
+        connect {providerLabel} later.
+      </p>
+      <div className="mt-3 flex flex-wrap gap-2">
+        <Button loading={isPending} loadingLabel="Saving…" onClick={onConfirm}>
+          Confirm
+        </Button>
+        <Button variant="secondary" onClick={onCancel} disabled={isPending}>
+          Cancel
+        </Button>
+      </div>
+    </div>
+  );
+}
+
+type OpenPanel = 'none' | 'connect' | 'skip';
+
 function ProviderRow({
-  status, progress,
+  status, progress, accountId, skip,
 }: {
   status: ProviderStatusSummary;
   progress: ProviderSyncProgress | undefined;
+  accountId: number;
+  skip: ReturnType<typeof useSkipProvider>;
 }) {
+  const [panel, setPanel] = useState<OpenPanel>('none');
+  const label = PROVIDER_LABELS[status.provider];
+  const isConnected = status.state === 'connected';
+  const isSkipping = skip.pendingProvider === status.provider;
+
+  // Reconnecting and connecting are the SAME endpoint; only the copy differs.
+  // A second api function for a different button label would be two things to
+  // keep in step for no gain.
+  const connectLabel = isConnected ? `Update ${label} credentials`
+    : status.state === 'requested' ? `Complete ${label} connection`
+      : `Connect ${label}`;
+
   const lastSync = status.lastSyncAt ?? progress?.lastSyncAt ?? null;
   const lastSyncLabel = lastSync ? formatDateTime(lastSync) : null;
   // Real counts, sorted for a stable reading order. No total exists, so there is
@@ -89,7 +150,14 @@ function ProviderRow({
       </div>
 
       <dl className="mt-2 space-y-1 text-sm">
-        {progress ? (
+        {/*
+          Suppressed when the sync state only echoes the provider state. A
+          skipped provider renders "Not used" as its badge; an "Import: Not used"
+          row underneath is the same words twice in one small card — noise to
+          scan past, and two identical strings for anyone navigating by text.
+          There is no import to describe in either case.
+        */}
+        {progress && progress.state !== 'skipped' && progress.state !== 'requested' ? (
           <div className="flex gap-2">
             <dt className="text-[var(--color-ink-muted)]">Import</dt>
             <dd>{SYNC_LABELS[progress.state]}</dd>
@@ -147,26 +215,128 @@ function ProviderRow({
           {progress.message}
         </p>
       ) : null}
+
+      {/* --- actions ------------------------------------------------------ */}
+      {panel === 'none' || (panel === 'skip' && (isConnected || status.state === 'skipped')) ? (
+        <div className="mt-3 flex flex-wrap gap-2">
+          <Button
+            variant={isConnected ? 'secondary' : 'primary'}
+            onClick={() => setPanel('connect')}
+          >
+            {connectLabel}
+          </Button>
+          {/*
+            Offered only when NOT connected and not already skipped. On a
+            connected provider it would imply a disconnect that does not exist;
+            on an already-skipped one it would do nothing.
+          */}
+          {!isConnected && status.state !== 'skipped' ? (
+            <Button
+              variant="secondary"
+              onClick={() => setPanel('skip')}
+              disabled={skip.pendingProvider !== null}
+            >
+              Mark as not used
+            </Button>
+          ) : null}
+        </div>
+      ) : null}
+
+      {/*
+        Gated on the provider still BEING skippable, not just on the panel flag.
+        Without the state check the confirmation stays open after a successful
+        skip: the card re-renders as "Not used" with a live "Confirm" underneath
+        it, which reads as though the choice had not been recorded. Tying it to
+        the refetched server state means the answer closes the question.
+      */}
+      {panel === 'skip' && !isConnected && status.state !== 'skipped' ? (
+        <SkipConfirmation
+          providerLabel={label}
+          isPending={isSkipping}
+          onConfirm={() => skip.skip(status.provider)}
+          onCancel={() => setPanel('none')}
+        />
+      ) : null}
+
+      {panel === 'connect' && status.provider === 'shopify' ? (
+        <ShopifyConnectForm
+          accountId={accountId}
+          // The domain, and ONLY the domain, is prefilled: from the client's
+          // agency-assist request when there is one, otherwise from the
+          // connected store. No credential is ever prefilled — there is nothing
+          // to prefill it from, and a masked field that looked populated would
+          // suggest otherwise.
+          initialDomain={status.requestedDomain ?? status.shopDomain ?? ''}
+          isUpdate={isConnected}
+          onDone={() => setPanel('none')}
+          onCancel={() => setPanel('none')}
+        />
+      ) : null}
+      {panel === 'connect' && status.provider === 'klaviyo' ? (
+        <KlaviyoConnectForm
+          accountId={accountId}
+          isUpdate={isConnected}
+          onDone={() => setPanel('none')}
+          onCancel={() => setPanel('none')}
+        />
+      ) : null}
+      {panel === 'connect' && status.provider === 'recharge' ? (
+        <RechargeConnectForm
+          accountId={accountId}
+          isUpdate={isConnected}
+          onDone={() => setPanel('none')}
+          onCancel={() => setPanel('none')}
+        />
+      ) : null}
     </li>
   );
 }
 
 export function ProviderStatusList({
-  providers, progress,
+  accountId, providers, progress,
 }: {
+  accountId: number;
   providers: ProviderStatusSummary[];
   progress: ProviderSyncProgress[];
 }) {
   const progressByProvider = new Map(progress.map((p) => [p.provider, p]));
+  // ONE skip mutation for the section, so a skip in flight disables the others:
+  // three parallel writes to the same provider-choice table is a race nobody
+  // needs.
+  const skip = useSkipProvider(accountId);
+  const skipFailure = skip.error ? describeOnboardingFailure(skip.error, 'skip') : null;
+
   return (
-    <ul className="grid grid-cols-1 gap-3 sm:grid-cols-3">
-      {providers.map((status) => (
-        <ProviderRow
-          key={status.provider}
-          status={status}
-          progress={progressByProvider.get(status.provider)}
-        />
-      ))}
-    </ul>
+    <>
+      {skipFailure && !skipFailure.sessionExpired ? (
+        <div className="mb-3">
+          <Alert tone="error" title={onboardingFailureTitle('skip')}>
+            <p>{skipFailure.message}</p>
+          </Alert>
+        </div>
+      ) : null}
+
+      {/*
+        One column below `lg`. Three credential forms side by side at 640px
+        produce inputs too narrow to read a domain in, and the cards are tall
+        once a form is open.
+      */}
+      {/*
+        `items-start` so each card sizes to its own content. Without it the grid
+        stretches every card to the tallest, and opening one provider's
+        credential form leaves the other two as tall empty boxes beside it.
+      */}
+      <ul className="grid grid-cols-1 items-start gap-3 lg:grid-cols-3">
+        {providers.map((status) => (
+          <ProviderRow
+            key={status.provider}
+            accountId={accountId}
+            status={status}
+            progress={progressByProvider.get(status.provider)}
+            skip={skip}
+          />
+        ))}
+      </ul>
+    </>
   );
 }

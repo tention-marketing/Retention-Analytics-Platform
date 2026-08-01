@@ -80,12 +80,25 @@ export function OnboardingControlCentre({ accountId }: { accountId: number }) {
       <OnboardingLinksSection accountId={accountId} />
 
       <section aria-labelledby="provider-status-heading">
-        <h2 id="provider-status-heading" className="text-base font-semibold">
-          Platforms
-        </h2>
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <h2 id="provider-status-heading" className="text-base font-semibold">
+            Platforms
+          </h2>
+          {/*
+            Shown only while the query is genuinely on its interval, so it is a
+            statement of fact rather than decoration. It is also the only signal
+            that anything is happening — there is no percentage, because the
+            backend has no total to divide by.
+          */}
+          {status.isPolling ? (
+            <span role="status" className="text-xs text-[var(--color-ink-muted)]">
+              Importing — checking every few seconds
+            </span>
+          ) : null}
+        </div>
         <p className="mt-1 max-w-prose text-sm text-[var(--color-ink-muted)]">
-          Read-only. Connecting, skipping and reconnecting platforms arrive in a later
-          checkpoint — nothing here changes anything.
+          Connect a platform with the brand&rsquo;s own credentials, or record that they do
+          not use it. Disconnecting is not available.
         </p>
 
         <div className="mt-4">
@@ -94,6 +107,7 @@ export function OnboardingControlCentre({ accountId }: { accountId: number }) {
           ) : null}
           {status.status === 'ready' && status.data ? (
             <ProviderStatusList
+              accountId={accountId}
               providers={status.data.providers}
               progress={status.data.progress}
             />

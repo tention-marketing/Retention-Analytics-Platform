@@ -13,7 +13,9 @@ import { ApiError } from '@/api/errors';
 // submitted id, and above all no URL or token is ever interpolated into one:
 // an error message is a string that gets copied into a bug report.
 
-export type OnboardingAction = 'status' | 'links' | 'create' | 'revoke';
+export type OnboardingAction =
+  | 'status' | 'links' | 'create' | 'revoke'
+  | 'connect-shopify' | 'connect-klaviyo' | 'connect-recharge' | 'skip';
 
 export interface OnboardingFailure {
   /** Fixed sentence, safe to render. */
@@ -29,6 +31,10 @@ const TITLES: Record<OnboardingAction, string> = {
   links: 'Could not load setup links',
   create: 'Could not create the setup link',
   revoke: 'Could not revoke the setup link',
+  'connect-shopify': 'Could not connect Shopify',
+  'connect-klaviyo': 'Could not connect Klaviyo',
+  'connect-recharge': 'Could not connect Recharge',
+  skip: 'Could not save that choice',
 };
 
 export function onboardingFailureTitle(action: OnboardingAction): string {
@@ -55,6 +61,42 @@ const PER_ACTION_400: Record<OnboardingAction, string> = {
   links: UNEXPECTED,
   create: 'That request was not valid, so no setup link was created.',
   revoke: 'That request was not valid, so nothing was revoked.',
+  'connect-shopify': 'Those Shopify details were not accepted. Nothing was changed.',
+  'connect-klaviyo': 'That Klaviyo key was not accepted. Nothing was changed.',
+  'connect-recharge': 'That Recharge token was not accepted. Nothing was changed.',
+  skip: 'That choice could not be saved. Nothing was changed.',
+};
+
+/**
+ * Fixed wording per ConnectFailure code, per provider.
+ *
+ * NONE of these is derived from the backend's `message`. For
+ * `verification_failed` that message interpolates the provider's own exception —
+ * verified against the running server, a wrong domain produced
+ * "Shopify verification failed: Shopify client_credentials token exchange failed
+ * for … : HTTP 404". That is a provider response body, and it belongs in the
+ * server log, not on an agency screen.
+ */
+const CONNECT_FAILURES: Record<string, Partial<Record<string, string>>> = {
+  'connect-shopify': {
+    missing_credentials: 'Enter the store domain, client ID and client secret.',
+    invalid_domain:
+      'Enter the permanent .myshopify.com store domain. A custom domain cannot be used here.',
+    // Deliberately does NOT say which account holds it: that would confirm to one
+    // agency user that a particular store is a client of this platform.
+    domain_conflict: 'This Shopify store is already being set up. Contact your account manager.',
+    verification_failed:
+      'We could not verify these Shopify credentials. Check the permanent store domain and '
+      + 'custom-app credentials.',
+  },
+  'connect-klaviyo': {
+    missing_credentials: 'Enter a Klaviyo private API key.',
+    verification_failed: 'We could not verify this Klaviyo API key.',
+  },
+  'connect-recharge': {
+    missing_credentials: 'Enter a Recharge Admin API token.',
+    verification_failed: 'We could not verify this Recharge API token.',
+  },
 };
 
 export function describeOnboardingFailure(
@@ -78,6 +120,12 @@ export function describeOnboardingFailure(
   if (error.status === 401) {
     return { message: SESSION_EXPIRED, retryable: false, sessionExpired: true };
   }
+  // A 502 on a connect route is the PROVIDER refusing us, not our server falling
+  // over — the code in the body says which, and the provider-specific sentence is
+  // far more actionable than "try again in a moment".
+  const byCode = CONNECT_FAILURES[action]?.[error.code ?? ''];
+  if (byCode) return { message: byCode, retryable: false, sessionExpired: false };
+
   if (error.status >= 500) {
     return { message: SERVER, retryable: true, sessionExpired: false };
   }
