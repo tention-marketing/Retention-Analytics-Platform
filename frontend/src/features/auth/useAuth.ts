@@ -31,6 +31,42 @@ export function resetAuthCache(queryClient: QueryClient, nextUser: AgencyUser | 
   queryClient.setQueryData(queryKeys.auth.me(), nextUser);
 }
 
+/**
+ * Route a 401 from ANY authenticated call into the one auth state.
+ *
+ * The alternative — each feature noticing its own 401 and doing its own
+ * redirect — is a second authentication model living alongside this one, and the
+ * two drift. Writing `null` to the auth key instead means the existing machinery
+ * does the rest, unchanged: `useCurrentUser` reports 'unauthenticated',
+ * ProtectedRoute sees a live session become a dead one, clears the cache through
+ * resetAuthCache, and navigates to /login. One path, already tested.
+ *
+ * ONLY 401. A network failure or a 500 leaves the session state exactly as it
+ * was, because neither is evidence about the session — treating them as a
+ * sign-out would eject a working user on a backend restart and hand them a login
+ * form that also cannot reach the server.
+ *
+ * Returns whether it acted, which is what makes it testable and lets a caller
+ * skip its own error rendering for an error that is about to become a redirect.
+ */
+export function reportSessionExpiry(queryClient: QueryClient, error: unknown): boolean {
+  if (!(error instanceof ApiError) || error.status !== 401) return false;
+  // Already known to be signed out: writing again would be a no-op that still
+  // notifies observers on every render.
+  if (queryClient.getQueryData(queryKeys.auth.me()) === null) return false;
+  queryClient.setQueryData(queryKeys.auth.me(), null);
+  return true;
+}
+
+/**
+ * `reportSessionExpiry` bound to the current client, stable across renders so it
+ * can sit in an effect dependency list without re-running it.
+ */
+export function useSessionExpiryReporter(): (error: unknown) => boolean {
+  const queryClient = useQueryClient();
+  return useCallback((error: unknown) => reportSessionExpiry(queryClient, error), [queryClient]);
+}
+
 /** A failure that means the service is unreachable — never a sign-out. */
 function isServiceFailure(error: unknown): boolean {
   if (!(error instanceof ApiError)) return true;

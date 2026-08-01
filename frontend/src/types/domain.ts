@@ -2,10 +2,10 @@
 //
 // SCOPE RULE FOR THIS FILE: every type here is traced to a real backend response
 // shape, and only the shapes the foundation needs are present. Types for
-// accounts, onboarding status, RCM readiness, links, currency, costs and ad
-// spend arrive with the checkpoints that actually call those routes — adding
-// them now would mean guessing at field-by-field detail with nothing compiling
-// against it to catch a mistake.
+// onboarding status, RCM readiness, links, currency, costs and ad spend arrive
+// with the checkpoints that actually call those routes — adding them now would
+// mean guessing at field-by-field detail with nothing compiling against it to
+// catch a mistake.
 
 /** backend/src/onboarding/choices.ts — PROVIDERS */
 export const PROVIDERS = ['shopify', 'klaviyo', 'recharge'] as const;
@@ -81,4 +81,52 @@ export interface SafeFailure {
 export interface AgencyUser {
   id: number;
   email: string;
+}
+
+/**
+ * A client brand. Source: GET /accounts.
+ *
+ * backend/src/routes/accounts.ts selects exactly these five columns:
+ *
+ *   SELECT id, name, store_timezone, onboarding_complete, created_at
+ *     FROM accounts ORDER BY id
+ *
+ * FIVE FIELDS, AND THERE IS NO SIXTH. No revenue, no RCM tier, no provider
+ * count, no owner, no completion percentage, no last-sync time, no subscription
+ * status. Every one of those is a number an agency would act on, and the backend
+ * returns none of them at this checkpoint — a plausible-looking zero in a
+ * retention tool is worse than an absent section, because it reads as a finding.
+ *
+ * SNAKE_CASE ON PURPOSE. These are the wire names, kept as they arrive rather
+ * than camel-cased on the way in. `store_timezone` in particular is also the
+ * request field POST /accounts expects, and having one spelling of it in the
+ * codebase removes the class of bug where the read path and the write path
+ * disagree about what the field is called.
+ *
+ * `created_at` is a TIMESTAMPTZ that serializes to an ISO 8601 string over JSON
+ * (verified against the running backend), not a Date — nothing has parsed it.
+ */
+export interface Account {
+  id: number;
+  name: string;
+  store_timezone: string;
+  onboarding_complete: boolean;
+  /** ISO 8601, UTC. Rendered in the viewer's locale; never used for math here. */
+  created_at: string;
+}
+
+/**
+ * What POST /accounts returns on 201 — deliberately NOT `Account`.
+ *
+ * The create handler sends back only `{ id, name, store_timezone }`. It does not
+ * echo `onboarding_complete` or `created_at`, so typing the response as a full
+ * Account would put `undefined` behind two required fields and render as a blank
+ * date and a missing setup state on the page the user lands on. The list query
+ * is the thing that knows the whole row, which is why creation invalidates it
+ * rather than seeding the new account into the cache from this payload.
+ */
+export interface CreatedAccount {
+  id: number;
+  name: string;
+  store_timezone: string;
 }

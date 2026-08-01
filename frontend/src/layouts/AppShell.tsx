@@ -1,5 +1,5 @@
 import type { ReactNode } from 'react';
-import { useNavigate } from 'react-router';
+import { NavLink, useNavigate } from 'react-router';
 import { Alert } from '@/components/Alert';
 import { Button } from '@/components/Button';
 import { useLogout } from '@/features/auth/useAuth';
@@ -10,13 +10,20 @@ interface AppShellProps {
   children: ReactNode;
 }
 
+/** The destinations that exist. Two, because two are built. */
+const NAV_ITEMS = [
+  { to: '/', label: 'Home', end: true },
+  { to: '/accounts', label: 'Accounts', end: false },
+] as const;
+
 /**
  * The authenticated agency shell.
  *
- * Product identity, who is signed in, a way out, and the protected content
- * area. Nothing else — there are no counts, no provider badges and no metrics
- * here, because no backend call in this checkpoint returns any, and a plausible
- * looking zero is worse than an absent section.
+ * Product identity, who is signed in, where to go, and a way out. Nothing else —
+ * there are no counts, no provider badges and no metrics here, because no
+ * backend call in this checkpoint returns any, and a plausible looking zero is
+ * worse than an absent section. The navigation lists only routes that exist; a
+ * disabled "coming soon" link is a promise the shell has no business making.
  */
 export function AppShell({ user, children }: AppShellProps) {
   const navigate = useNavigate();
@@ -60,6 +67,35 @@ export function AppShell({ user, children }: AppShellProps) {
             </Button>
           </div>
         </div>
+
+        {/*
+          A real <nav> landmark with a real <ul>, so assistive technology can
+          jump to it and announce "2 items" rather than reading two anonymous
+          links. NavLink gives aria-current="page" on the active one for free,
+          which is the part a hand-rolled version usually leaves out.
+        */}
+        <nav aria-label="Sections" className="mx-auto w-full max-w-5xl px-4 sm:px-6">
+          <ul className="-mb-px flex gap-1 overflow-x-auto">
+            {NAV_ITEMS.map((item) => (
+              <li key={item.to}>
+                <NavLink
+                  to={item.to}
+                  end={item.end}
+                  className={({ isActive }) =>
+                    `inline-block whitespace-nowrap border-b-2 px-3 py-2 text-sm font-medium
+                     transition-colors ${
+                       isActive
+                         ? 'border-[var(--color-accent)] text-[var(--color-accent)]'
+                         : 'border-transparent text-[var(--color-ink-muted)] hover:text-[var(--color-ink)]'
+                     }`
+                  }
+                >
+                  {item.label}
+                </NavLink>
+              </li>
+            ))}
+          </ul>
+        </nav>
       </header>
 
       {logoutMutation.error ? (

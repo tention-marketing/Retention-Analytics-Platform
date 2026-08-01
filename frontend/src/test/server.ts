@@ -20,6 +20,8 @@ export interface StubResponse {
   text?: string;
   contentType?: string;
   headers?: Record<string, string>;
+  /** Never answer. Use the PENDING constant below rather than setting this. */
+  pending?: true;
 }
 
 export interface RecordedCall {
@@ -128,6 +130,24 @@ export function stubFetchSequence(stubs: StubResponse[]): void {
 }
 
 /**
+ * A route that is recorded but never answers.
+ *
+ * For asserting a pending state on ONE endpoint while the others resolve
+ * normally — a loading skeleton behind an authenticated shell cannot be reached
+ * with stubFetchNeverResolves(), because that leaves /auth/me hanging too and
+ * the protected subtree never mounts.
+ *
+ * Expressed as a StubResponse flag rather than a sentinel symbol so RouteStub
+ * keeps its existing type and every call site that already narrows on
+ * `response.status` still compiles.
+ *
+ * Do NOT express this by throwing a promise from a route function: the
+ * dispatcher is async, so a throw rejects the fetch and the caller sees a
+ * network error, which is the opposite of pending.
+ */
+export const PENDING: StubResponse = { pending: true };
+
+/**
  * Dispatch by `METHOD /path`, so one test can answer /auth/me and /auth/login
  * differently. A route may be a fixed stub, or a function receiving the
  * zero-based call index for that route — which is how "fails, then succeeds on
@@ -151,7 +171,18 @@ export function stubFetchRoutes(routes: Record<string, RouteStub>): void {
       }
       const attempt = attempts.get(key) ?? 0;
       attempts.set(key, attempt + 1);
-      return buildResponse(typeof route === 'function' ? route(attempt) : route);
+      const resolved = typeof route === 'function' ? route(attempt) : route;
+      if (resolved.pending) {
+        // Honours an abort so an unmounted component's request still settles.
+        return new Promise<Response>((_resolve, reject) => {
+          const signal = init?.signal;
+          if (!signal) return;
+          const fail = () => reject(new DOMException('The operation was aborted.', 'AbortError'));
+          if (signal.aborted) fail();
+          else signal.addEventListener('abort', fail, { once: true });
+        });
+      }
+      return buildResponse(resolved);
     }),
   );
 }
