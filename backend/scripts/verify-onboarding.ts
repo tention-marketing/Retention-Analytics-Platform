@@ -244,7 +244,20 @@ function envCredentialLeaked(): string | null {
 // ---------------------------------------------------------------------------
 const createdAccounts: number[] = [];
 
-async function makeAccount(name: string, tz = 'America/Los_Angeles'): Promise<number> {
+/**
+ * The store timezone every test account is created in unless a case says
+ * otherwise.
+ *
+ * Deliberately NOT 'UTC'. It matches the production column default in
+ * 001_init.sql, which is the whole point: the coverage window, the cohort month
+ * and every other date boundary are computed in the ACCOUNT's timezone, and a
+ * suite whose accounts all sat in UTC would never exercise that. This constant
+ * is shared with monthsAgo() below so the fixtures and the account can never
+ * drift apart — see the comment there.
+ */
+const STORE_TZ = 'America/Los_Angeles';
+
+async function makeAccount(name: string, tz = STORE_TZ): Promise<number> {
   const { rows } = await query<{ id: number }>(
     `INSERT INTO accounts (name, store_timezone) VALUES ($1, $2) RETURNING id`,
     [`__verify5a_${name}_${Date.now()}_${Math.floor(passed + failures)}`, tz],
@@ -294,12 +307,61 @@ async function insertLineItem(
   );
 }
 
-function monthsAgo(n: number): string {
-  const d = new Date();
-  const total = d.getUTCFullYear() * 12 + d.getUTCMonth() - n;
+/**
+ * The first day of the month `monthsBack` months before now, AS SEEN IN
+ * `timeZone`.
+ *
+ * WHY THE TIMEZONE ARGUMENT EXISTS. This used to read the current month from
+ * `new Date().getUTCMonth()`. The code under test does not: getCoverageWindow
+ * computes `date_trunc('month', now() AT TIME ZONE <accounts.store_timezone>)`.
+ * Those two agree for most of the month and disagree for the last seven hours of
+ * it — between 17:00 Pacific on the final day and local midnight, UTC has
+ * already rolled over and Pacific has not. In that window the fixtures asked for
+ * the FOLLOWING month while the account was still in the previous one, and four
+ * Group C checks plus three cascading Group H checks failed on a suite that had
+ * changed in no way. The failures looked like an ad-spend regression and were a
+ * clock mismatch in this file.
+ *
+ * So the month is read through the same timezone the account was created with.
+ * Not the machine's local timezone — that would move the suite's answers to
+ * whichever laptop or CI box ran it, which is the same class of bug wearing a
+ * different hat.
+ *
+ * `now` is injectable so the boundary itself can be asserted at a fixed instant
+ * rather than only when the calendar happens to reproduce it. See group A.
+ */
+function monthAgoInTimezone(monthsBack: number, timeZone: string, now: Date = new Date()): string {
+  // formatToParts rather than string parsing: the numeric year and month come
+  // back as labelled fields, so no locale's date order can be misread.
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone, year: 'numeric', month: '2-digit',
+  }).formatToParts(now);
+
+  const year = Number(parts.find((p) => p.type === 'year')?.value);
+  const month = Number(parts.find((p) => p.type === 'month')?.value);
+  if (!Number.isInteger(year) || !Number.isInteger(month) || month < 1 || month > 12) {
+    // A silent NaN here would produce a fixture month of "NaN-NaN-01" and a
+    // failure somewhere far away from the cause.
+    throw new Error(`Could not read the current month in ${timeZone}`);
+  }
+
+  // Arithmetic in absolute months, so a year rollover is not a special case.
+  const total = year * 12 + (month - 1) - monthsBack;
   const y = Math.floor(total / 12);
-  const m = (total % 12) + 1;
-  return `${y}-${String(m).padStart(2, '0')}-01`;
+  const m = ((total % 12) + 12) % 12 + 1;
+  return `${String(y).padStart(4, '0')}-${String(m).padStart(2, '0')}-01`;
+}
+
+/**
+ * Fixture month for an account in the default store timezone.
+ *
+ * Defaults to STORE_TZ — the same constant makeAccount() defaults to — so a
+ * fixture and the account it is inserted against cannot disagree about what
+ * month it is. A case that creates an account in another timezone must pass
+ * that timezone here too.
+ */
+function monthsAgo(n: number, timeZone: string = STORE_TZ): string {
+  return monthAgoInTimezone(n, timeZone);
 }
 
 // ---------------------------------------------------------------------------
@@ -556,6 +618,89 @@ function groupA(): void {
   check('ui: not complete → onboardingInProgress', state.deriveUiStates({
     onboardingComplete: false, shopifyConnected: false, rcmReady: false, syncRunning: false,
   }).onboardingInProgress);
+
+  // --- fixture clock (monthAgoInTimezone) ---
+  //
+  // This helper decides which month every ad-spend and coverage fixture below
+  // is written into. It used to read the month in UTC while the code under test
+  // read it in the account's store timezone, which made four Group C checks and
+  // three Group H checks fail for the last seven hours of every month. These
+  // assertions pin the boundary at a FIXED INSTANT so the disagreement is caught
+  // by running the suite, not by running it on the right evening.
+  //
+  // 2026-08-01T01:00:00Z is 18:00 on 2026-07-31 in Los Angeles: August in UTC,
+  // still July in the store's own timezone.
+  const BOUNDARY = new Date('2026-08-01T01:00:00Z');
+  check('clock: at the UTC/Pacific boundary, Los Angeles is still in July',
+    monthAgoInTimezone(0, 'America/Los_Angeles', BOUNDARY) === '2026-07-01',
+    monthAgoInTimezone(0, 'America/Los_Angeles', BOUNDARY));
+  check('clock: at the same instant, UTC has rolled over to August',
+    monthAgoInTimezone(0, 'UTC', BOUNDARY) === '2026-08-01',
+    monthAgoInTimezone(0, 'UTC', BOUNDARY));
+  check('clock: the two timezones genuinely disagree at that instant',
+    monthAgoInTimezone(0, 'America/Los_Angeles', BOUNDARY)
+      !== monthAgoInTimezone(0, 'UTC', BOUNDARY));
+  check('clock: a timezone AHEAD of UTC can be in the next month already',
+    monthAgoInTimezone(0, 'Asia/Tokyo', BOUNDARY) === '2026-08-01',
+    monthAgoInTimezone(0, 'Asia/Tokyo', BOUNDARY));
+
+  // Subtraction, including the year rollover the old integer maths got right
+  // and which must survive the rewrite.
+  check('clock: subtracting 1 month steps back inside the year',
+    monthAgoInTimezone(1, 'America/Los_Angeles', BOUNDARY) === '2026-06-01');
+  check('clock: subtracting 6 months steps back inside the year',
+    monthAgoInTimezone(6, 'America/Los_Angeles', BOUNDARY) === '2026-01-01');
+  check('clock: subtracting 7 months crosses into the previous year',
+    monthAgoInTimezone(7, 'America/Los_Angeles', BOUNDARY) === '2025-12-01',
+    monthAgoInTimezone(7, 'America/Los_Angeles', BOUNDARY));
+  check('clock: the 11-month window start crosses the year boundary',
+    monthAgoInTimezone(11, 'America/Los_Angeles', BOUNDARY) === '2025-08-01');
+  check('clock: subtracting 23 months crosses two year boundaries',
+    monthAgoInTimezone(23, 'America/Los_Angeles', BOUNDARY) === '2024-08-01');
+  check('clock: the rollover is computed from the STORE month, not the UTC one',
+    monthAgoInTimezone(7, 'UTC', BOUNDARY) === '2026-01-01'
+    && monthAgoInTimezone(7, 'America/Los_Angeles', BOUNDARY) === '2025-12-01');
+
+  // January is where an off-by-one in the month index shows up.
+  const JANUARY = new Date('2026-01-15T12:00:00Z');
+  check('clock: January minus 0 is January',
+    monthAgoInTimezone(0, 'America/Los_Angeles', JANUARY) === '2026-01-01');
+  check('clock: January minus 1 is the previous December',
+    monthAgoInTimezone(1, 'America/Los_Angeles', JANUARY) === '2025-12-01');
+  check('clock: January minus 12 is the same month a year earlier',
+    monthAgoInTimezone(12, 'America/Los_Angeles', JANUARY) === '2025-01-01');
+
+  // A DST transition must not move the month.
+  const DST = new Date('2026-03-08T10:30:00Z'); // 02:30 -> 03:30 in Los Angeles
+  check('clock: a DST transition does not shift the month',
+    monthAgoInTimezone(0, 'America/Los_Angeles', DST) === '2026-03-01');
+
+  check('clock: every month is emitted as the first day, zero-padded', (() => {
+    for (let i = 0; i <= 24; i++) {
+      if (!/^\d{4}-\d{2}-01$/.test(monthAgoInTimezone(i, 'America/Los_Angeles', BOUNDARY))) {
+        return false;
+      }
+    }
+    return true;
+  })());
+  check('clock: consecutive offsets are strictly descending and contiguous', (() => {
+    const months = Array.from({ length: 25 },
+      (_, i) => monthAgoInTimezone(i, 'America/Los_Angeles', BOUNDARY));
+    for (let i = 1; i < months.length; i++) {
+      if (months[i] >= months[i - 1]) return false;
+    }
+    return new Set(months).size === months.length;
+  })());
+  check('clock: an unknown timezone fails loudly rather than yielding NaN', (() => {
+    try {
+      monthAgoInTimezone(0, 'Not/A_Timezone', BOUNDARY);
+      return false;
+    } catch {
+      return true;
+    }
+  })());
+  check('clock: the fixture default is the timezone the accounts are created in',
+    monthsAgo(0) === monthAgoInTimezone(0, STORE_TZ));
 
   // --- capabilities map ---
   check('capabilities: Shopify carries the RCM revenue foundation',
