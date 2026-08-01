@@ -34,6 +34,28 @@ export const queryKeys = {
      * a secret.
      */
     detail: (accountId: number) => ['accounts', 'detail', accountId] as const,
+
+    /**
+     * GET /accounts/:id/onboarding/status.
+     *
+     * Nested under `detail(accountId)` so it is scoped to one account and so
+     * `all()` still reaches it — a revoke that refreshes only half of an
+     * account's data is how a page ends up disagreeing with itself.
+     */
+    onboardingStatus: (accountId: number) =>
+      ['accounts', 'detail', accountId, 'onboarding-status'] as const,
+
+    /**
+     * GET /accounts/:id/onboarding-links.
+     *
+     * SUMMARIES ONLY. The list the backend returns carries no token, no hash and
+     * no URL, and the parser rejects a payload that does — so nothing cached
+     * under this key can be a secret. The one-time URL from link CREATION never
+     * touches the query cache at all; it lives in component state only. See
+     * features/onboarding/useOnboardingLinks.ts.
+     */
+    onboardingLinks: (accountId: number) =>
+      ['accounts', 'detail', accountId, 'onboarding-links'] as const,
   },
 } as const;
 

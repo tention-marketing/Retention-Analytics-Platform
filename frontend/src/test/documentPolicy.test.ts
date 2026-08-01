@@ -90,10 +90,52 @@ describe('source-level security discipline', () => {
     }
   });
 
-  it('parses no URL fragment — onboarding tokens are Phase 5C and not handled here', () => {
+  it('never reads a token out of the browser URL — that is the client wizard, not this app', () => {
+    // Unchanged and non-negotiable. The agency app ISSUES setup links; it never
+    // consumes one. Reading location.hash here would mean an agency session and
+    // a client link token meeting inside the same page.
     for (const [path, code] of sourceEntries()) {
       expect(code, path).not.toMatch(/location\.hash/);
+    }
+  });
+
+  it('mentions the token fragment only where the minted URL is validated', () => {
+    // `#token=` is now legitimate in exactly one place: the validator in
+    // api/onboarding.ts that refuses a setup URL carrying its token anywhere
+    // other than the fragment. Anywhere else it would be a hand-built link, and
+    // a link this app assembled is a link the server did not issue.
+    for (const [path, code] of sourceEntries()) {
+      if (path.endsWith('/api/onboarding.ts')) continue;
       expect(code, path).not.toMatch(/#token=/);
+    }
+  });
+
+  it('contains no literal that looks like a real setup token', () => {
+    // A minted token is 32 bytes of base64url — exactly 43 unpadded characters.
+    // A literal of that shape in source is either a real leaked credential or a
+    // fixture realistic enough to be mistaken for one. Neither belongs here.
+    //
+    // Test files are scanned too: this is the rule that stops a debugging
+    // session's real token from being pasted into an assertion.
+    const tokenShaped = /(?<![A-Za-z0-9_-])[A-Za-z0-9_-]{43}(?![A-Za-z0-9_-])/;
+    const all = Object.entries(sources).map(
+      ([path, code]) => [path, stripComments(code as string)] as [string, string],
+    );
+    for (const [path, code] of all) {
+      const match = tokenShaped.exec(code);
+      // Report the path only. Printing the match would put the very thing this
+      // test exists to catch into the CI log.
+      expect(match === null, `${path} contains a 43-character token-shaped literal`).toBe(true);
+    }
+  });
+
+  it('never persists a setup URL or token anywhere', () => {
+    // Belt and braces over the storage tests above: the one-time URL lives in
+    // component state only, so no source may hand it to a storage API, a query
+    // key, or the address bar.
+    for (const [path, code] of sourceEntries()) {
+      expect(code, path).not.toMatch(/history\.(?:push|replace)State/);
+      expect(code, path).not.toMatch(/location\.(?:href|search)\s*=/);
     }
   });
 

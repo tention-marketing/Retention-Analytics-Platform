@@ -43,8 +43,36 @@ const BOREALIS = {
   created_at: '2026-02-20T12:00:00.000Z',
 };
 
+/**
+ * The onboarding reads the workspace makes on arrival.
+ *
+ * Stubbed for every account this file uses so a workspace test is measuring the
+ * account resolution it is about, not an unrouted-call error from the control
+ * centre. The control centre's own behaviour lives in
+ * features/onboarding/onboarding.test.tsx.
+ */
+const EMPTY_STATUS = {
+  onboardingComplete: false,
+  onboardingBlockers: [],
+  rcmReadiness: { ready: false, blockers: [] },
+  providers: [],
+  progress: [],
+  uiStates: {
+    onboardingInProgress: true, onboardingComplete: false, limitedAnalyticsAvailable: false,
+    shopifyNotConnected: true, rcmSetupIncomplete: false, rcmReady: false,
+    syncStillRunning: false,
+  },
+};
+
+const ONBOARDING_ROUTES: Record<string, RouteStub> = Object.fromEntries(
+  [11, 12, 31, 999].flatMap((id) => [
+    [`GET /api/accounts/${id}/onboarding/status`, { json: EMPTY_STATUS }],
+    [`GET /api/accounts/${id}/onboarding-links`, { json: [] }],
+  ]),
+);
+
 function renderAt(route: string, routes: Record<string, RouteStub>): RenderWithProvidersResult {
-  stubFetchRoutes(routes);
+  stubFetchRoutes({ ...ONBOARDING_ROUTES, ...routes });
   return renderWithProviders(<AppRoutes />, { route });
 }
 
@@ -103,7 +131,7 @@ describe('/accounts is behind the agency session', () => {
 // ===========================================================================
 describe('the account directory', () => {
   it('shows a loading state while the list is in flight', async () => {
-    stubFetchRoutes({ [ME]: SIGNED_IN, [ACCOUNTS]: PENDING });
+    stubFetchRoutes({ ...ONBOARDING_ROUTES, [ME]: SIGNED_IN, [ACCOUNTS]: PENDING });
     renderWithProviders(<AppRoutes />, { route: '/accounts' });
 
     await screen.findByRole('heading', { name: 'Accounts', level: 1 });
@@ -306,7 +334,7 @@ describe('creating an account', () => {
   });
 
   it('blocks a duplicate submission while the first is in flight', async () => {
-    stubFetchRoutes({ [ME]: SIGNED_IN, [ACCOUNTS]: { json: [] }, [CREATE]: PENDING });
+    stubFetchRoutes({ ...ONBOARDING_ROUTES, [ME]: SIGNED_IN, [ACCOUNTS]: { json: [] }, [CREATE]: PENDING });
     const { user } = renderWithProviders(<AppRoutes />, { route: '/accounts' });
     await screen.findByRole('heading', { name: 'Accounts', level: 1 });
     await user.click(await screen.findByRole('button', { name: 'New account' }));
@@ -329,7 +357,7 @@ describe('creating an account', () => {
       id: 31, name: 'Synthetic Nimbus', store_timezone: 'Asia/Tokyo',
       onboarding_complete: false, created_at: '2026-03-01T10:00:00.000Z',
     };
-    stubFetchRoutes({
+    stubFetchRoutes({ ...ONBOARDING_ROUTES,
       [ME]: SIGNED_IN,
       [ACCOUNTS]: (attempt) => ({ json: attempt === 0 ? [] : [created] }),
       [CREATE]: {
@@ -376,7 +404,14 @@ describe('creating an account', () => {
     await user.click(screen.getByRole('button', { name: 'Create account' }));
     await screen.findByRole('heading', { name: 'Synthetic Nimbus', level: 1 });
 
-    expect(calls.some((c) => c.url.includes('onboarding'))).toBe(false);
+    // The workspace READS onboarding state on arrival, which is expected. What
+    // must never happen is a link being MINTED as a side effect of creating an
+    // account: that would put a live credential into existence that nobody asked
+    // for and nobody saw, since the URL is shown exactly once.
+    const writes = calls.filter(
+      (c) => c.url.includes('onboarding-links') && c.method.toUpperCase() !== 'GET',
+    );
+    expect(writes).toEqual([]);
   });
 
   // --- failure presentation ------------------------------------------------
@@ -456,7 +491,11 @@ describe('the account workspace', () => {
     await screen.findByRole('heading', { name: 'Synthetic Acme', level: 1 });
 
     expect(callCountFor('GET', '/api/accounts/11')).toBe(0);
-    expect(calls.filter((c) => /\/api\/accounts\/\d/.test(c.url))).toEqual([]);
+    // Anchored to the BARE detail path. The workspace legitimately calls
+    // account-scoped sub-resources (`/accounts/11/onboarding/status`,
+    // `/accounts/11/onboarding-links`); what must never exist is a request for
+    // the account record itself, because the backend has no such route.
+    expect(calls.filter((c) => /^\/api\/accounts\/\d+$/.test(c.url.split('?')[0] ?? ''))).toEqual([]);
   });
 
   it('shows only real fields', async () => {
@@ -469,10 +508,15 @@ describe('the account workspace', () => {
       .toHaveAttribute('href', '/accounts');
   });
 
-  it('says plainly that setup tools are not here yet', async () => {
+  it('hosts the onboarding control centre', async () => {
+    // Replaces the placeholder assertion this page carried in 5B-2C. The
+    // sections it promised now exist; their behaviour is covered in
+    // features/onboarding/onboarding.test.tsx.
     renderAt('/accounts/11', { [ME]: SIGNED_IN, [ACCOUNTS]: { json: [ACME] } });
     await screen.findByRole('heading', { name: 'Synthetic Acme', level: 1 });
-    expect(screen.getByText(/Setup tools arrive next/)).toBeInTheDocument();
+    for (const section of ['Setup overview', 'Setup links', 'Platforms']) {
+      expect(await screen.findByRole('heading', { name: section, level: 2 })).toBeInTheDocument();
+    }
   });
 
   it('invents no metrics or provider state', async () => {
@@ -485,7 +529,7 @@ describe('the account workspace', () => {
   });
 
   it('shows a loading state before the list arrives', async () => {
-    stubFetchRoutes({ [ME]: SIGNED_IN, [ACCOUNTS]: PENDING });
+    stubFetchRoutes({ ...ONBOARDING_ROUTES, [ME]: SIGNED_IN, [ACCOUNTS]: PENDING });
     renderWithProviders(<AppRoutes />, { route: '/accounts/11' });
 
     expect(await screen.findByText('Loading this account…')).toBeInTheDocument();
@@ -520,7 +564,7 @@ describe('the account workspace', () => {
   });
 
   it('recovers from a list failure via retry', async () => {
-    stubFetchRoutes({
+    stubFetchRoutes({ ...ONBOARDING_ROUTES,
       [ME]: SIGNED_IN,
       [ACCOUNTS]: (attempt) =>
         attempt === 0 ? { status: 500, json: { error: 'boom' } } : { json: [ACME] },
@@ -540,7 +584,7 @@ describe('the account workspace', () => {
 describe('an expired session while browsing accounts', () => {
   it('clears the whole cache and returns to sign-in on a confirmed 401', async () => {
     const queryClient = createRetainingQueryClient();
-    stubFetchRoutes({
+    stubFetchRoutes({ ...ONBOARDING_ROUTES,
       [ME]: SIGNED_IN,
       [ACCOUNTS]: (attempt) =>
         attempt === 0 ? { json: [ACME] } : { status: 401, json: { error: 'unauthorized' } },
@@ -567,7 +611,7 @@ describe('an expired session while browsing accounts', () => {
 
   it('leaves no stale account data for the browser Back button to paint', async () => {
     const queryClient = createRetainingQueryClient();
-    stubFetchRoutes({
+    stubFetchRoutes({ ...ONBOARDING_ROUTES,
       [ME]: SIGNED_IN,
       [ACCOUNTS]: (attempt) =>
         attempt === 0 ? { json: [ACME] } : { status: 401, json: { error: 'unauthorized' } },
@@ -586,7 +630,7 @@ describe('an expired session while browsing accounts', () => {
 
   it('does not sign the user out on a 500', async () => {
     const queryClient = createRetainingQueryClient();
-    stubFetchRoutes({
+    stubFetchRoutes({ ...ONBOARDING_ROUTES,
       [ME]: SIGNED_IN,
       [ACCOUNTS]: { status: 500, json: { error: 'boom' } },
     });
@@ -600,7 +644,7 @@ describe('an expired session while browsing accounts', () => {
 
   it('does not sign the user out on a network failure', async () => {
     const queryClient = createRetainingQueryClient();
-    stubFetchRoutes({
+    stubFetchRoutes({ ...ONBOARDING_ROUTES,
       [ME]: SIGNED_IN,
       [ACCOUNTS]: () => {
         throw new TypeError('Failed to fetch');
@@ -615,7 +659,7 @@ describe('an expired session while browsing accounts', () => {
   });
 
   it('returns to sign-in without a redirect loop', async () => {
-    stubFetchRoutes({
+    stubFetchRoutes({ ...ONBOARDING_ROUTES,
       [ME]: (attempt) => (attempt === 0 ? SIGNED_IN : SIGNED_OUT),
       [ACCOUNTS]: (attempt) =>
         attempt === 0 ? { json: [ACME] } : { status: 401, json: { error: 'unauthorized' } },

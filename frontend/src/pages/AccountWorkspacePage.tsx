@@ -1,9 +1,9 @@
 import { Link, useParams } from 'react-router';
-import { Alert } from '@/components/Alert';
 import { ErrorPanel } from '@/components/ErrorPanel';
 import { LoadingSkeleton } from '@/components/LoadingSkeleton';
 import { formatCreatedAt } from '@/features/accounts/AccountList';
 import { useAccount } from '@/features/accounts/useAccounts';
+import { OnboardingControlCentre } from '@/features/onboarding/OnboardingControlCentre';
 
 /**
  * One account.
@@ -131,14 +131,15 @@ export function AccountWorkspacePage() {
         </dl>
       </section>
 
-      <div className="mt-4">
-        <Alert tone="info" title="Setup tools arrive next">
-          <p>
-            Onboarding links and provider connections for this account are part of the next
-            checkpoint. Nothing on this page stands in for them.
-          </p>
-        </Alert>
-      </div>
+      {/*
+        Keyed on the account id so switching accounts REMOUNTS the whole control
+        centre rather than reusing it. That matters because it holds a one-time
+        setup URL in component state: a remount guarantees one brand's live
+        credential cannot still be on screen while another brand's name is in the
+        heading. The hook clears on an id change too — this is the structural
+        version of the same guarantee.
+      */}
+      <OnboardingControlCentre key={account.id} accountId={account.id} />
 
       <BackToAccounts />
     </>
