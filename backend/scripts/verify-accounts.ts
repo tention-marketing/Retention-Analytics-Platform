@@ -27,9 +27,64 @@ const { default: bcrypt } = await import('bcryptjs');
 const { pool, query } = await import('../src/db/pool.js');
 const { buildApp } = await import('../src/index.js');
 const { redis } = await import('../src/queue/queues.js');
+const { config } = await import('../src/config.js');
 const security = await import('../src/auth/security.js');
 const { DEFAULT_STORE_TIMEZONE, normalizeStoreTimezone } =
   await import('../src/accounts/timezone.js');
+
+// ---------------------------------------------------------------------------
+// Redis precondition — the FIRST thing this suite does, before anything else.
+// ---------------------------------------------------------------------------
+//
+// The imports above only define things; queues.ts builds its IORedis client with
+// lazyConnect and creates Queue objects on first use, not on import. So this
+// guard runs before buildApp() — whose rate limiter writes to Redis on the first
+// request — before an account exists and before a session is minted. Nothing
+// above this line mutates Redis.
+//
+// THIS SUITE ENQUEUES NOTHING. It exercises POST /accounts, GET /accounts and
+// the two session types; it never reaches a provider connect route, so no Queue
+// is ever constructed and no `bull:*` key is ever written. Cleanup therefore
+// removes rate-limit counters and nothing else — there is deliberately no BullMQ
+// deletion here to mirror the other suites with, because deleting shared queue
+// structure keys that this run did not create would be pure risk for no gain.
+//
+// The guard still matters: cleanup DEL's every `fastify-rate-limit-*` key, and
+// the only thing that makes "every" mean "this run's" is having proved the
+// database was empty first.
+//
+// IT INSPECTS NOTHING. Only DBSIZE is read: no KEYS, no GET, no TYPE, no TTL, no
+// scan. If the database is not empty the suite refuses to start without having
+// read, altered or deleted one value, and it never calls FLUSHDB or FLUSHALL.
+async function requireEmptyRedis(): Promise<void> {
+  let size: number;
+  try {
+    size = await redis.dbsize();
+  } catch (err) {
+    console.error('\n✗ Cannot reach Redis.');
+    console.error(`  ${(err as Error).message}`);
+    console.error(`  This suite needs a dedicated Redis at ${config.redisUrl}.`);
+    process.exit(1);
+  }
+
+  if (size !== 0) {
+    console.error('\n✗ REFUSING TO RUN: the Redis database is not empty.');
+    console.error(`  DBSIZE is ${size}; this suite requires exactly 0.`);
+    console.error('');
+    console.error('  It clears rate-limit counters by prefix during cleanup, which only');
+    console.error('  means "the ones this run made" on a database nothing else writes to.');
+    console.error('  Point REDIS_URL at a dedicated test database, or clear that database');
+    console.error('  yourself once you are certain it holds nothing you need.');
+    console.error('');
+    console.error('  Nothing has been read, changed or deleted. No key was inspected.');
+    await redis.quit().catch(() => undefined);
+    process.exit(1);
+  }
+
+  console.log(`Redis precondition: DBSIZE is ${size} — dedicated and empty. Proceeding.`);
+}
+
+await requireEmptyRedis();
 
 type App = ReturnType<typeof buildApp>;
 
@@ -68,6 +123,9 @@ function nextIp(): string {
   ipCounter++;
   return `172.20.${Math.floor(ipCounter / 256) % 256}.${ipCounter % 256}`;
 }
+
+/** @fastify/rate-limit's Redis store writes `fastify-rate-limit-<METHOD><route>-<key>`. */
+const RATE_LIMIT_KEY_PREFIX = 'fastify-rate-limit-';
 
 // ---------------------------------------------------------------------------
 // Synthetic fixtures. Every name is obviously fake and shares one prefix so
@@ -500,6 +558,45 @@ async function cleanup(): Promise<void> {
   console.log(`  removed ${links.rowCount ?? 0} onboarding link(s)`);
   console.log(`  removed ${accts.rowCount ?? 0} synthetic account(s)`);
   console.log(`  removed ${users.rowCount ?? 0} synthetic user(s)`);
+
+  // --- rate-limit counters -------------------------------------------------
+  //
+  // The only Redis keys this suite produces: the logins and token exchanges
+  // above go through @fastify/rate-limit's Redis store. They carry a TTL and
+  // would expire on their own, but "returns Redis to how it found it" should not
+  // depend on waiting — the next suite in the run would refuse to start.
+  //
+  // No BullMQ deletion here on purpose: this suite never reaches a connect
+  // route, so it constructs no Queue and writes no `bull:*` key. Removing keys
+  // it did not create would be risk without purpose.
+  const rateKeys = await redis.keys(`${RATE_LIMIT_KEY_PREFIX}*`).catch(() => [] as string[]);
+  if (rateKeys.length) await redis.del(...rateKeys).catch(() => undefined);
+  console.log(`  removed ${rateKeys.length} rate-limit counter(s)`);
+}
+
+/**
+ * Redis must end exactly as it began: empty.
+ *
+ * Reported as a hard precondition failure rather than as a counted check, so the
+ * suite's total stays a measure of the contract it verifies rather than of its
+ * own housekeeping. It does NOT clean up the leftovers — silently forcing the
+ * database back to zero is how a cleanup bug survives for months. The names are
+ * safe to print: the precondition proved the database was empty beforehand, so
+ * every remaining key came from here.
+ */
+async function assertRedisEmpty(): Promise<boolean> {
+  const size = await redis.dbsize().catch(() => -1);
+  if (size === 0) {
+    console.log('  Redis: DBSIZE is 0 — the database is exactly as the run found it.');
+    return true;
+  }
+  console.log(`\n✗ Redis was NOT returned to empty. DBSIZE is ${size}.`);
+  const remaining = await redis.keys('*').catch(() => [] as string[]);
+  console.log('  Keys this run created and failed to remove:');
+  for (const key of remaining.slice(0, 50)) console.log(`    ${key}`);
+  if (remaining.length > 50) console.log(`    …and ${remaining.length - 50} more`);
+  console.log('  They have been LEFT IN PLACE. Fix the cleanup rather than flushing.');
+  return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -519,8 +616,11 @@ try {
   await cleanup();
   await app.close();
   await pool.end();
-  redis.disconnect();
 }
+
+// After cleanup, before the connection is dropped.
+const redisClean = await assertRedisEmpty();
+redis.disconnect();
 
 console.log(`\n${'='.repeat(72)}`);
 console.log('ACCOUNT WRITE-PATH RESULTS BY GROUP');
@@ -542,6 +642,12 @@ if (failures > 0) {
   console.log('\nFAILED CHECKS:');
   for (const name of failed) console.log(`  ✗ ${name}`);
   console.log(`\n✗ ${failures} CHECK(S) FAILED`);
+  process.exit(1);
+}
+if (!redisClean) {
+  // Every contract check passed, but the suite did not clean up after itself.
+  // That is still a failing run: the next one will refuse to start.
+  console.log('\n✗ CHECKS PASSED BUT REDIS WAS LEFT DIRTY');
   process.exit(1);
 }
 console.log('\n✓ ALL ACCOUNT WRITE-PATH CHECKS PASSED');

@@ -66,6 +66,61 @@ const state = await import('../src/onboarding/state.js');
 const choices = await import('../src/onboarding/choices.js');
 const capabilities = await import('../src/onboarding/capabilities.js');
 
+// ---------------------------------------------------------------------------
+// Redis precondition — the FIRST thing this suite does, before anything else.
+// ---------------------------------------------------------------------------
+//
+// The imports above define functions; none of them opens a socket or writes a
+// key (queues.ts constructs its IORedis client with lazyConnect, and its Queue
+// objects are created on first use, not on import). So this guard runs before
+// buildApp() — whose rate limiter writes to Redis on the first request — before
+// any Queue is constructed, before an account exists, before a session, and
+// before a single provider fixture request. Nothing above this line mutates
+// Redis.
+//
+// Why it has to exist: cleanup below deletes SHARED BullMQ queue structure keys
+// (`wait`, `meta`, `id`, …). Those belong to the queue, not to this run's
+// accounts — on a database holding real work, deleting `wait` drops somebody
+// else's queued jobs. Proving the database was empty first is what makes that
+// deletion provably self-inflicted.
+//
+// IT INSPECTS NOTHING. Only DBSIZE is read: no KEYS, no GET, no TYPE, no TTL,
+// no scan. If the database is not empty the suite refuses to start without
+// having read, altered or deleted one value. It does not offer to clean up for
+// you, and it never calls FLUSHDB or FLUSHALL — a verification script that
+// empties a database it did not fill is a far worse failure than one that
+// declines to run.
+async function requireEmptyRedis(): Promise<void> {
+  let size: number;
+  try {
+    size = await redis.dbsize();
+  } catch (err) {
+    console.error('\n✗ Cannot reach Redis.');
+    console.error(`  ${(err as Error).message}`);
+    console.error(`  This suite needs a dedicated Redis at ${config.redisUrl}.`);
+    process.exit(1);
+  }
+
+  if (size !== 0) {
+    console.error('\n✗ REFUSING TO RUN: the Redis database is not empty.');
+    console.error(`  DBSIZE is ${size}; this suite requires exactly 0.`);
+    console.error('');
+    console.error('  It enqueues real backfill jobs and removes shared BullMQ queue');
+    console.error('  structure keys during cleanup, which is only safe when nothing else');
+    console.error('  put anything in this database. Point REDIS_URL at a dedicated test');
+    console.error('  database, or clear that database yourself once you are certain it');
+    console.error('  holds nothing you need.');
+    console.error('');
+    console.error('  Nothing has been read, changed or deleted. No key was inspected.');
+    await redis.quit().catch(() => undefined);
+    process.exit(1);
+  }
+
+  console.log(`Redis precondition: DBSIZE is ${size} — dedicated and empty. Proceeding.`);
+}
+
+await requireEmptyRedis();
+
 type App = Awaited<ReturnType<typeof buildApp>>;
 
 // ---------------------------------------------------------------------------
@@ -2649,6 +2704,32 @@ async function groupJ(app: App, agencyCookie: string): Promise<void> {
 // ===========================================================================
 // Main
 // ===========================================================================
+
+/**
+ * Redis must end exactly as it began: empty.
+ *
+ * It does NOT clean up the leftovers — silently forcing the database back to
+ * zero is how a cleanup bug survives for months, and the next run would refuse
+ * to start with no clue why. The names are safe to print: the precondition
+ * proved the database was empty beforehand, so every remaining key came from
+ * here.
+ */
+let redisClean = false;
+async function assertRedisEmpty(): Promise<boolean> {
+  const size = await redis.dbsize().catch(() => -1);
+  if (size === 0) {
+    console.log('  Redis: DBSIZE is 0 — the database is exactly as the run found it.');
+    return true;
+  }
+  console.log(`\n✗ Redis was NOT returned to empty. DBSIZE is ${size}.`);
+  const remaining = await redis.keys('*').catch(() => [] as string[]);
+  console.log('  Keys this run created and failed to remove:');
+  for (const key of remaining.slice(0, 50)) console.log(`    ${key}`);
+  if (remaining.length > 50) console.log(`    …and ${remaining.length - 50} more`);
+  console.log('  They have been LEFT IN PLACE. Fix the cleanup rather than flushing.');
+  return false;
+}
+
 async function main(): Promise<void> {
   console.log('Phase 5A verification — onboarding backend (offline; all provider APIs mocked)');
   installMockFetch();
@@ -2673,29 +2754,65 @@ async function main(): Promise<void> {
     console.log('\nCleanup');
     await cleanupAccounts();
     await query(`DELETE FROM users WHERE email LIKE 'verify5a_%'`).catch(() => undefined);
-    // Remove the backfill jobs the fixture connects enqueued, so a verification
-    // run leaves no work behind for a real worker to pick up.
-    for (const [queueName, jobId] of [
-      ['shopify-backfill', 'backfill'],
-      ['recharge-backfill', 'recharge-backfill'],
-      ['klaviyo-poll', 'klaviyo-backfill'],
-    ] as [string, string][]) {
+    // --- queue jobs, removed through BullMQ rather than by key pattern -----
+    //
+    // The group B and group H provider fixtures enqueue real backfill jobs, so
+    // this run genuinely has jobs to clear — leaving them behind hands work to a
+    // real worker.
+    //
+    // `job.remove()` deletes the job hash AND unlinks it from the wait list and
+    // every index BullMQ put it in. The previous version globbed
+    // `bull:<queue>:*<prefix>-<id>*` and DEL'd the matches, which encodes
+    // BullMQ's internal key layout as guesswork and would also match a longer id
+    // sharing the prefix (`…-138` matching `…-1387`). getJob() takes the exact
+    // id, so neither hazard applies.
+    //
+    // The ids come from queues.ts rather than being re-spelled here: an id that
+    // does not match the one the enqueue used would silently remove nothing.
+    let removedJobs = 0;
+    const JOB_TARGETS: [() => { getJob: (id: string) => Promise<unknown> }, (n: number) => string][] = [
+      [queues.backfillQueue, queues.backfillJobId],
+      [queues.rechargeBackfillQueue, queues.rechargeBackfillJobId],
+      [queues.klaviyoPollQueue, queues.klaviyoBackfillJobId],
+    ];
+    for (const [queueFactory, jobIdFor] of JOB_TARGETS) {
       for (const id of createdAccounts) {
-        const keys = await redis.keys(`bull:${queueName}:*${jobId}-${id}*`).catch(() => []);
-        if (keys.length) await redis.del(...keys).catch(() => undefined);
-      }
-      for (const k of ['meta', 'id', 'wait', 'events', 'marker']) {
-        await redis.del(`bull:${queueName}:${k}`).catch(() => undefined);
+        const job = (await queueFactory().getJob(jobIdFor(id)).catch(() => null)) as
+          { remove: () => Promise<void> } | null;
+        if (job) {
+          await job.remove().catch(() => undefined);
+          removedJobs++;
+        }
       }
     }
-    // Rate-limit counters this run created. They carry a TTL and would expire on
-    // their own, but leaving them behind means Redis is not returned to the state
-    // the run found it in.
+    console.log(`  removed ${removedJobs} queue job(s)`);
+
+    // --- queue structure keys ----------------------------------------------
+    //
+    // SAFE ONLY BECAUSE OF THE PRECONDITION AT THE TOP OF THIS FILE. These keys
+    // are shared by the whole queue, not owned by one account. The suite refused
+    // to start unless DBSIZE was exactly 0, so every one of them was created by
+    // this run, by enqueuing the fixture backfills above.
+    let removedStructure = 0;
+    for (const queueName of ['shopify-backfill', 'recharge-backfill', 'klaviyo-poll']) {
+      for (const k of ['meta', 'id', 'wait', 'events', 'marker', 'completed', 'failed', 'active']) {
+        removedStructure += await redis.del(`bull:${queueName}:${k}`).catch(() => 0);
+      }
+    }
+    console.log(`  removed ${removedStructure} queue structure key(s)`);
+
+    // Rate-limit counters this run created — and by the same precondition, the
+    // only ones that can be here. They carry a TTL and would expire on their
+    // own, but "returns Redis to how it found it" should not depend on waiting.
     const rlKeys = await redis.keys(`${RATE_LIMIT_KEY_PREFIX}*`).catch(() => []);
     if (rlKeys.length) await redis.del(...rlKeys).catch(() => undefined);
     console.log(`  cleared ${rlKeys.length} rate-limit counters`);
     console.log(`  cleaned ${createdAccounts.length} throwaway accounts`);
     await app.close();
+    // After cleanup, before the results table. Reported as a hard precondition
+    // failure rather than a counted check, so the suite's total stays a measure
+    // of the contract it verifies rather than of its own housekeeping.
+    redisClean = await assertRedisEmpty();
   }
 
   console.log('\n' + '='.repeat(72));
@@ -2716,10 +2833,18 @@ async function main(): Promise<void> {
     console.log('\nFAILED CHECKS:');
     for (const f of failed) console.log(`  ✗ ${f}`);
   }
-  console.log(failures === 0 ? '\n✓ ALL PHASE 5A CHECKS PASSED' : `\n✗ ${failures} CHECK(S) FAILED`);
+  if (failures > 0) {
+    console.log(`\n✗ ${failures} CHECK(S) FAILED`);
+  } else if (!redisClean) {
+    // Every contract check passed, but the suite did not clean up after itself.
+    // That is still a failing run: the next one will refuse to start.
+    console.log('\n✗ CHECKS PASSED BUT REDIS WAS LEFT DIRTY');
+  } else {
+    console.log('\n✓ ALL PHASE 5A CHECKS PASSED');
+  }
 
   await pool.end();
-  process.exit(failures === 0 ? 0 : 1);
+  process.exit(failures === 0 && redisClean ? 0 : 1);
 }
 
 main().catch(async (err) => {
