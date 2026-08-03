@@ -1,4 +1,5 @@
 import { query, withTransaction } from '../db/pool.js';
+import { hasAtMostTwoDecimals, parseAmount } from './amount.js';
 
 // COGS and OCAS services (D4 / D5 / E2 / E3).
 
@@ -140,17 +141,20 @@ export type ValidationResult<T> =
 
 /** D4 method 2: > 0, < 100, max 2dp, finite, within NUMERIC(5,2). */
 export function validateBlendedMargin(input: unknown): ValidationResult<number> {
-  const n = typeof input === 'number' ? input : Number(input);
-  if (input === null || input === undefined || input === '' || !Number.isFinite(n)) {
+  // parseAmount, not Number(): a whitespace-only field, an array and a boolean all
+  // coerce to a number and none of them is one. See onboarding/amount.ts.
+  const parsed = parseAmount(input);
+  if (!parsed.ok) {
     return { ok: false, error: 'not_a_number', message: 'Enter a gross margin percentage.' };
   }
+  const n = parsed.value;
   if (n <= 0 || n >= 100) {
     return {
       ok: false, error: 'out_of_range',
       message: 'Gross margin must be greater than 0 and less than 100.',
     };
   }
-  if (Math.round(n * 100) !== n * 100) {
+  if (!hasAtMostTwoDecimals(n)) {
     return {
       ok: false, error: 'too_precise',
       message: 'Gross margin supports at most two decimal places.',
@@ -171,18 +175,21 @@ export function validateSkuCost(input: unknown): ValidationResult<SkuCostInput> 
   if (typeof row.sku !== 'string' || !row.sku.trim()) {
     return { ok: false, error: 'sku_required', message: 'A SKU is required.' };
   }
-  const n = typeof row.cogs === 'number' ? row.cogs : Number(row.cogs);
-  if (row.cogs === null || row.cogs === undefined || row.cogs === '' || !Number.isFinite(n)) {
-    // An empty field is never read as zero (D4/D5).
+  // An empty field is never read as zero (D4/D5) — and `'   '` is an empty field,
+  // which `Number()` alone would have turned into a real 0 that the zero
+  // confirmation below would then happily store. See onboarding/amount.ts.
+  const parsed = parseAmount(row.cogs);
+  if (!parsed.ok) {
     return { ok: false, error: 'not_a_number', message: `Enter a cost for ${row.sku}.` };
   }
+  const n = parsed.value;
   if (n < 0) {
     return { ok: false, error: 'negative', message: `Cost for ${row.sku} cannot be negative.` };
   }
   if (n > NUMERIC_12_2_MAX) {
     return { ok: false, error: 'too_large', message: `Cost for ${row.sku} is too large.` };
   }
-  if (Math.round(n * 100) !== n * 100) {
+  if (!hasAtMostTwoDecimals(n)) {
     return {
       ok: false, error: 'too_precise',
       message: `Cost for ${row.sku} supports at most two decimal places.`,
@@ -202,17 +209,22 @@ export function validateOcas(
   input: unknown,
   confirmedZero: boolean,
 ): ValidationResult<{ ocas: number; confirmedZero: boolean }> {
-  const n = typeof input === 'number' ? input : Number(input);
-  if (input === null || input === undefined || input === '' || !Number.isFinite(n)) {
+  // A blank field is never read as zero (D5). `'   '`, `'\t'` and `[]` all coerce
+  // to 0 through `Number()`, and paired with `confirmedZero` below that stored a
+  // CONFIRMED zero monthly operating cost nobody had entered — which makes the
+  // "RCM >= OCAS -> self-funding" verdict trivially true. See onboarding/amount.ts.
+  const parsed = parseAmount(input);
+  if (!parsed.ok) {
     return { ok: false, error: 'not_a_number', message: 'Enter a monthly operating cost.' };
   }
+  const n = parsed.value;
   if (n < 0) {
     return { ok: false, error: 'negative', message: 'Operating cost cannot be negative.' };
   }
   if (n > NUMERIC_12_2_MAX) {
     return { ok: false, error: 'too_large', message: 'Operating cost is too large.' };
   }
-  if (Math.round(n * 100) !== n * 100) {
+  if (!hasAtMostTwoDecimals(n)) {
     return {
       ok: false, error: 'too_precise',
       message: 'Operating cost supports at most two decimal places.',

@@ -22,6 +22,7 @@
     "verify:accounts": "tsx scripts/verify-accounts.ts",
     "verify:connections": "tsx scripts/verify-connections.ts",
     "verify:onboarding": "tsx scripts/verify-onboarding.ts",
+    "verify:financial-controls": "tsx scripts/verify-financial-controls.ts",
     "verify:auth-security": "tsx scripts/verify-auth-security.ts",
     "verify:shutdown": "tsx scripts/verify-shutdown.ts"
   },

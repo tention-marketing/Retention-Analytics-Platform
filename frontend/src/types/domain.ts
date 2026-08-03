@@ -395,3 +395,214 @@ export interface ProviderSkipOutcome {
   /** The refreshed provider list the backend returns alongside. */
   providers: ProviderStatusSummary[];
 }
+
+// ---------------------------------------------------------------------------
+// Financial inputs (Phase 5B-2F)
+// ---------------------------------------------------------------------------
+//
+// EVERY TYPE BELOW IS TRACED TO A RESPONSE THIS APP ACTUALLY READS, verified
+// against the running backend rather than inferred from the route names.
+//
+// CAMELCASE INTERNALLY, even where the wire is snake_case. The currency and costs
+// routes select raw columns (`currency_source`, `cogs_method`, `ocas_monthly`),
+// and those names are mapped once at the API boundary. That differs from
+// `Account` above, which deliberately keeps its wire names because they are also
+// the POST /accounts REQUEST field names — here the write bodies use different
+// names again (`blendedMarginPct`, `ocasMonthly`), so there is no single spelling
+// to preserve and camelCase is the one the rest of the app reads in.
+//
+// MONEY IS A STRING. `blendedMarginPct` is the exception: it is a PERCENTAGE, not
+// money — currency-independent, never converted, and safe as a number because it
+// is only ever compared against 0 and 100.
+
+/** backend/src/onboarding/currency.ts — accounts.currency_source. */
+export const CURRENCY_SOURCES = ['shopify', 'manual'] as const;
+export type CurrencySource = (typeof CURRENCY_SOURCES)[number];
+
+/**
+ * GET /accounts/:id/currency.
+ *
+ * THREE COLUMNS, NOT TWO, and that is load-bearing: `currency` is the currency
+ * the account's STORED MONEY VALUES are expressed in, while
+ * `shopifyCurrencyDetected` is what Shopify reports, recorded independently. When
+ * they disagree the backend keeps both — nothing is converted and nothing is
+ * deleted — and the mismatch is DERIVED from the two columns rather than stored
+ * as a flag, so resolving the data clears it.
+ */
+export interface AccountCurrencyState {
+  currency: string | null;
+  currencySource: CurrencySource | null;
+  shopifyCurrencyDetected: string | null;
+}
+
+/** backend/src/onboarding/costs.ts — account_costs.cogs_method. */
+export const COGS_METHODS = ['per_sku', 'blended'] as const;
+export type CogsMethod = (typeof COGS_METHODS)[number];
+
+/**
+ * One eligible SKU with its trailing-12-month line-item revenue and any cost
+ * already entered.
+ *
+ * `revenue` is a NUMBER, not a money string, and it is not presented as a
+ * business revenue figure anywhere — see the note on `SkuCoverage`.
+ *
+ * `cogs` IS THE ONE MONEY FIELD THIS BACKEND DOES NOT SEND AS A STRING, and the
+ * distinction matters enough to record. `account_costs.ocas_monthly` and
+ * `ad_spend.spend` arrive as NUMERIC strings ("1500.25") and are kept as strings
+ * end to end. `getSkuCoverage()` in backend/src/onboarding/costs.ts instead maps
+ * its column through `Number()` before serializing, so a per-SKU cost reaches us
+ * as `33.33` — already a binary float, whatever we do next.
+ *
+ * So the string here is RECONSTRUCTED from that number at the API boundary, not
+ * preserved from the database. That is honest about what is available: the
+ * conversion has already happened server-side and cannot be undone from here, and
+ * turning it into a canonical two-decimal string at the edge at least stops a
+ * SECOND float round trip happening in the browser every time the value is
+ * rendered, prefilled into a form, or sent back. Two decimal places is well
+ * inside the exactly-representable range for the magnitudes NUMERIC(12,2) holds,
+ * so the reconstruction is faithful; it is the principle of not floating money
+ * twice that this preserves, not a guarantee the backend already gave up.
+ */
+export interface SkuRevenueCost {
+  sku: string;
+  revenue: number;
+  /**
+   * A canonical two-decimal string, or null when no cost has been entered.
+   * Reconstructed from the number the backend sends — see above.
+   */
+  cogs: string | null;
+  zeroConfirmed: boolean;
+}
+
+/**
+ * The coverage arithmetic behind the 80% COGS target.
+ *
+ * `eligibleLineRevenue` AND `costedRevenue` ARE NOT NET REVENUE. They are
+ * line-item values (price x quantity) over eligible orders, gross of order-level
+ * discounts and refunds — deliberately a different measure from
+ * `orders.total_net`, which Phase 6 uses for RCM revenue. They exist only as the
+ * denominator and numerator of a RATIO, and mixing measures would make that
+ * ratio wrong in both directions. The UI shows `coveragePct`; it must never
+ * label either of these as revenue.
+ */
+export interface SkuCoverage {
+  /** The default required set: smallest group reaching 80%, capped at 20. */
+  required: SkuRevenueCost[];
+  /** Every eligible SKU, so costs can be added beyond the initial 20. */
+  all: SkuRevenueCost[];
+  /** Ratio denominator. NOT a revenue figure — see above. */
+  eligibleLineRevenue: number;
+  /** Ratio numerator. NOT a revenue figure — see above. */
+  costedRevenue: number;
+  /** The one figure this UI displays: costedRevenue / eligibleLineRevenue. */
+  coveragePct: number;
+  /** True when even all 20 required SKUs cannot reach the target. */
+  cappedBelowTarget: boolean;
+  missingSkus: string[];
+  /** Costed SKUs sitting at zero with no explicit confirmation. */
+  unconfirmedZeroSkus: string[];
+}
+
+/** GET /accounts/:id/costs — the `costs` half. */
+export interface FinancialCostsState {
+  cogsMethod: CogsMethod | null;
+  /** A percentage, not money. Null until entered. */
+  blendedMarginPct: number | null;
+  /** A validated money string, or null when never entered. NEVER "0" by default. */
+  ocasMonthly: string | null;
+  ocasZeroConfirmed: boolean;
+}
+
+/** GET /accounts/:id/costs, whole. */
+export interface AccountCostsResponse {
+  costs: FinancialCostsState;
+  coverage: SkuCoverage;
+}
+
+/**
+ * One stored monthly spend row.
+ *
+ * `source` is read-only and is 'manual' for everything V1 can produce — the
+ * column exists so V3's aggregator and direct-API paths slot into the same model.
+ * It is displayed, never edited.
+ */
+export interface AdSpendRow {
+  /** First-of-month, YYYY-MM-DD. */
+  month: string;
+  channel: string;
+  /** A validated money string. */
+  spend: string;
+  source: string;
+}
+
+/**
+ * The required coverage window, computed entirely by the backend.
+ *
+ * THE FRONTEND NEVER DERIVES ANY OF THIS. The rule (trailing 12 months, never
+ * before the first eligible order, only months with at least one new customer,
+ * all boundaries in the account's store timezone) lives in one place, and a
+ * second implementation in a browser would disagree with it the moment a clock,
+ * a timezone or a cache differed.
+ */
+export interface AdSpendCoverage {
+  firstOrderMonth: string | null;
+  currentMonth: string;
+  windowStart: string | null;
+  requiredMonths: string[];
+  missingMonths: string[];
+  /** Months holding BOTH real spend and a confirmed zero. A data-integrity fault. */
+  contradictoryMonths: string[];
+  coveredMonths: string[];
+  zeroConfirmedMonths: string[];
+  complete: boolean;
+}
+
+/** GET /accounts/:id/ad-spend. */
+export interface AdSpendState {
+  rows: AdSpendRow[];
+  coverage: AdSpendCoverage;
+  suggestedChannels: string[];
+}
+
+/** One channel x month-range row, as submitted to PUT /accounts/:id/ad-spend. */
+export interface AdSpendRangeInput {
+  channel: string;
+  /** A canonical decimal string. Positive — zero goes through the dedicated route. */
+  amount: string;
+  startMonth: string;
+  endMonth: string;
+}
+
+/** One per-SKU cost, as submitted to PUT /accounts/:id/costs. */
+export interface SkuCostInput {
+  sku: string;
+  /** A canonical decimal string. */
+  cogs: string;
+  /** Required, and only ever true, when `cogs` is zero. */
+  zeroConfirmed?: boolean;
+}
+
+/**
+ * What a financial write tells the UI once the response has been stripped to its
+ * safe parts.
+ *
+ * Deliberately thin. These routes echo a good deal more — refreshed coverage, a
+ * `note` sentence, `monthsWritten`/`rowsWritten` counts — and none of it is read
+ * into the UI's state, because the UI re-reads the resource after every write
+ * rather than believing a write response. A screen built from an echo and a
+ * screen built from a fresh GET disagree exactly when it matters most.
+ */
+export interface FinancialWriteOutcome {
+  ok: true;
+}
+
+/**
+ * POST /accounts/:id/ad-spend/zero answering 409 `requires_replace`.
+ *
+ * The months are the ones that ALREADY HOLD SPEND. Replacing them deletes every
+ * spend row for those months, so this is surfaced as a second, explicit
+ * confirmation rather than retried — and never as an automatic retry.
+ */
+export interface ZeroSpendConflict {
+  months: string[];
+}

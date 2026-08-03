@@ -1,4 +1,5 @@
 import { query, withTransaction } from '../db/pool.js';
+import { hasAtMostTwoDecimals, parseAmount } from './amount.js';
 
 // Manual monthly advertising spend (D3 / E1 / Correction 4).
 //
@@ -30,14 +31,38 @@ export function normalizeChannel(input: unknown): ValidationResult<string> {
 }
 
 export function validateSpendAmount(input: unknown): ValidationResult<number> {
-  const n = typeof input === 'number' ? input : Number(input);
-  if (input === null || input === undefined || input === '' || !Number.isFinite(n)) {
-    // Never read an empty field as zero (D3).
+  // Never read an empty field as zero (D3) — and `'   '` is an empty field, which
+  // `Number()` alone would have turned into a real 0. See onboarding/amount.ts.
+  const parsed = parseAmount(input);
+  if (!parsed.ok) {
     return { ok: false, error: 'not_a_number', message: 'Enter a monthly spend amount.' };
   }
+  const n = parsed.value;
   if (n < 0) return { ok: false, error: 'negative', message: 'Spend cannot be negative.' };
+  // A ZERO SPEND ROW IS NOT A SPEND ROW (D3/D5, and the same rule D4/D5 already
+  // enforce for per-SKU COGS and OCAS).
+  //
+  // This route used to accept `amount: 0`, write `ad_spend` with spend 0.00, and
+  // let getCoverageWindow() count that month as COVERED — so a caller could mark
+  // a month answered without ever stating that spend was genuinely zero. That is
+  // exactly the inference D3 forbids: the whole reason ad_spend_zero_months
+  // exists is that "no row" and "a confirmed zero" must be distinguishable, and a
+  // 0.00 spend row is a third state that reads as the second while carrying none
+  // of its evidence. Downstream that is a CAC of 0 for the month, which flows
+  // straight into an RCM tier presented as complete.
+  //
+  // The confirmation is NOT duplicated here — there is one implementation of it,
+  // confirmZeroMonths(), reached through POST /ad-spend/zero, which requires
+  // `confirmedZero: true` and refuses to overwrite existing spend without an
+  // explicit `replace`. This validator only refuses to be a second way in.
+  if (n === 0) {
+    return {
+      ok: false, error: 'zero_requires_confirmation',
+      message: 'A zero-spend month must be confirmed explicitly rather than entered as 0.',
+    };
+  }
   if (n > NUMERIC_12_2_MAX) return { ok: false, error: 'too_large', message: 'Spend is too large.' };
-  if (Math.round(n * 100) !== n * 100) {
+  if (!hasAtMostTwoDecimals(n)) {
     return { ok: false, error: 'too_precise', message: 'Spend supports at most two decimal places.' };
   }
   return { ok: true, value: n };

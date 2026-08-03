@@ -56,6 +56,26 @@ export const queryKeys = {
      */
     onboardingLinks: (accountId: number) =>
       ['accounts', 'detail', accountId, 'onboarding-links'] as const,
+
+    /**
+     * The three financial resources, each nested under `detail(accountId)`.
+     *
+     * ONE KEY PER RESOURCE, and no resource appears twice. The costs response
+     * carries the SKU coverage as well, so there is deliberately no separate
+     * `skus` key: GET /accounts/:id/skus returns the same coverage object, and
+     * caching it twice means a per-SKU save that invalidates one leaves the other
+     * showing the old percentage on the same screen.
+     *
+     * All three sit under the `accounts` prefix, so `all()` still reaches them —
+     * and under `detail(accountId)`, so switching account cannot show one brand's
+     * cost figures under another brand's name.
+     */
+    currency: (accountId: number) =>
+      ['accounts', 'detail', accountId, 'currency'] as const,
+    costs: (accountId: number) =>
+      ['accounts', 'detail', accountId, 'costs'] as const,
+    adSpend: (accountId: number) =>
+      ['accounts', 'detail', accountId, 'ad-spend'] as const,
   },
 } as const;
 

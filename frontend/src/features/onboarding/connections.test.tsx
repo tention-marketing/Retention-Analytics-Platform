@@ -7,6 +7,7 @@ import {
   createRetainingQueryClient, renderWithProviders, type RenderWithProvidersResult,
 } from '@/test/render';
 import { callCountFor, calls, PENDING, stubFetchRoutes, type RouteStub } from '@/test/server';
+import { financialBaseRoutes } from '@/test/financialFixtures';
 
 // Agency provider connection controls.
 //
@@ -107,6 +108,10 @@ function baseRoutes(overrides: Record<string, RouteStub> = {}): Record<string, R
     [ACCOUNTS]: { json: [ACCOUNT] },
     [STATUS_ROUTE]: { json: statusPayload() },
     [LINKS_ROUTE]: { json: [] },
+    // The financial-inputs section renders on this page too. All three of its
+    // GETs answer in their "nothing configured" state: this suite is about
+    // provider credentials, not money.
+    ...financialBaseRoutes(ACCOUNT_ID),
     ...overrides,
   };
 }
@@ -866,12 +871,23 @@ describe('session handling and scope', () => {
     expect(screen.getByLabelText('Private API key')).toHaveValue('');
   });
 
-  it('builds no currency, cost or ad-spend control', async () => {
+  /**
+   * The PROVIDER form carries credentials and nothing else.
+   *
+   * This previously forbade currency and cost controls anywhere on the page,
+   * which was true when none existed. They exist now, in their own section, so
+   * the claim is narrowed to the provider form itself — where a cost or currency
+   * field would mean a credential submission also writing financial data, and an
+   * env-credential or sync-mode control would mean one brand's stored .env
+   * credential reachable from another brand's page.
+   */
+  it('builds no currency, cost or ad-spend control inside the provider form', async () => {
     const { user } = await openWorkspace();
     await openShopifyForm(user);
+    const platforms = screen.getByRole('region', { name: 'Platforms' });
     for (const label of [/currency/i, /cogs/i, /gross margin/i, /operating cost/i, /ocas/i,
       /ad spend/i, /advertising/i]) {
-      expect(screen.queryByLabelText(label)).toBeNull();
+      expect(within(platforms).queryByLabelText(label)).toBeNull();
     }
     // And no environment-credential or sync-mode control.
     expect(screen.queryByLabelText(/environment/i)).toBeNull();

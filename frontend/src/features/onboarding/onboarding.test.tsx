@@ -7,6 +7,7 @@ import {
   createRetainingQueryClient, renderWithProviders, type RenderWithProvidersResult,
 } from '@/test/render';
 import { callCountFor, calls, PENDING, stubFetchRoutes, type RouteStub } from '@/test/server';
+import { financialBaseRoutes } from '@/test/financialFixtures';
 
 // The agency onboarding control centre.
 //
@@ -103,6 +104,10 @@ function baseRoutes(overrides: Record<string, RouteStub> = {}): Record<string, R
     [ACCOUNTS]: { json: [ACCOUNT] },
     [STATUS_ROUTE]: { json: STATUS },
     [LINKS_ROUTE]: { json: [] },
+    // The workspace now also renders the financial-inputs section, so its three
+    // GETs are part of every render of this page. All three answer in their
+    // "nothing configured" state; this suite is about onboarding, not money.
+    ...financialBaseRoutes(ACCOUNT_ID),
     ...overrides,
   };
 }
@@ -379,20 +384,44 @@ describe('the platform section', () => {
     expect(main).not.toHaveTextContent('attemptsMade');
   });
 
-  it('builds no credential, cost, currency or ad-spend form anywhere on the page', async () => {
+  /**
+   * The ONBOARDING sections build no form of their own.
+   *
+   * This assertion used to cover the whole page and forbid every financial
+   * control, because at that checkpoint none existed. The financial-inputs
+   * section is now real, so the claim has been narrowed to what it was always
+   * protecting rather than deleted: the setup-overview, setup-link and platform
+   * sections must not sprout credential or cost fields of their own. Financial
+   * inputs live in their own section, with their own tests, reached through
+   * account-scoped routes — and a cost field appearing inside the platform list
+   * would mean two places writing the same value.
+   */
+  it('builds no credential or cost form inside the onboarding sections', async () => {
     await openWorkspace();
     await screen.findByRole('heading', { name: 'Shopify', level: 3 });
 
-    // The whole workspace: the only inputs that may exist belong to the
-    // one-time link panel, and it is not open.
-    expect(screen.getByRole('main').querySelectorAll('input, textarea, select')).toHaveLength(0);
+    for (const heading of ['Setup overview', 'Setup links', 'Platforms']) {
+      const section = screen.getByRole('region', { name: heading });
+      expect(section.querySelectorAll('input, textarea, select')).toHaveLength(0);
+    }
+    // No credential field anywhere on the page: the provider forms are opened by
+    // an explicit action, and none has been taken.
     for (const label of [
       /api key/i, /api token/i, /access token/i, /client secret/i, /shop domain/i,
-      /currency/i, /cogs/i, /gross margin/i, /operating cost/i, /ocas/i, /ad spend/i,
-      /advertising/i,
     ]) {
       expect(screen.queryByLabelText(label)).toBeNull();
     }
+  });
+
+  it('renders the financial inputs section as a sibling of the onboarding sections', async () => {
+    await openWorkspace();
+    // Present, headed, and NOT inside the platform list — a financial failure must
+    // never read as a provider-connection problem.
+    const financial = await screen.findByRole('region', { name: 'Financial inputs' });
+    expect(financial).toBeInTheDocument();
+    expect(
+      screen.getByRole('region', { name: 'Platforms' }).contains(financial),
+    ).toBe(false);
   });
 });
 

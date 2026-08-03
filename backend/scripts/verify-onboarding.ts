@@ -594,6 +594,75 @@ function groupA(): void {
   check('spend: negative rejected', !adspend.validateSpendAmount(-1).ok);
   check('spend: empty rejected, not read as zero', !adspend.validateSpendAmount('').ok);
   check('spend: 3 decimals rejected', !adspend.validateSpendAmount(1.234).ok);
+  // A 0.00 spend row used to be accepted here and counted as coverage, giving a
+  // caller a way to mark a month answered without confirming the zero. The
+  // confirmation lives in POST /ad-spend/zero and nowhere else.
+  check('spend: 0 rejected — an ordinary row cannot bypass zero confirmation',
+    !adspend.validateSpendAmount(0).ok);
+  check('spend: 0 carries the fixed zero_requires_confirmation code', (() => {
+    const r = adspend.validateSpendAmount(0);
+    return !r.ok && r.error === 'zero_requires_confirmation';
+  })());
+  check('spend: string "0" rejected too — coercion is not a way round it', (() => {
+    const r = adspend.validateSpendAmount('0');
+    return !r.ok && r.error === 'zero_requires_confirmation';
+  })());
+  check('spend: 0.00 rejected', !adspend.validateSpendAmount(0.0).ok);
+  check('spend: the smallest positive amount is still accepted',
+    adspend.validateSpendAmount(0.01).ok);
+
+  // --- an empty field is never a number, whatever Number() thinks of it ---
+  //
+  // `Number('   ')`, `Number('\t')` and `Number([])` are all 0, and `Number([100])`
+  // is 100. Every validator below used to open with a bare `Number(input)` guarded
+  // only against the literal `''`, so a whitespace-only field arrived as a real
+  // zero — and paired with the explicit zero confirmations these validators
+  // require, that STORED a confirmed zero nobody had entered. See
+  // onboarding/amount.ts.
+  for (const [label, value] of [
+    ['whitespace', '   '], ['a tab', '\t'], ['a newline', '\n'],
+    ['an empty array', []], ['a single-element array', [100]],
+    ['true', true], ['false', false], ['an object', {}], ['undefined', undefined],
+  ] as [string, unknown][]) {
+    check(`spend: ${label} is not_a_number, never a coerced value`, (() => {
+      const r = adspend.validateSpendAmount(value);
+      return !r.ok && r.error === 'not_a_number';
+    })());
+    check(`ocas: ${label} is not_a_number even WITH a zero confirmation`, (() => {
+      const r = costs.validateOcas(value, true);
+      return !r.ok && r.error === 'not_a_number';
+    })());
+    check(`sku cost: ${label} is not_a_number even WITH a zero confirmation`, (() => {
+      const r = costs.validateSkuCost({ sku: 'A', cogs: value, zeroConfirmed: true });
+      return !r.ok && r.error === 'not_a_number';
+    })());
+    check(`blended: ${label} is not_a_number`, (() => {
+      const r = costs.validateBlendedMargin(value);
+      return !r.ok && r.error === 'not_a_number';
+    })());
+  }
+  // Legitimate numeric strings still work — the fix narrows coercion, it does not
+  // ban the string form the wire actually carries.
+  check('spend: a numeric string is still accepted', (() => {
+    const r = adspend.validateSpendAmount('1234.56');
+    return r.ok && r.value === 1234.56;
+  })());
+  check('spend: a padded numeric string is still accepted', (() => {
+    const r = adspend.validateSpendAmount('  1234.56  ');
+    return r.ok && r.value === 1234.56;
+  })());
+  check('ocas: a numeric string is still accepted', (() => {
+    const r = costs.validateOcas('5000.00', false);
+    return r.ok && r.value.ocas === 5000;
+  })());
+  check('ocas: a string "0" with confirmation is still a real confirmed zero', (() => {
+    const r = costs.validateOcas('0', true);
+    return r.ok && r.value.ocas === 0 && r.value.confirmedZero === true;
+  })());
+  check('blended: a numeric string is still accepted', (() => {
+    const r = costs.validateBlendedMargin('62.55');
+    return r.ok && r.value === 62.55;
+  })());
   check('month: YYYY-MM normalized to first of month', (() => {
     const r = adspend.normalizeMonth('2026-03');
     return r.ok && r.value === '2026-03-01';

@@ -3,7 +3,9 @@ import { ErrorPanel } from '@/components/ErrorPanel';
 import { LoadingSkeleton } from '@/components/LoadingSkeleton';
 import { formatCreatedAt } from '@/features/accounts/AccountList';
 import { useAccount } from '@/features/accounts/useAccounts';
+import { FinancialInputsSection } from '@/features/financial/FinancialInputsSection';
 import { OnboardingControlCentre } from '@/features/onboarding/OnboardingControlCentre';
+import { useOnboardingStatus } from '@/features/onboarding/useOnboarding';
 
 /**
  * One account.
@@ -141,7 +143,41 @@ export function AccountWorkspacePage() {
       */}
       <OnboardingControlCentre key={account.id} accountId={account.id} />
 
+      {/*
+        Also keyed on the account id, so switching brands remounts every financial
+        form rather than reusing one with the previous brand's unsaved values still
+        in its inputs. The queries are already id-scoped; this is the same guarantee
+        for local form state.
+      */}
+      <AccountFinancialInputs key={`financial-${account.id}`} accountId={account.id} />
+
       <BackToAccounts />
     </>
+  );
+}
+
+/**
+ * Financial inputs, plus the one fact they need from the onboarding status.
+ *
+ * A SECOND OBSERVER OF AN EXISTING QUERY, not a second request: this reads the
+ * same `onboardingStatus(accountId)` key the control centre above already
+ * subscribes to, so TanStack serves both from one fetch and both see the same
+ * answer. Threading the flag down through the control centre instead would couple
+ * two unrelated sections together, and copying the value into a second cache entry
+ * is how a page ends up disagreeing with itself.
+ *
+ * `shopifyConnected` is passed as `undefined` until the status resolves, so the
+ * explanatory line about RCM appears only once it is known to be true — a brand
+ * with Shopify connected must never be told, even briefly, that it is not.
+ */
+function AccountFinancialInputs({ accountId }: { accountId: number }) {
+  const status = useOnboardingStatus(accountId);
+  return (
+    <FinancialInputsSection
+      accountId={accountId}
+      shopifyConnected={
+        status.data ? !status.data.uiStates.shopifyNotConnected : undefined
+      }
+    />
   );
 }
