@@ -291,13 +291,26 @@ describe('the setup overview', () => {
     expect(callCountFor('GET', `/api/accounts/${ACCOUNT_ID}/onboarding/status`)).toBe(1);
   });
 
-  it('never calls the onboarding-complete endpoint', async () => {
+  it('never calls a CLIENT onboarding route', async () => {
     const { user } = await openWorkspace();
     await screen.findByRole('heading', { name: 'Client setup', level: 3 });
     await user.click(screen.getByRole('button', { name: 'Refresh status' }));
     await waitFor(() => expect(callCountFor('GET', `/api/accounts/${ACCOUNT_ID}/onboarding/status`)).toBe(2));
 
-    expect(calls.some((c) => c.url.includes('/onboarding/complete'))).toBe(false);
+    // NARROWED, NOT WEAKENED. This used to test
+    // `url.includes('/onboarding/complete')`, which was unambiguous only while no
+    // agency completion route existed — the account-scoped
+    // /api/accounts/:id/onboarding/complete contains that substring too, so the
+    // old assertion would have started passing for the wrong reason. The
+    // guarantee it was written to make is "this app never touches the client
+    // wizard's routes", and the client prefix is what expresses that: every one
+    // of them lives directly under /api/onboarding/.
+    for (const call of calls) {
+      expect(call.url.startsWith('/api/onboarding/')).toBe(false);
+      expect(call.url).not.toBe('/api/onboarding/complete');
+    }
+    // And this page still issues no completion request of any kind, agency or not.
+    expect(calls.some((c) => c.url.endsWith('/onboarding/complete'))).toBe(false);
   });
 });
 

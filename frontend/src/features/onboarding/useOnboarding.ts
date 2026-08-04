@@ -1,10 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import {
-  connectKlaviyoForAccount, connectRechargeForAccount, connectShopifyForAccount,
-  createOnboardingLink, getAgencyOnboardingStatus, getOnboardingLinks, revokeOnboardingLink,
-  skipProviderForAccount, type ShopifyCredentialsInput,
+  completeOnboardingForAccount, connectKlaviyoForAccount, connectRechargeForAccount,
+  connectShopifyForAccount, createOnboardingLink, getAgencyOnboardingStatus, getOnboardingLinks,
+  revokeOnboardingLink, skipProviderForAccount, type ShopifyCredentialsInput,
 } from '@/api/onboarding';
+import { ApiError } from '@/api/errors';
 import { queryKeys } from '@/api/queryKeys';
 import { useSessionExpiryReporter } from '@/features/auth/useAuth';
 import type {
@@ -487,6 +488,103 @@ export function useSkipProvider(accountId: number): UseSkipProviderResult {
       mutation.mutate(provider);
     },
     pendingProvider: mutation.isPending ? pendingProvider : null,
+    error: mutation.error,
+    reset: mutation.reset,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Completion — the last agency action in setup
+// ---------------------------------------------------------------------------
+
+export interface UseCompleteOnboardingResult {
+  submit: () => void;
+  isSubmitting: boolean;
+  error: unknown;
+  reset: () => void;
+}
+
+/**
+ * Mark this account's setup complete.
+ *
+ * useMutation is safe here for the reason it was not safe for credentials or the
+ * one-time link: there is no variable at all (the account is in the URL, not the
+ * body) and the response carries no secret — so nothing this hook leaves in the
+ * mutation cache is anything that should not be there.
+ *
+ * NO OPTIMISTIC UPDATE, and here that matters more than anywhere else in the
+ * feature. `onboarding_complete` never reverts once written, so a cache entry
+ * painted `true` before the server agreed would be a claim the UI could not walk
+ * back — and the one screen an agency would trust it from. The panel changes when
+ * the refetched status says it changed.
+ */
+export function useCompleteOnboarding(accountId: number): UseCompleteOnboardingResult {
+  const queryClient = useQueryClient();
+  const reportSessionExpiry = useSessionExpiryReporter();
+
+  // A ref, for the same reason useCreateOnboardingLink and useConnectProvider use
+  // one: `mutation.isPending` is state, and TanStack does NOT set it synchronously
+  // inside mutate(). Three clicks in one tick therefore all read `false` and all
+  // fire — measured, not assumed: guarding on isPending alone sent three POSTs in
+  // the duplicate-submission test. This flips before mutate() is reached.
+  const inFlight = useRef(false);
+
+  const invalidate = (key: readonly unknown[]) =>
+    queryClient.invalidateQueries({ queryKey: key }).catch(() => undefined);
+
+  const mutation = useMutation({
+    mutationFn: () => completeOnboardingForAccount(accountId),
+    // Never. This is not idempotent from the user's point of view even though the
+    // endpoint is: a silent replay after a timeout would mean nobody can say
+    // whether the completion they are looking at was asked for once or twice.
+    retry: false,
+
+    // DELIBERATELY NOT onSettled. A single invalidation for every outcome is the
+    // obvious shape and the wrong one here, because the outcomes differ in what
+    // they changed:
+    //
+    //   success  — the account row changed, so the directory list is stale too
+    //   409      — nothing changed on the server, but the page's idea of the
+    //              blockers evidently had, which is the whole reason for the
+    //              refusal; re-read the status and nothing else
+    //   401      — the session is gone; refetching would 401 again on the way
+    //              out and the cache is about to be cleared anyway
+    //   network/5xx — we do not know what happened. Refetching the account list
+    //              would be asking a question whose answer we would then have to
+    //              interpret, and interpreting it is how a page ends up showing
+    //              a completion the server never performed.
+    onSuccess: async () => {
+      await Promise.all([
+        // The authority. Everything the panel, the two gates and the provider
+        // cards render is re-read from here — nothing is written into the cache
+        // by hand, so the screen can only ever show what the server said.
+        invalidate(queryKeys.accounts.onboardingStatus(accountId)),
+        // `accounts.onboarding_complete` moved, and it is rendered twice outside
+        // this feature: the workspace's Setup detail and the directory badge.
+        // Same reason useConnectShopify invalidates the list.
+        invalidate(queryKeys.accounts.list()),
+      ]);
+    },
+    onError: async (cause) => {
+      if (reportSessionExpiry(cause)) return;
+      if (cause instanceof ApiError && cause.status === 409) {
+        await invalidate(queryKeys.accounts.onboardingStatus(accountId));
+      }
+    },
+    // Released on both paths, so a failure does not leave the control latched
+    // shut with no way back other than reloading the page.
+    onSettled: () => {
+      inFlight.current = false;
+    },
+  });
+
+  return {
+    submit: () => {
+      if (inFlight.current || mutation.isPending) return;
+      inFlight.current = true;
+      mutation.mutate();
+    },
+    isSubmitting: mutation.isPending,
     error: mutation.error,
     reset: mutation.reset,
   };

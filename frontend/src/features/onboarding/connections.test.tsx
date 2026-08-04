@@ -896,7 +896,7 @@ describe('session handling and scope', () => {
     expect(screen.getByRole('main')).not.toHaveTextContent('useEnvCredentials');
   });
 
-  it('never requests the onboarding-complete endpoint', async () => {
+  it('never requests a client onboarding route, and completes nothing', async () => {
     const { user } = await openWorkspace({ [KLAVIYO_ROUTE]: { status: 202, json: KLAVIYO_OK } });
     await user.click(screen.getByRole('button', { name: 'Connect Klaviyo' }));
     await user.type(await screen.findByLabelText('Private API key'), KLAVIYO_KEY);
@@ -904,6 +904,13 @@ describe('session handling and scope', () => {
     await waitFor(() => {
       expect(callCountFor('GET', `/api/accounts/${ACCOUNT_ID}/onboarding/status`)).toBe(2);
     });
-    expect(calls.some((c) => c.url.includes('/onboarding/complete'))).toBe(false);
+    // Narrowed to the client prefix: the agency completion route added in 5B-2G
+    // also contains '/onboarding/complete', so a substring match would no longer
+    // distinguish the two. Both guarantees are kept explicitly — no client route,
+    // and connecting a platform never completes setup as a side effect.
+    for (const call of calls) {
+      expect(call.url.startsWith('/api/onboarding/')).toBe(false);
+    }
+    expect(calls.some((c) => c.url.endsWith('/onboarding/complete'))).toBe(false);
   });
 });

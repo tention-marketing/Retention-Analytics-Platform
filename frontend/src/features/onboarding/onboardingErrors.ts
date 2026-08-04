@@ -15,7 +15,7 @@ import { ApiError } from '@/api/errors';
 
 export type OnboardingAction =
   | 'status' | 'links' | 'create' | 'revoke'
-  | 'connect-shopify' | 'connect-klaviyo' | 'connect-recharge' | 'skip';
+  | 'connect-shopify' | 'connect-klaviyo' | 'connect-recharge' | 'skip' | 'complete';
 
 export interface OnboardingFailure {
   /** Fixed sentence, safe to render. */
@@ -35,6 +35,7 @@ const TITLES: Record<OnboardingAction, string> = {
   'connect-klaviyo': 'Could not connect Klaviyo',
   'connect-recharge': 'Could not connect Recharge',
   skip: 'Could not save that choice',
+  complete: 'Could not mark setup complete',
 };
 
 export function onboardingFailureTitle(action: OnboardingAction): string {
@@ -56,6 +57,29 @@ const UNEXPECTED = 'The server returned something unexpected. Nothing was change
  */
 const LINK_GONE = 'That setup link is no longer available. Refresh the list and try again.';
 
+/**
+ * The 409 from POST /accounts/:id/onboarding/complete.
+ *
+ * A conflict here means one specific thing: the server re-ran the completion gate
+ * and it did not pass. Either the page was working from a status that had since
+ * changed, or a platform's state moved while the request was in flight. Nothing
+ * was written.
+ *
+ * WHY THIS SENTENCE AND NOT THE BLOCKERS THEMSELVES. The 409 body does carry
+ * `onboardingBlockers`, and api/errors.ts allowlists them into ApiError.details —
+ * but they are a snapshot from the instant the write was refused, and the hook
+ * refetches the status immediately afterwards. Rendering both would put two
+ * blocker lists on one screen, and the stale one would be the more prominent.
+ * So this says what happened and where to look, and the refreshed status query
+ * says what is actually still outstanding.
+ *
+ * It is deliberately NOT called unexpected or internal. It is neither: it is the
+ * server correctly refusing a write, and telling a user that a correct refusal
+ * was a system fault is how they learn to ignore the message.
+ */
+const COMPLETE_CONFLICT =
+  'Setup changed before it could be completed. Review the latest setup status and try again.';
+
 const PER_ACTION_400: Record<OnboardingAction, string> = {
   status: UNEXPECTED,
   links: UNEXPECTED,
@@ -65,6 +89,7 @@ const PER_ACTION_400: Record<OnboardingAction, string> = {
   'connect-klaviyo': 'That Klaviyo key was not accepted. Nothing was changed.',
   'connect-recharge': 'That Recharge token was not accepted. Nothing was changed.',
   skip: 'That choice could not be saved. Nothing was changed.',
+  complete: 'Setup could not be marked complete. Nothing was changed.',
 };
 
 /**
@@ -125,6 +150,17 @@ export function describeOnboardingFailure(
   // far more actionable than "try again in a moment".
   const byCode = CONNECT_FAILURES[action]?.[error.code ?? ''];
   if (byCode) return { message: byCode, retryable: false, sessionExpired: false };
+
+  // A 409 on completion is the gate refusing the write, not a fault.
+  //
+  // It sits AFTER the code lookup above so `domain_conflict` — also a 409, on a
+  // connect route — keeps its own more specific sentence. `retryable:false`
+  // because the button is not what fixes this: an outstanding platform decision
+  // is, and the refreshed status is where that is listed. An automatic retry
+  // would re-send a request the server has just finished explaining it refuses.
+  if (error.status === 409 && action === 'complete') {
+    return { message: COMPLETE_CONFLICT, retryable: false, sessionExpired: false };
+  }
 
   if (error.status >= 500) {
     return { message: SERVER, retryable: true, sessionExpired: false };

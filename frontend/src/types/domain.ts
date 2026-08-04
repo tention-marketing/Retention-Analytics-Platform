@@ -324,6 +324,28 @@ export interface AgencyOnboardingStatus {
   uiStates: OnboardingUiStates;
 }
 
+/**
+ * POST /accounts/:id/onboarding/complete — the 200 body.
+ *
+ * `completed` is the LITERAL true, not a boolean. The endpoint answers a refusal
+ * with 409 and `{completed: false}`, which the client layer turns into an
+ * ApiError, so a `false` can never reach a caller holding this type. Typing it as
+ * `boolean` would invite a `if (outcome.completed)` branch guarding a case that
+ * does not exist, and the absence of that branch is the guarantee.
+ *
+ * `rcmReady` and `rcmBlockers` are the backend's own words and are modelled
+ * because refusing to model them would mean parsing a payload we do not
+ * understand. They are NOT the source of RCM state on screen: the refetched
+ * onboarding status is, because it is the one thing every section of the page
+ * already reads. Two sources for one fact is how a page starts disagreeing with
+ * itself — so these are validated, returned, and not rendered.
+ */
+export interface OnboardingCompletionOutcome {
+  completed: true;
+  rcmReady: boolean;
+  rcmBlockers: OnboardingBlocker[];
+}
+
 // ---------------------------------------------------------------------------
 // Provider connections
 // ---------------------------------------------------------------------------

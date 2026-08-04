@@ -172,8 +172,14 @@ describe('the financial inputs section', () => {
   it('never requests a client onboarding route, completion, or a dashboard', async () => {
     await openWorkspace();
     for (const call of calls) {
+      // Every client wizard route lives directly under /api/onboarding/. Matching
+      // the prefix rather than a substring keeps this meaning "no client route"
+      // now that an agency /api/accounts/:id/onboarding/... family exists.
+      expect(call.url.startsWith('/api/onboarding/')).toBe(false);
       expect(call.url).not.toMatch(/\/onboarding\/(currency|cogs|ocas|ad-spend)/);
-      expect(call.url).not.toContain('/onboarding/complete');
+      // Unchanged in force: merely opening the workspace completes nothing, on
+      // either surface. The financial section has no completion control at all.
+      expect(call.url.endsWith('/onboarding/complete')).toBe(false);
       expect(call.url).not.toMatch(/\/(rcm|metrics|snapshot|churn|cohort|repurchase)\b/);
     }
   });

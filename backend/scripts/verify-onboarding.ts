@@ -2771,6 +2771,553 @@ async function groupJ(app: App, agencyCookie: string): Promise<void> {
 }
 
 // ===========================================================================
+// K. Agency onboarding completion — POST /accounts/:id/onboarding/complete
+// ===========================================================================
+//
+// This endpoint has existed since Phase 5A and was reachable from nothing: the
+// only coverage was group D's 401 probe. Phase 5B-2G gives it a caller, so this
+// group verifies the contract that caller now depends on.
+//
+// IT CHANGES NOTHING. canCompleteOnboarding(), markOnboardingComplete() and the
+// route itself are untouched; every check below reads the behaviour that is
+// already there. No completion timestamp column is introduced, and the agency
+// path's deliberate non-effect on onboarding_links is PINNED rather than
+// "fixed" — see check 12.
+//
+// Providers are made connected by inserting the `connections` row directly.
+// That is not a shortcut around verification: what is under test here is the
+// completion gate's reading of connection state, not the provider clients (group
+// B owns those, against mocked fixtures). No live API is contacted anywhere in
+// this file — global fetch is mocked for the whole run.
+
+/** The tables a refusal must leave untouched, plus the account row itself. */
+const COMPLETION_SNAPSHOT_TABLES = [
+  'connections', 'onboarding_provider_choices', 'onboarding_links',
+  'account_costs', 'sku_costs', 'ad_spend', 'ad_spend_zero_months',
+] as const;
+
+/**
+ * Every row this account owns in the tables above, as deterministic text.
+ *
+ * Ordered by the row's own JSON rather than by a primary key, so tables with
+ * composite or text keys still serialise identically across two reads. Comparing
+ * whole rows — not counts — is what makes "byte-for-byte unchanged" mean it: a
+ * mutation that swapped a value while keeping the row count would pass a count
+ * check and fail this one.
+ */
+async function completionSnapshot(accountId: number): Promise<string> {
+  const parts: string[] = [];
+  const acct = await query<{ j: string | null }>(
+    `SELECT to_jsonb(a)::text AS j FROM accounts a WHERE id = $1`, [accountId]);
+  parts.push(`accounts=${acct.rows[0]?.j ?? 'ABSENT'}`);
+  for (const t of COMPLETION_SNAPSHOT_TABLES) {
+    const { rows } = await query<{ j: string }>(
+      `SELECT COALESCE(jsonb_agg(to_jsonb(t) ORDER BY to_jsonb(t)::text), '[]'::jsonb)::text AS j
+         FROM ${t} t WHERE account_id = $1`,
+      [accountId],
+    );
+    parts.push(`${t}=${rows[0].j}`);
+  }
+  return parts.join('\n');
+}
+
+/**
+ * Mark a provider connected without touching a provider API.
+ *
+ * `credentials_encrypted` is a non-credential literal: nothing on the completion
+ * path decrypts it, and a realistic-looking ciphertext in a test fixture is one
+ * more string that has to be proven harmless.
+ */
+async function seedConnectedProvider(
+  accountId: number, provider: 'shopify' | 'klaviyo' | 'recharge',
+  shopDomain: string | null = null,
+): Promise<void> {
+  await query(
+    `INSERT INTO connections (account_id, provider, credentials_encrypted, shop_domain, status)
+     VALUES ($1, $2, 'verify5a-not-a-credential', $3, 'connected')
+     ON CONFLICT (account_id, provider)
+     DO UPDATE SET status = 'connected', shop_domain = EXCLUDED.shop_domain`,
+    [accountId, provider, shopDomain],
+  );
+}
+
+/** Does this account have any financial input recorded at all? */
+async function hasAnyFinancialInput(accountId: number): Promise<boolean> {
+  const { rows } = await query<{ n: string }>(
+    `SELECT (
+       (SELECT count(*) FROM account_costs        WHERE account_id = $1)
+     + (SELECT count(*) FROM sku_costs            WHERE account_id = $1)
+     + (SELECT count(*) FROM ad_spend             WHERE account_id = $1)
+     + (SELECT count(*) FROM ad_spend_zero_months WHERE account_id = $1)
+     + (SELECT count(*) FROM accounts WHERE id = $1 AND currency IS NOT NULL)
+     ) AS n`,
+    [accountId],
+  );
+  return Number(rows[0].n) > 0;
+}
+
+/** The closed blocker vocabularies. A code outside them is a contract change. */
+const COMPLETION_BLOCKER_CODES = [
+  'account_not_found', 'session_invalid', 'link_account_mismatch', 'session_revoked',
+  'session_expired', 'no_platform_connected', 'provider_undecided', 'connection_not_verified',
+] as const;
+const RCM_BLOCKER_CODES = [
+  'shopify_not_connected', 'currency_unknown', 'currency_mismatch', 'no_eligible_revenue_data',
+  'cogs_method_not_selected', 'cogs_blended_missing_or_invalid',
+  'insufficient_shopify_data_for_skus', 'cogs_per_sku_zero_unconfirmed', 'cogs_per_sku_incomplete',
+  'ocas_missing', 'ocas_zero_unconfirmed', 'contradictory_ad_spend_state',
+  'ad_spend_coverage_incomplete', 'ad_spend_invalid',
+] as const;
+
+/** Substrings that must never appear in a completion response, at any depth. */
+const COMPLETION_FORBIDDEN = [
+  'credentials', 'credentials_encrypted', 'apiKey', 'api_key', 'clientSecret', 'client_secret',
+  'accessToken', 'access_token', 'password', 'secret', 'token',
+  'account_id', 'accountId', 'jobId', 'jobState', 'failedReason', 'recentErrors',
+  'stack', 'node_modules', 'node:internal', 'file://', '/Users/', '/var/', '/opt/',
+  'SELECT ', 'INSERT ', 'UPDATE ', 'DELETE ', 'pg_', 'ECONNREFUSED', 'verify5a-not-a-credential',
+] as const;
+
+function checkCompletionBodyHygiene(label: string, raw: string): void {
+  for (const needle of COMPLETION_FORBIDDEN) {
+    check(`${label}: response carries no "${needle}"`, !raw.includes(needle));
+  }
+  check(`${label}: response is a single line of JSON with no embedded trace`, !/\\n\s*at /.test(raw));
+}
+
+function checkBlockerShape(
+  label: string, blockers: { code: string; message: string }[], allowed: readonly string[],
+): void {
+  check(`${label}: every code comes from the closed vocabulary`,
+    blockers.every((b) => allowed.includes(b.code)), blockers.map((b) => b.code));
+  check(`${label}: every message is a short single-line sentence`,
+    blockers.every((b) =>
+      typeof b.message === 'string' && b.message.length > 0 && b.message.length <= 300
+      && !/[\n\r]/.test(b.message)),
+    blockers.map((b) => b.message));
+  check(`${label}: no message quotes a filesystem path or an exception`,
+    blockers.every((b) => !/\/Users\/|node_modules|:\d+:\d+|^[A-Za-z]*Error:/.test(b.message)));
+}
+
+async function groupK(app: App, agencyCookie: string): Promise<void> {
+  group('K', 'Agency onboarding completion (5B-2G)');
+
+  const completeUrl = (id: number | string) => `/accounts/${id}/onboarding/complete`;
+
+  // --- 1. No agency cookie -------------------------------------------------
+  const noCookieAcc = await makeAccount('complete_nocookie');
+  await seedConnectedProvider(noCookieAcc, 'klaviyo');
+  await choices.setSkipped(noCookieAcc, 'shopify');
+  await choices.setSkipped(noCookieAcc, 'recharge');
+  const anon = await app.inject({
+    method: 'POST', url: completeUrl(noCookieAcc), remoteAddress: nextIp(), payload: {},
+  });
+  check('1. unauthenticated completion is refused', anon.statusCode === 401, anon.statusCode);
+  check('1. the refusal names no reason beyond "unauthorized"',
+    (anon.json() as { error?: string }).error === 'unauthorized');
+  check('1. the account is still incomplete', !(await state.isOnboardingComplete(noCookieAcc)));
+
+  // --- 2. Scoped onboarding-link cookie ------------------------------------
+  //
+  // A client link is not a weaker agency session; it is a different principal.
+  // requireAuth rejects it because it carries no session.userId.
+  const scopedAcc = await makeAccount('complete_scoped');
+  await seedConnectedProvider(scopedAcc, 'klaviyo');
+  await choices.setSkipped(scopedAcc, 'shopify');
+  await choices.setSkipped(scopedAcc, 'recharge');
+  const scopedLink = await mintAndExchange(app, agencyCookie, scopedAcc);
+  const scoped = await app.inject({
+    method: 'POST', url: completeUrl(scopedAcc), headers: { cookie: scopedLink.cookie },
+    remoteAddress: nextIp(), payload: {},
+  });
+  check('2. a scoped onboarding-link cookie is refused by the agency route',
+    scoped.statusCode === 401, scoped.statusCode);
+  check('2. the account is still incomplete', !(await state.isOnboardingComplete(scopedAcc)));
+
+  // --- 3. Invalid path ids -------------------------------------------------
+  for (const bad of ['abc', '0', '-1', '1.5', '%20']) {
+    const res = await app.inject({
+      method: 'POST', url: completeUrl(bad), headers: { cookie: agencyCookie },
+      remoteAddress: nextIp(), payload: {},
+    });
+    check(`3. path id "${bad}" is refused with 400 bad_account_id`,
+      res.statusCode === 400 && (res.json() as { error: string }).error === 'bad_account_id',
+      { status: res.statusCode, body: res.json() });
+  }
+
+  // --- 4. Missing account --------------------------------------------------
+  const accountsBefore = Number((await query<{ n: string }>(
+    `SELECT count(*) n FROM accounts`)).rows[0].n);
+  const missingId = 2_000_000_007;
+  const missing = await app.inject({
+    method: 'POST', url: completeUrl(missingId), headers: { cookie: agencyCookie },
+    remoteAddress: nextIp(), payload: {},
+  });
+  check('4. an absent account is 404 account_not_found',
+    missing.statusCode === 404 && (missing.json() as { error: string }).error === 'account_not_found',
+    { status: missing.statusCode, body: missing.json() });
+  check('4. no account row was created by the attempt',
+    Number((await query<{ n: string }>(`SELECT count(*) n FROM accounts`)).rows[0].n)
+      === accountsBefore);
+  check('4. no dependent row was created for the absent id',
+    (await completionSnapshot(missingId)).includes('accounts=ABSENT')
+    && !(await completionSnapshot(missingId)).match(/=\[\{/));
+
+  // --- 5. provider_undecided, in isolation --------------------------------
+  const undecidedAcc = await makeAccount('complete_undecided');
+  await seedConnectedProvider(undecidedAcc, 'klaviyo');
+  await choices.setSkipped(undecidedAcc, 'recharge');
+  // Shopify is deliberately left with no connection and no choice row at all.
+  const beforeUndecided = await completionSnapshot(undecidedAcc);
+  const undecided = await app.inject({
+    method: 'POST', url: completeUrl(undecidedAcc), headers: { cookie: agencyCookie },
+    remoteAddress: nextIp(), payload: {},
+  });
+  const undecidedBody = undecided.json() as {
+    completed: boolean; onboardingBlockers: { code: string; message: string }[];
+  };
+  check('5. an undecided platform refuses completion with 409', undecided.statusCode === 409,
+    undecided.statusCode);
+  check('5. the refusal says completed:false', undecidedBody.completed === false);
+  check('5. provider_undecided is among the blockers',
+    undecidedBody.onboardingBlockers.some((b) => b.code === 'provider_undecided'),
+    undecidedBody.onboardingBlockers.map((b) => b.code));
+  check('5. the blocker names the platform at fault',
+    undecidedBody.onboardingBlockers.some((b) => b.message.includes('shopify')));
+  check('5. the account is still incomplete', !(await state.isOnboardingComplete(undecidedAcc)));
+  check('5. the refusal mutated nothing (17)',
+    (await completionSnapshot(undecidedAcc)) === beforeUndecided);
+  checkBlockerShape('5', undecidedBody.onboardingBlockers, COMPLETION_BLOCKER_CODES);
+  checkCompletionBodyHygiene('5', undecided.body);
+
+  // --- 6. no_platform_connected, in isolation ------------------------------
+  const noneAcc = await makeAccount('complete_none');
+  for (const p of ['shopify', 'klaviyo', 'recharge'] as const) await choices.setSkipped(noneAcc, p);
+  const beforeNone = await completionSnapshot(noneAcc);
+  const none = await app.inject({
+    method: 'POST', url: completeUrl(noneAcc), headers: { cookie: agencyCookie },
+    remoteAddress: nextIp(), payload: {},
+  });
+  const noneBody = none.json() as {
+    completed: boolean; onboardingBlockers: { code: string; message: string }[];
+  };
+  check('6. skipping everything refuses completion with 409', none.statusCode === 409,
+    none.statusCode);
+  check('6. no_platform_connected is among the blockers',
+    noneBody.onboardingBlockers.some((b) => b.code === 'no_platform_connected'),
+    noneBody.onboardingBlockers.map((b) => b.code));
+  check('6. every platform being answered is NOT sufficient on its own',
+    noneBody.onboardingBlockers.every((b) => b.code !== 'provider_undecided'));
+  check('6. the account is still incomplete', !(await state.isOnboardingComplete(noneAcc)));
+  check('6. the refusal mutated nothing (17)',
+    (await completionSnapshot(noneAcc)) === beforeNone);
+  check('6. skipping created no connections row',
+    Number((await query<{ n: string }>(
+      `SELECT count(*) n FROM connections WHERE account_id = $1`, [noneAcc])).rows[0].n) === 0);
+  checkBlockerShape('6', noneBody.onboardingBlockers, COMPLETION_BLOCKER_CODES);
+  checkCompletionBodyHygiene('6', none.body);
+
+  // --- 7. Klaviyo-only completion -----------------------------------------
+  //
+  // The load-bearing case. Shopify absent, no cost figure anywhere, and setup
+  // still finishes — with RCM honestly reported as unavailable in the same
+  // response.
+  const klaviyoOnly = await makeAccount('complete_klaviyo_only');
+  await seedConnectedProvider(klaviyoOnly, 'klaviyo');
+  await choices.setSkipped(klaviyoOnly, 'shopify');
+  await choices.setSkipped(klaviyoOnly, 'recharge');
+  check('7. no financial input exists on this account',
+    !(await hasAnyFinancialInput(klaviyoOnly)));
+  const kOnly = await app.inject({
+    method: 'POST', url: completeUrl(klaviyoOnly), headers: { cookie: agencyCookie },
+    remoteAddress: nextIp(), payload: {},
+  });
+  const kOnlyBody = kOnly.json() as {
+    completed: boolean; rcmReady: boolean; rcmBlockers: { code: string; message: string }[];
+  };
+  check('7. Klaviyo-only onboarding completes', kOnly.statusCode === 200, {
+    status: kOnly.statusCode, body: kOnly.json(),
+  });
+  check('7. the response says completed:true', kOnlyBody.completed === true);
+  check('7. accounts.onboarding_complete became true',
+    await state.isOnboardingComplete(klaviyoOnly));
+  check('7. the same response says RCM is NOT ready', kOnlyBody.rcmReady === false);
+  check('7. shopify_not_connected remains an RCM blocker',
+    kOnlyBody.rcmBlockers.some((b) => b.code === 'shopify_not_connected'),
+    kOnlyBody.rcmBlockers.map((b) => b.code));
+  check('7. no cost blocker is reported instead of the missing Shopify connection',
+    kOnlyBody.rcmBlockers.length === 1, kOnlyBody.rcmBlockers.map((b) => b.code));
+  check('7. completion required no financial row (10)',
+    !(await hasAnyFinancialInput(klaviyoOnly)));
+  check('7. completion fabricated no connection for a skipped platform',
+    Number((await query<{ n: string }>(
+      `SELECT count(*) n FROM connections WHERE account_id = $1`, [klaviyoOnly])).rows[0].n) === 1);
+  check('7. the skipped platforms are still recorded as skipped',
+    (await choices.getProviderStatuses(klaviyoOnly))
+      .filter((p) => p.state === 'skipped').map((p) => p.provider).join(',') === 'shopify,recharge');
+  checkBlockerShape('7', kOnlyBody.rcmBlockers, RCM_BLOCKER_CODES);
+  checkCompletionBodyHygiene('7', kOnly.body);
+
+  // --- 8. A requested platform is an answer, and stays "requested" ---------
+  const requestedAcc = await makeAccount('complete_requested');
+  await seedConnectedProvider(requestedAcc, 'klaviyo');
+  await choices.setShopifyRequested(requestedAcc, `verify5a-req-${Date.now()}.myshopify.com`);
+  await choices.setSkipped(requestedAcc, 'recharge');
+  const requested = await app.inject({
+    method: 'POST', url: completeUrl(requestedAcc), headers: { cookie: agencyCookie },
+    remoteAddress: nextIp(), payload: {},
+  });
+  check('8. an agency-assist request counts as answered and completes',
+    requested.statusCode === 200, { status: requested.statusCode, body: requested.json() });
+  check('8. onboarding_complete became true', await state.isOnboardingComplete(requestedAcc));
+  const reqStatuses = await choices.getProviderStatuses(requestedAcc);
+  check('8. Shopify is still "requested" after completion',
+    reqStatuses.find((p) => p.provider === 'shopify')?.state === 'requested',
+    reqStatuses.map((p) => `${p.provider}:${p.state}`));
+  check('8. completion did NOT relabel the request as connected',
+    reqStatuses.filter((p) => p.state === 'connected').map((p) => p.provider).join(',') === 'klaviyo');
+  check('8. no connections row was invented for the requested store',
+    Number((await query<{ n: string }>(
+      `SELECT count(*) n FROM connections WHERE account_id = $1 AND provider = 'shopify'`,
+      [requestedAcc])).rows[0].n) === 0);
+  // Through the wire payload the frontend actually reads, not only the helper.
+  const reqStatusRes = await app.inject({
+    method: 'GET', url: `/accounts/${requestedAcc}/onboarding/status`,
+    headers: { cookie: agencyCookie }, remoteAddress: nextIp(),
+  });
+  const reqStatusBody = reqStatusRes.json() as {
+    onboardingComplete: boolean;
+    providers: { provider: string; state: string }[];
+    rcmReadiness: { ready: boolean };
+    uiStates: Record<string, boolean>;
+  };
+  check('8. the status payload reports completion',
+    reqStatusBody.onboardingComplete === true);
+  check('8. the status payload keeps the three states distinct',
+    reqStatusBody.providers.map((p) => `${p.provider}:${p.state}`).join(',')
+      === 'shopify:requested,klaviyo:connected,recharge:skipped',
+    reqStatusBody.providers);
+  check('8. completion did not make RCM ready', reqStatusBody.rcmReadiness.ready === false);
+  check('8. uiStates reports complete-but-limited, not complete-and-ready',
+    reqStatusBody.uiStates.onboardingComplete === true
+    && reqStatusBody.uiStates.limitedAnalyticsAvailable === true
+    && reqStatusBody.uiStates.rcmReady === false, reqStatusBody.uiStates);
+
+  // --- 9. All three connected ---------------------------------------------
+  const allAcc = await makeAccount('complete_all');
+  await seedConnectedProvider(allAcc, 'shopify', `verify5a-all-${Date.now()}.myshopify.com`);
+  await seedConnectedProvider(allAcc, 'klaviyo');
+  await seedConnectedProvider(allAcc, 'recharge');
+  const all = await app.inject({
+    method: 'POST', url: completeUrl(allAcc), headers: { cookie: agencyCookie },
+    remoteAddress: nextIp(), payload: {},
+  });
+  const allBody = all.json() as { completed: boolean; rcmReady: boolean };
+  check('9. all three connected completes', all.statusCode === 200,
+    { status: all.statusCode, body: all.json() });
+  check('9. onboarding_complete became true', await state.isOnboardingComplete(allAcc));
+  check('9. Shopify being connected still does not make RCM ready — costs are missing',
+    allBody.rcmReady === false);
+  check('9. completion required no financial row (10)', !(await hasAnyFinancialInput(allAcc)));
+
+  // --- 11. Idempotency ----------------------------------------------------
+  const afterFirst = await completionSnapshot(klaviyoOnly);
+  const globalAccountsBefore = Number((await query<{ n: string }>(
+    `SELECT count(*) n FROM accounts`)).rows[0].n);
+  const globalCompleteBefore = Number((await query<{ n: string }>(
+    `SELECT count(*) n FROM accounts WHERE onboarding_complete = true`)).rows[0].n);
+  const repeat = await app.inject({
+    method: 'POST', url: completeUrl(klaviyoOnly), headers: { cookie: agencyCookie },
+    remoteAddress: nextIp(), payload: {},
+  });
+  check('11. a repeated completion is 200, not a conflict', repeat.statusCode === 200,
+    { status: repeat.statusCode, body: repeat.json() });
+  check('11. the repeat still says completed:true',
+    (repeat.json() as { completed: boolean }).completed === true);
+  check('11. onboarding_complete remains true', await state.isOnboardingComplete(klaviyoOnly));
+  check('11. the repeat added no row of any kind',
+    (await completionSnapshot(klaviyoOnly)) === afterFirst);
+  check('11. no account was created by the repeat',
+    Number((await query<{ n: string }>(`SELECT count(*) n FROM accounts`)).rows[0].n)
+      === globalAccountsBefore);
+  check('11. no unrelated account became complete',
+    Number((await query<{ n: string }>(
+      `SELECT count(*) n FROM accounts WHERE onboarding_complete = true`)).rows[0].n)
+      === globalCompleteBefore);
+
+  // --- 12. The agency path leaves onboarding links alone ------------------
+  //
+  // PINNING CURRENT BEHAVIOUR, NOT ASSERTING AN IDEAL. The client route stamps
+  // completed_at (check 13); the agency route deliberately does not, because no
+  // consumer of that flag exists until the Phase 5C wizard decides what a
+  // completed account's link should open into. 5B-2G does not change it, and
+  // this check is what will notice if something later does.
+  const linkAcc = await makeAccount('complete_agency_link');
+  await seedConnectedProvider(linkAcc, 'klaviyo');
+  await choices.setSkipped(linkAcc, 'shopify');
+  await choices.setSkipped(linkAcc, 'recharge');
+  const liveLink = await mintAndExchange(app, agencyCookie, linkAcc);
+  const linkBefore = await links.getLinkById(liveLink.linkId);
+  const agencyDone = await app.inject({
+    method: 'POST', url: completeUrl(linkAcc), headers: { cookie: agencyCookie },
+    remoteAddress: nextIp(), payload: {},
+  });
+  check('12. agency completion succeeded', agencyDone.statusCode === 200, agencyDone.statusCode);
+  const linkAfter = await links.getLinkById(liveLink.linkId);
+  check('12. the live link is untouched: completed_at stays NULL',
+    linkAfter?.completed_at === null, linkAfter?.completed_at);
+  check('12. the live link is untouched: revoked_at stays NULL',
+    linkAfter?.revoked_at === null, linkAfter?.revoked_at);
+  check('12. the live link is untouched: expiry unchanged',
+    linkAfter?.expires_at.getTime() === linkBefore?.expires_at.getTime());
+  check('12. the agency listing still reports it as active',
+    (await links.listLinks(linkAcc)).find((l) => l.id === liveLink.linkId)?.status === 'active');
+
+  // --- 13. The client route, by contrast, DOES stamp its link -------------
+  const clientAcc = await makeAccount('complete_client_link');
+  await seedConnectedProvider(clientAcc, 'klaviyo');
+  const clientLink = await mintAndExchange(app, agencyCookie, clientAcc);
+  for (const p of ['shopify', 'recharge']) {
+    await app.inject({
+      method: 'POST', url: `/onboarding/connections/${p}/skip`,
+      headers: { cookie: clientLink.cookie }, remoteAddress: nextIp(), payload: {},
+    });
+  }
+  const clientDone = await app.inject({
+    method: 'POST', url: '/onboarding/complete', headers: { cookie: clientLink.cookie },
+    remoteAddress: nextIp(), payload: {},
+  });
+  check('13. the client route completes', clientDone.statusCode === 200,
+    { status: clientDone.statusCode, body: clientDone.json() });
+  check('13. the client route stamps its own link completed_at',
+    (await links.getLinkById(clientLink.linkId))?.completed_at !== null);
+  const reExchange = await app.inject({
+    method: 'POST', url: '/onboarding/session', remoteAddress: nextIp(),
+    payload: { token: clientLink.token },
+  });
+  check('13. re-exchanging that token reports manageMode:true',
+    (reExchange.json() as { manageMode: boolean }).manageMode === true, reExchange.json());
+
+  // --- 14. A link scoped to B cannot complete A ---------------------------
+  const accA = await makeAccount('complete_tenant_a');
+  const accB = await makeAccount('complete_tenant_b');
+  await seedConnectedProvider(accA, 'klaviyo');
+  await choices.setSkipped(accA, 'shopify');
+  await choices.setSkipped(accA, 'recharge');
+  await seedConnectedProvider(accB, 'klaviyo');
+  await choices.setSkipped(accB, 'shopify');
+  await choices.setSkipped(accB, 'recharge');
+  const linkB = await mintAndExchange(app, agencyCookie, accB);
+
+  const crossAgency = await app.inject({
+    method: 'POST', url: completeUrl(accA), headers: { cookie: linkB.cookie },
+    remoteAddress: nextIp(), payload: {},
+  });
+  check('14. B\'s scoped cookie is refused by A\'s agency completion route',
+    crossAgency.statusCode === 401, crossAgency.statusCode);
+  check('14. A is still incomplete', !(await state.isOnboardingComplete(accA)));
+
+  const crossClient = await app.inject({
+    method: 'POST', url: '/onboarding/complete', headers: { cookie: linkB.cookie },
+    remoteAddress: nextIp(), payload: {},
+  });
+  check('14. B\'s cookie completes B and only B', crossClient.statusCode === 200
+    && (await state.isOnboardingComplete(accB)), crossClient.statusCode);
+  check('14. A was not completed by B\'s client session',
+    !(await state.isOnboardingComplete(accA)));
+
+  // --- 15/16. A body account id cannot redirect the write ----------------
+  //
+  // NOTE THE DIFFERENCE FROM THE CLIENT PATH, and it is deliberate on both
+  // sides. Client routes REJECT an account identifier with 400
+  // `account_identifier_not_permitted` (group E), because there the id would be
+  // the only thing distinguishing one workspace from another. The agency route
+  // does not reject it — it never reads the body at all, so the field is inert
+  // rather than refused. This check proves inertness: the write lands on the
+  // path's account, and B is untouched.
+  const snapshotBBefore = await completionSnapshot(accB);
+  const bCompleteBefore = await state.isOnboardingComplete(accB);
+  const redirected = await app.inject({
+    method: 'POST', url: completeUrl(accA), headers: { cookie: agencyCookie },
+    remoteAddress: nextIp(), payload: { accountId: accB, account_id: accB, account: accB },
+  });
+  check('15. the request succeeds — the extra fields are unused, not rejected',
+    redirected.statusCode === 200, { status: redirected.statusCode, body: redirected.json() });
+  check('15. it is NOT answered with the client path\'s account_identifier_not_permitted',
+    (redirected.json() as { error?: string }).error === undefined);
+  check('15. the account in the PATH is the one that completed',
+    await state.isOnboardingComplete(accA));
+  check('16. account B is byte-for-byte unchanged',
+    (await completionSnapshot(accB)) === snapshotBBefore);
+  check('16. account B\'s completion flag is exactly what it was',
+    (await state.isOnboardingComplete(accB)) === bCompleteBefore);
+
+  // --- 17. Refusal rollback, over every table, once more -----------------
+  //
+  // Checks 5 and 6 already compare a full snapshot around their 409s. This one
+  // does it on an account that carries data in EVERY snapshot table, so a
+  // partial write would have somewhere to show up.
+  const richAcc = await makeAccount('complete_rollback');
+  await seedConnectedProvider(richAcc, 'klaviyo');
+  // Answered: klaviyo connected. Unanswered: shopify AND recharge → 409.
+  await currency.setManualCurrency(richAcc, 'USD');
+  await costs.setCogsMethod(richAcc, 'per_sku');
+  // upsertSkuCosts only accepts a SKU this account has actually sold, so the
+  // line item has to exist before the cost can.
+  const richOrder = await insertOrder(richAcc, monthsAgo(1), 250, true);
+  await insertLineItem(richAcc, richOrder, 7001, 'ROLLBACK-SKU', 250);
+  await costs.upsertSkuCosts(richAcc, [{ sku: 'ROLLBACK-SKU', cogs: 4.5, zeroConfirmed: false }]);
+  await costs.setOcas(richAcc, 900, false);
+  await adspend.writeAdSpendRanges(richAcc, [
+    { channel: 'Meta', amount: 100, startMonth: monthsAgo(1), endMonth: monthsAgo(1) },
+  ]);
+  await adspend.confirmZeroMonths(richAcc, [monthsAgo(2)], { replace: false });
+  await mintOnboardingLinkFor(app, agencyCookie, richAcc);
+  const richBefore = await completionSnapshot(richAcc);
+  const richRes = await app.inject({
+    method: 'POST', url: completeUrl(richAcc), headers: { cookie: agencyCookie },
+    remoteAddress: nextIp(), payload: {},
+  });
+  check('17. the refusal still happens with every financial input present',
+    richRes.statusCode === 409, richRes.statusCode);
+  check('17. and it is the undecided platforms, never the money, that block it',
+    (richRes.json() as { onboardingBlockers: { code: string }[] }).onboardingBlockers
+      .every((b) => b.code === 'provider_undecided'),
+    (richRes.json() as { onboardingBlockers: { code: string }[] }).onboardingBlockers);
+  check('17. connections, choices, links, costs, SKU costs, ad spend and zero months are all unchanged',
+    (await completionSnapshot(richAcc)) === richBefore);
+  check('17. the account did not become complete', !(await state.isOnboardingComplete(richAcc)));
+
+  // --- 18. Response hygiene, over every response this group produced ------
+  for (const [label, res] of [
+    ['18 success', kOnly], ['18 refusal', undecided], ['18 repeat', repeat],
+    ['18 all-connected', all], ['18 requested', requested], ['18 rollback refusal', richRes],
+  ] as [string, { body: string }][]) {
+    checkCompletionBodyHygiene(label, res.body);
+  }
+  check('18. a success response carries exactly the three documented fields',
+    Object.keys(kOnly.json() as object).sort().join(',') === 'completed,rcmBlockers,rcmReady',
+    Object.keys(kOnly.json() as object));
+  check('18. a refusal carries exactly the two documented fields',
+    Object.keys(undecided.json() as object).sort().join(',') === 'completed,onboardingBlockers',
+    Object.keys(undecided.json() as object));
+  check('18. no outbound provider request was made by any completion',
+    fetchLog.every((r) => !r.url.includes('/onboarding/complete')));
+  check('18. no .env credential leaked while this group ran', envCredentialLeaked() === null,
+    envCredentialLeaked());
+}
+
+/** Mint a link without exchanging it, so a case can assert on an unused link. */
+async function mintOnboardingLinkFor(
+  app: App, agencyCookie: string, accountId: number,
+): Promise<void> {
+  await app.inject({
+    method: 'POST', url: `/accounts/${accountId}/onboarding-links`,
+    headers: { cookie: agencyCookie }, remoteAddress: nextIp(), payload: {},
+  });
+}
+
+// ===========================================================================
 // Main
 // ===========================================================================
 
@@ -2819,6 +3366,7 @@ async function main(): Promise<void> {
     await groupH(app, agencyCookie);
     await groupI(app, agencyCookie);
     await groupJ(app, agencyCookie);
+    await groupK(app, agencyCookie);
   } finally {
     console.log('\nCleanup');
     await cleanupAccounts();
@@ -2891,6 +3439,7 @@ async function main(): Promise<void> {
     D: 'Session isolation', E: 'Cross-tenant', F: 'Credential fallback',
     G: 'Link states + rate limit', H: 'Later connection',
     I: 'Fastify 5 regressions', J: 'Agency API hardening',
+    K: 'Agency completion (5B-2G)',
   };
   for (const [letter, t] of Object.entries(groupTotals)) {
     const mark = t.fail === 0 ? '✓' : '✗';

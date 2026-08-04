@@ -1,6 +1,7 @@
 import { Alert } from '@/components/Alert';
 import { Button } from '@/components/Button';
 import { LoadingSkeleton } from '@/components/LoadingSkeleton';
+import { CompleteSetupPanel } from './CompleteSetupPanel';
 import { OnboardingLinksSection } from './OnboardingLinksSection';
 import { ProviderStatusList } from './ProviderStatusList';
 import { SetupOverview } from './SetupOverview';
@@ -66,13 +67,31 @@ export function OnboardingControlCentre({ accountId }: { accountId: number }) {
           ) : null}
 
           {status.status === 'ready' && status.data ? (
-            <SetupOverview
-              onboardingComplete={status.data.onboardingComplete}
-              onboardingBlockers={status.data.onboardingBlockers}
-              rcmReady={status.data.rcmReadiness.ready}
-              rcmBlockers={status.data.rcmReadiness.blockers}
-              limitedAnalyticsAvailable={status.data.uiStates.limitedAnalyticsAvailable}
-            />
+            <>
+              <SetupOverview
+                onboardingComplete={status.data.onboardingComplete}
+                onboardingBlockers={status.data.onboardingBlockers}
+                rcmReady={status.data.rcmReadiness.ready}
+                rcmBlockers={status.data.rcmReadiness.blockers}
+                limitedAnalyticsAvailable={status.data.uiStates.limitedAnalyticsAvailable}
+              />
+              {/*
+                Directly under the two gates, and rendered ONLY once the status has
+                resolved. A completion control offered beside a loading skeleton or
+                a failed status request would be a button whose enabled state was
+                guesswork — and the thing it guesses about is whether a write the
+                server will refuse is worth sending.
+
+                It takes the same two fields SetupOverview took, from the same
+                object. No second query, and no prop drilled down from anywhere
+                else, so the panel and the gate above it are reading one answer.
+              */}
+              <CompleteSetupPanel
+                accountId={accountId}
+                onboardingComplete={status.data.onboardingComplete}
+                onboardingBlockers={status.data.onboardingBlockers}
+              />
+            </>
           ) : null}
         </div>
       </section>

@@ -7,7 +7,7 @@ import {
   type Provider, type ProviderState, type ProviderStatusSummary, type ProviderSyncProgress,
   type RcmReadiness, type SafeFailure, type SyncState, type FailureCategory,
   type OnboardingUiStates, type ProviderConnectionOutcome, type ProviderSkipOutcome,
-  type ShopifyConnectionOutcome,
+  type ShopifyConnectionOutcome, type OnboardingCompletionOutcome,
 } from '@/types/domain';
 
 // The four agency onboarding calls.
@@ -382,6 +382,55 @@ export async function getAgencyOnboardingStatus(
     providers: body.providers.map(parseProviderStatus),
     progress: body.progress.map(parseProgress),
     uiStates: parseUiStates(body.uiStates),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Completion
+// ---------------------------------------------------------------------------
+
+/**
+ * POST /accounts/:id/onboarding/complete.
+ *
+ * THE REQUEST HAS NO BODY AT ALL, and that is the security property rather than a
+ * convenience. The account being completed is the path segment the session is
+ * authorised against; an `accountId` field would be a second, caller-controlled
+ * answer to the same question. The shared client only sets Content-Type when
+ * there is a body, so a bodyless POST is also the only shape Fastify accepts here
+ * (a declared `application/json` with nothing after it is FST_ERR_CTP_EMPTY_JSON_BODY).
+ *
+ * A REFUSAL IS NOT A RETURN VALUE. The backend answers a still-blocked account
+ * with 409 `{completed:false, onboardingBlockers}`, which the shared client turns
+ * into an ApiError — and api/errors.ts already allowlists `onboardingBlockers`
+ * into `ApiError.details`, so the blockers survive without this function having to
+ * model two outcomes. The caller re-reads the status query for the current
+ * blockers instead of trusting a body that was already stale when it was written.
+ *
+ * `accountId` is checked before a URL is built. `/accounts/NaN/onboarding/complete`
+ * would otherwise be a real request to a nonsense path, and this function is the
+ * last place that can be a type error instead of a 400.
+ */
+export async function completeOnboardingForAccount(
+  accountId: number,
+): Promise<OnboardingCompletionOutcome> {
+  if (!isPositiveInt(accountId)) malformed('invalid_account_id');
+
+  const body = await api.post<unknown>(`/accounts/${accountId}/onboarding/complete`);
+
+  if (!isRecord(body)) malformed('malformed_completion_response');
+  // The literal, not a truthy check: a 200 whose body says `completed:false`
+  // contradicts its own status code, and guessing which half meant it is exactly
+  // the guess that ends with a completion claimed on screen and not in the
+  // database.
+  if (body.completed !== true) malformed('malformed_completion_response');
+  if (typeof body.rcmReady !== 'boolean') malformed('malformed_completion_response');
+
+  // Built field by field. Nothing else on the wire — present or future — can ride
+  // into a component through this function.
+  return {
+    completed: true,
+    rcmReady: body.rcmReady,
+    rcmBlockers: parseBlockers(body.rcmBlockers),
   };
 }
 
