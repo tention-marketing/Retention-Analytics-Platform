@@ -51,20 +51,35 @@ export function AppShell({ user, children }: AppShellProps) {
             <p className="text-xs text-[var(--color-ink-muted)]">Agency workspace</p>
           </div>
 
-          <div className="flex items-center gap-3">
-            <span className="text-sm text-[var(--color-ink-muted)]">
+          {/*
+            min-w-0 on this row and on the email itself is what stops a long
+            address from widening the header past the viewport: a flex item's
+            default min-width is auto, so an unbreakable email establishes a
+            floor no amount of shrinking can get under and the button gets
+            pushed off-screen. Zeroing that floor lets the email absorb the
+            squeeze and ellipsize; the button is shrink-0 so it never pays for
+            the email's length. The full address stays in the accessibility
+            tree as text and in `title` for pointer users.
+          */}
+          <div className="flex min-w-0 items-center gap-3">
+            <span
+              className="min-w-0 truncate text-sm text-[var(--color-ink-muted)]"
+              title={user.email}
+            >
               {/* The only identity the backend returns, shown as-is. */}
               <span className="sr-only">Signed in as </span>
               {user.email}
             </span>
-            <Button
-              variant="secondary"
-              onClick={logoutMutation.submit}
-              loading={logoutMutation.isSubmitting}
-              loadingLabel="Signing out…"
-            >
-              Sign out
-            </Button>
+            <div className="shrink-0">
+              <Button
+                variant="secondary"
+                onClick={logoutMutation.submit}
+                loading={logoutMutation.isSubmitting}
+                loadingLabel="Signing out…"
+              >
+                Sign out
+              </Button>
+            </div>
           </div>
         </div>
 
