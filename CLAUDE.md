@@ -9,7 +9,7 @@
 | Decision | Locked choice |
 |---|---|
 | V1 objective | **A trustworthy RCM tier + daily churn curve for a SINGLE brand. Nothing else.** |
-| Language / stack | TypeScript (Node 20+), Fastify, PostgreSQL 16, BullMQ + Redis, React + Vite + Tailwind, Recharts |
+| Language / stack | TypeScript using **the Node.js versions supported by the root `package.json` engines field for the full monorepo, currently `^22.22.2 \|\| ^24.15.0 \|\| >=26.0.0`** — a disjoint set of ranges, not an open-ended minimum, so an intermediate major such as 23 or 25 is NOT supported. Fastify, PostgreSQL 16, BullMQ + Redis, React + Vite + Tailwind, Recharts |
 | Hosting | Railway (local dev: docker-compose Postgres + Redis) |
 | Integrations (V1) | Shopify (incl. **inventory levels**), Klaviyo (campaign/flow aggregates + send timestamps ONLY), **Recharge** |
 | Ad spend (V1) | **Manual monthly entry per channel only.** No ad APIs, no aggregators. Normalized into a source-agnostic spend model so APIs slot in at V3 without touching RCM logic. |
@@ -17,7 +17,9 @@
 | Tenancy | Single-brand operation, **multi-account-ready architecture**: every table carries `account_id`, every query filters by it. No hard-coded single-account assumptions. |
 | Timezones | Store UTC; convert to store timezone at query time |
 | Data handling | Read-only everywhere; credentials encrypted (AES-256-GCM); **full provable deletion on disconnect** |
-| Auth | Session email+password, agency staff only |
+| Auth | Session email+password, agency staff only. **Every authenticated staff member currently has agency-wide access to every account.** Per-account staff roles, scoped client dashboard accounts and client permissions are NOT implemented (V4 — §10). |
+| Onboarding completion | **TWO SEPARATE GATES, never merged (§5.1).** Basic onboarding completion = every provider answered + at least one genuinely connected. Analytics/RCM readiness is derived independently and may stay blocked afterwards. |
+| Financial inputs | Currency, COGS, blended margin, per-SKU costs, OCAS and ad spend are **optional for basic onboarding completion** and required only for RCM/full analytics readiness (§5.2). |
 
 ## 0.1 EXPLICITLY CUT FROM V1 — DO NOT BUILD
 Hourly engagement tab · Ask AI query layer · agency portfolio view · white-labeling · roles/permissions · aggregator integrations · direct ad platform APIs · SMS markers · subject-line analysis · Klaviyo event-level opens/clicks · RFM segments · send-hour dashboard · campaigns dashboard page · Skio/Stay.
@@ -29,8 +31,9 @@ The **exact RCM formula and tier thresholds** must be locked from the *Retention
 ---
 
 ## 1. WHAT V1 IS
-One brand connects Shopify + Klaviyo + Recharge through an onboarding wizard that also collects COGS, OCAS, and monthly ad spend (wizard cannot complete without them). The platform backfills full history, syncs continuously, and produces: (a) an auto-calculated **RCM tier** with a data-completeness indicator, and (b) a **daily churn curve** with auto-annotated lifecycle spikes — plus a retention snapshot, cohort-LTV-by-first-product, and a combined repurchase-behavior view.
+One brand answers for Shopify, Klaviyo and Recharge through an onboarding wizard that also collects COGS, OCAS and monthly ad spend. Each platform is either **connected**, **requested** (agency assistance pending) or **skipped** (not used by the brand); setup finishes once every platform has an answer and **at least one is genuinely connected**. The financial inputs are collected in the same wizard but do **not** gate that completion — they gate RCM (§5.2). The platform backfills full history, syncs continuously, and produces: (a) an auto-calculated **RCM tier** with a data-completeness indicator, and (b) a **daily churn curve** with auto-annotated lifecycle spikes — plus a retention snapshot, cohort-LTV-by-first-product, and a combined repurchase-behavior view.
 **Success = RCM tier and churn curve match hand-calculated values, onboarding takes under one hour, and disconnect provably deletes everything.**
+A brand connected to Klaviyo alone therefore reaches a valid finished setup with **no RCM figure at all**, and that combination must read as normal rather than as a fault.
 
 ---
 
@@ -206,15 +209,67 @@ CREATE TABLE m_rcm (account_id INT NOT NULL, month DATE NOT NULL,
 ---
 
 ## 5. ONBOARDING WIZARD (`/onboarding`)
-Steps, in order — **completion blocked until ALL steps done** (RCM is meaningless without them):
-1. Connect Shopify (domain + token) → backfill starts
-2. Connect Klaviyo (API key)
-3. Connect Recharge (API token)
-4. COGS: top ~20 SKUs by revenue prefilled from backfill → enter per-SKU COGS, OR enter one blended gross-margin %
-5. OCAS: monthly operating cost allocation
-6. Ad spend: monthly amount per channel (rows: channel + amount; editable later)
+Steps, in order. Steps 1–3 must each be **answered** (connected, requested or skipped); steps 4–6 are collected here but do **not** block basic completion — see §5.1 and §5.2:
+1. Shopify: connect (domain + credentials) → backfill starts · OR request agency setup · OR mark not used
+2. Klaviyo: connect (API key) · OR request agency setup · OR mark not used
+3. Recharge: connect (API token) · OR request agency setup · OR mark not used
+4. COGS: top ~20 SKUs by revenue prefilled from backfill → enter per-SKU COGS, OR enter one blended gross-margin % *(RCM input)*
+5. OCAS: monthly operating cost allocation *(RCM input)*
+6. Ad spend: monthly amount per channel (rows: channel + amount; editable later) *(RCM input)*
 7. Review → mark account onboarding_complete
 Acceptance: an existing account onboards end-to-end in **under one hour** (backfill may continue in background after wizard completes).
+
+### 5.1 Gate 1 — basic onboarding completion
+Completion is permitted when **all** of these hold:
+- the account exists
+- **at least one provider is genuinely connected**
+- **no provider remains undecided**
+- every provider sits in exactly one of `connected` · `requested` · `skipped`
+- every provider represented as connected has a **verified** connection row (an unverified row blocks completion)
+
+**Currency, COGS, blended margin, per-SKU costs, OCAS and ad spend are never consulted by this gate.** That is structural, not conditional: there is no branch to get wrong, which is what makes limited onboarding safe.
+
+**Shopify is not required.** Klaviyo-only completion is valid when Klaviyo is genuinely connected and Shopify and Recharge are each `requested` or `skipped`. The same holds with any other single provider as the connected one.
+
+**The three answered states must stay visibly distinct — never collapsed into one:**
+
+| State | Meaning | Is it "connected"? |
+|---|---|---|
+| `connected` | credentials verified; a real connected connection row exists | yes |
+| `requested` | answered; connection or agency setup assistance still pending | **NO** |
+| `skipped` | the brand does not use this platform | **NO** |
+| `undecided` | not yet answered — **blocks completion** | no |
+
+A requested platform must never be rendered, described or counted as a successful connection.
+
+**`accounts.onboarding_complete` is a historical completion latch.** It records that the gate passed **at least once**. It does NOT mean the current provider configuration still satisfies the gate, that analytics or RCM are ready now, or that it reverts when provider state later changes — it never reverts by design. Current readiness is always derived separately.
+
+### 5.2 Gate 2 — analytics / RCM readiness (DERIVED, never stored)
+Recomputed from live table state on every read, and **deliberately stricter**. It may require: Shopify connected · sufficient eligible order and product data · a valid, non-conflicting currency state · adequate COGS coverage of revenue or a valid blended margin · OCAS · advertising-spend coverage · and every other already-implemented readiness requirement. None of these is relaxed by anything in §5.1.
+
+A workspace may validly show all of the following **at the same time**, and the UI must present that as normal:
+- Setup complete
+- Limited analytics available
+- Analytics not ready
+
+**"Setup complete" must never be documented, labelled or implied as meaning:** RCM ready · all analytics ready · every integration connected · all imports finished · the client personally completed the work.
+
+### 5.3 Agency completion route
+`POST /accounts/:id/onboarding/complete`
+- the account id comes from the **route path**; it is the only authority
+- the frontend sends **no request body**
+- a body account identifier is **inert — this route never reads the body**. It is not explicitly rejected here (client-facing `/onboarding/*` routes *do* reject one with `account_identifier_not_permitted`; this route simply has nothing to read it)
+- the route **re-runs the whole gate server-side**; the caller's view of the world is irrelevant. A disabled button is never the control
+- a refusal returns `409` with the **current onboarding blockers** and writes nothing
+- a successful completion does **not** stamp `onboarding_links.completed_at`
+- **active client setup links are left unchanged** — not revoked, not expired, not stamped
+
+### 5.4 Deferred to Phase 5C — DO NOT LOCK HERE
+Client-side completion and setup-link lifecycle semantics remain open product decisions. Each must be inspected and locked during Phase 5C, not assumed now:
+- whether client completion immediately stamps `onboarding_links.completed_at`
+- whether a completed link becomes unusable
+- whether a completed link enters a restricted manage mode
+- whether a client may keep editing their setup until the link expires
 
 ---
 
@@ -233,7 +288,7 @@ Acceptance: an existing account onboards end-to-end in **under one hour** (backf
 | 2 | Shopify sync + inventory | Pilot store: order count exact vs admin; 12m net sales within 0.5%; live test order < 60s; inventory snapshot rows exist |
 | 3 | Recharge sync + identity graph | Subscriber counts + active/cancelled match Recharge; unmatched-identity rate < 5% (or surfaced) |
 | 4 | Klaviyo light poller | 3 campaigns within 1% of Klaviyo dashboard |
-| 5 | Onboarding wizard | Fresh account onboards in < 1 hour; completion blocked without COGS/OCAS/spend |
+| 5 | Onboarding wizard | Fresh account onboards in < 1 hour; completion blocked while any provider is undecided or none is connected; **Klaviyo-only completion succeeds with no cost figures present**; COGS/OCAS/spend block only RCM readiness (§5.1–5.2) |
 | 6 | Metrics + RCM (config-driven) | Snapshot + product LTV hand-checked vs spreadsheet; churn_daily day-30 count matches hand-count in Recharge; RCM matches hand calculation with placeholder config; partial-state shows when an input is removed |
 | 7 | Four dashboards | Team member navigates unaided; churn spike labels sit on real lifecycle days; RCM tile shows completeness |
 | 8 | Deletion + hardening | Disconnect provably removes ALL account rows (write a verification script that counts account rows across every table → 0); sync_errors clean for 72h |
@@ -250,6 +305,9 @@ Acceptance: an existing account onboards end-to-end in **under one hour** (backf
 5. Never render a confident tier on incomplete inputs — partial + warning is a feature, not a fallback.
 6. Insight wording: "tied to rebill", never "caused by rebill".
 7. Recharge rate limits: backoff, never drop silently.
+8. **Never merge the two gates.** A single combined blocker list is exactly what makes limited non-Shopify onboarding impossible, and it would tell an agency setup was unfinished when only cost inputs were missing. Two lists, always (§5.1/§5.2).
+9. **Never collapse `connected` / `requested` / `skipped`.** A requested platform shown as connected is a fabricated integration — the one lie this surface must not tell.
+10. **`onboarding_complete` is a latch, not a live status.** Read current readiness from the derived gate, never from the stored flag.
 
 ---
 
@@ -268,3 +326,4 @@ Then after each verified phase: `"Phase N verified. Build Phase N+1 only: [deliv
 - **V2 — Agency layer + AI + hourly engagement:** multi-account activation + portfolio + rollout; Ask AI (tool-based, never writes SQL); NOW add Klaviyo event-level storage + hourly engagement tab with send markers.
 - **V3 — Automated spend + full email + more subs:** aggregator Path A / direct APIs Path B (manual stays as bridge — apply for ad API approvals DURING V2, they take months); subject lines, flows pages, send-hour, list growth; Skio then Stay.
 - **V4 — White-label client access + QBR automation:** roles enforced at API layer, scoped client dashboards, invitation flow, automated Retention Health summaries.
+
