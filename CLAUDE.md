@@ -264,12 +264,190 @@ A workspace may validly show all of the following **at the same time**, and the 
 - a successful completion does **not** stamp `onboarding_links.completed_at`
 - **active client setup links are left unchanged** — not revoked, not expired, not stamped
 
-### 5.4 Deferred to Phase 5C — DO NOT LOCK HERE
-Client-side completion and setup-link lifecycle semantics remain open product decisions. Each must be inspected and locked during Phase 5C, not assumed now:
-- whether client completion immediately stamps `onboarding_links.completed_at`
-- whether a completed link becomes unusable
-- whether a completed link enters a restricted manage mode
-- whether a client may keep editing their setup until the link expires
+### 5.4 Client setup links — LOCKED lifecycle (Phase 5C, Option B: restricted manage mode)
+Locked after full repository inspection. These are no longer open product decisions.
+
+A client setup link **remains usable after completion**, until its original `expires_at` or agency revocation — but its permissions **narrow the moment the account passes Gate 1**, by either route. Client completion through a link stamps that link's `onboarding_links.completed_at` **once**. Completion does not extend `expires_at`. Re-exchanging the raw token does not extend `expires_at`. Agency revocation ends **every** existing browser session belonging to that link on its next request, because the link row is re-read on every onboarding request.
+
+**Restricted manage mode must be a real permission boundary (§5.4.4).** A link that still behaves identically to first-time setup once its account is complete is not manage mode; it is the absence of one.
+
+#### 5.4.1 Three distinct facts — never collapsed
+| Fact | Source of truth | Means |
+|---|---|---|
+| `onboardingComplete` | `accounts.onboarding_complete` is true | the account passed Gate 1 **at least once**, through *either* the agency route *or* some client link |
+| `completedByThisLink` | `onboarding_links.completed_at` is not null | **this specific link** performed a successful client completion |
+| `manageMode` | `onboardingComplete` **OR** `completedByThisLink` | this client session is restricted to the §5.4.4 allowlist |
+
+**`manageMode` is a permission state, and it is not a completion-attribution fact.** It answers only "what may this session do now" — never "who completed this account". Deriving it from `completedByThisLink` alone would leave a live link in unrestricted first-time setup mode on an account the agency had **already** completed, which is an open editing surface on a finished account. So the account-level fact restricts too, and the OR is what makes the restriction unconditional.
+
+**Never use `manageMode` alone to display:**
+- "this client completed setup"
+- "this link completed setup"
+- "`completed_at` exists"
+
+Every one of those claims requires **`completedByThisLink`**. The two facts stay separately stored, separately exposed and separately rendered — a permission state and an audit fact are not interchangeable.
+
+`completed_at` is the timestamp of the **first** successful client completion through that link. **Repeated completion must not update it.**
+
+`GET /onboarding/me` must expose enough client-safe information to restore **all three** facts — `onboardingComplete`, `completedByThisLink` and the derived `manageMode` — after a browser reload carrying only the onboarding cookie. A reload cannot re-read the URL fragment, so anything knowable only at token exchange is lost on refresh.
+
+#### 5.4.2 Agency-completed account, client link that has not completed
+These three states are valid **together**, and the UI must present them as normal:
+- `onboardingComplete` = true
+- `completedByThisLink` = false
+- `manageMode` = **true**
+
+This is what an agency completing the account looks like from a live client link. In that state:
+- the UI **may** truthfully say that setup is complete
+- the UI **must not** claim that this client or this link completed it
+- **this link immediately receives restricted manage-mode permissions**
+- `onboarding_links.completed_at` remains **null**
+- the link **may** still call the idempotent client completion endpoint
+- a successful client completion stamps **this** link's `completed_at` once
+- **`manageMode` stays true before and after that client completion** — the client completion changes the audit fact, not the permission mode
+
+The agency route is unchanged from §5.3: `POST /accounts/:id/onboarding/complete` sets `accounts.onboarding_complete` when Gate 1 passes, does **not** stamp `onboarding_links.completed_at`, leaves the link **active**, and leaves `expires_at` and `revoked_at` untouched. It changes a client link's **permission mode** only because the account-level `onboardingComplete` fact is now true — not by writing anything to the link.
+
+#### 5.4.3 Link expiry — the only access-expiry authority
+`onboarding_links.expires_at` is the single access-expiry authority. There is **no** `manage_expires_at` and **no** separate manage-mode timer.
+
+The current default, and the fixed value the agency UI requests, is **14 days**. The existing backend validation accepts a longer TTL (currently 1–90 days), so **14 days is the normal choice, not an enforced backend hard maximum**. Phase 5C does not change that validation.
+
+- completion never extends access
+- token re-exchange never extends access
+- issuing another onboarding cookie never extends `expires_at`
+- expired links are invalid; revoked links are invalid
+- after expiry, the agency must issue a **fresh** link when later access is needed
+- a cookie's lifetime stays **capped by the remaining lifetime of its link**
+
+#### 5.4.4 Accepted bearer-link risk, and the manage-mode allowlist
+Anyone holding the raw token may exchange it until `expires_at` or revocation. What that grants depends on the **account**, not on which link is in hand:
+
+- **before the account has completed Gate 1** — an active link grants normal setup access
+- **after the account has completed Gate 1, through either agency or client completion** — **every** active link for that account grants restricted manage-mode access only
+
+A specific link's `completed_at` remains an **independent audit fact** and never widens or narrows this on its own.
+
+This is an accepted, **bounded** bearer-link risk, held in place by: a cryptographically random token · hash-only token storage · the original `expires_at` · immediate agency revocation · tenant-scoped onboarding sessions · full separation from agency sessions · and the allowlist below.
+
+A repeated token exchange **may** issue a new onboarding cookie, but must never extend `expires_at`, bypass revocation, change tenant scope, or **restore unrestricted setup access once `accounts.onboarding_complete` is true**.
+
+The client UI must state plainly that anyone holding the active link may edit the allowed settings until the displayed expiry date or agency revocation. Shared access that is invisible is shared access nobody can decide about.
+
+**ALLOWED when `manageMode` is true:**
+- read its own client-safe onboarding status
+- read its own safe sync progress and real row counts
+- connect Klaviyo when Klaviyo is not already connected
+- connect Recharge when Recharge is not already connected
+- submit or update a Shopify **domain request** for agency setup when Shopify is not connected
+- change `requested` → `skipped` for an **unconnected** provider
+- change `skipped` → `requested` for an **unconnected** provider
+- update manually editable currency when Shopify is not authoritative
+- update blended-margin COGS
+- update per-SKU COGS
+- change the selected COGS method, retaining the inactive method's values
+- update OCAS
+- explicitly confirm zero OCAS
+- update positive advertising spend
+- explicitly confirm zero-spend months
+- repeat client completion, idempotently
+- log out by clearing its own onboarding cookie
+
+**DENIED when `manageMode` is true:**
+- mark a **connected** provider as `requested`
+- mark a **connected** provider as `skipped`
+- move any provider back to `undecided`
+- submit Shopify app credentials directly
+- disconnect a provider
+- delete provider credentials or provider data
+- view stored provider credentials
+- regenerate or retrieve provider credentials
+- resolve a currency mismatch
+- override Shopify-authoritative currency
+- see raw sync errors, stack traces, provider exception text or queue internals
+- access analytics dashboards
+- access agency navigation
+- access agency account pages
+- list accounts · create accounts · access another account
+- create, list or revoke onboarding links
+- extend link expiry
+- change agency users, roles or permissions
+
+**Every future client route is DENIED in manage mode unless it is explicitly added to this allowlist**, and enforcement must be **centralized** — one gate, one table — so a route added later cannot silently forget the restriction.
+
+#### 5.4.5 Provider request routes
+Phase 5C adds client-scoped **request** support for **Klaviyo** and **Recharge**. Shopify request support already exists and stays domain-based.
+
+The four provider states remain exactly `connected` · `requested` · `skipped` · `undecided`, visibly and semantically distinct (§5.1, trap 9). Requesting a provider:
+- must **not** create a `connections` row
+- must **not** be rendered as connected
+- must **not** be counted as a genuine connection
+- **does** satisfy the "answered" half of Gate 1
+- still leaves completion blocked while **no** provider is genuinely connected
+
+A `requested` or `skipped` unconnected provider may become connected later; a real connection **supersedes** the stored choice for live state derivation. A **connected** provider cannot be moved back to `requested` or `skipped` without an explicit disconnect feature. **Disconnect remains outside Phase 5C.**
+
+#### 5.4.6 Shopify on the client surface
+Client users never submit Shopify application credentials. They submit only the **store domain** and request agency setup; direct Shopify credential connection stays agency-only. Client routes must not accept a Shopify client ID, client secret, access token, `useEnvCredentials`, or an account identifier. A Shopify request must not create a fake or placeholder `connections` row.
+
+#### 5.4.7 Financial inputs in manage mode
+Manage mode may update financial inputs through the existing client-scoped financial routes. **No existing financial guarantee may be weakened.** All of these stay locked:
+- no automatic currency conversion
+- both the manual and the Shopify-detected currency are preserved during a mismatch
+- mismatch resolution is agency-only; Shopify-authoritative currency cannot be overwritten by a client
+- no silent deletion of monetary values
+- the inactive COGS method's values remain stored; only the selected method is active for readiness
+- positive spend and zero-spend declarations stay mutually exclusive
+- replacing positive spend with a zero declaration requires explicit confirmation
+- blank, missing or invalid fields are **never** read as zero
+- zero COGS, zero OCAS and zero ad spend each require explicit confirmation
+- every read and write is scoped **only** through the onboarding session's account
+- an account identifier in a request body, query string or path can never redirect a client write
+
+Financial inputs stay outside Gate 1. They may remain incomplete after setup completion and continue blocking **only** analytics/RCM readiness (§5.2).
+
+#### 5.4.8 Token and client-session behaviour
+The raw token stays in the URL **fragment**: `/onboarding#token=…`. The client frontend must:
+- read the fragment in **one** narrowly approved token-exchange module and nowhere else
+- POST the token only in the **body** of `/onboarding/session`
+- never place the token in a query string, browser storage, a query key, or application logs
+- remove the fragment from the visible URL **immediately** after exchange
+- use router **replacement**, so the token-bearing URL never enters browser history
+
+The onboarding cookie stays separate from the agency cookie. Client sessions must never authenticate against agency routes; agency sessions must never authenticate against client onboarding routes. Invalid, malformed, unknown, expired and revoked links keep returning the **same neutral** client-facing failure, revealing neither the reason nor the account. A 401 on the client surface shows the client invalid-link / session-ended screen — it must **not** redirect a client to the agency login page.
+
+#### 5.4.9 Browser acceptance (Phase 5C-6)
+Playwright is approved as a **frontend development dependency** for Phase 5C-6 only. The browser suite must prove:
+- the public `/onboarding` route exists **outside** ProtectedRoute
+- the agency AppShell is never rendered on the client surface
+- the token fragment is removed from the visible URL after exchange, and is absent from `document.location.href`
+- the HttpOnly onboarding cookie is unreachable through `document.cookie`
+- an account that is **not** complete, whose link has not completed, opens in **first-time setup mode**
+- a client-completed link opens in **restricted manage mode**
+- a **non-completed** link belonging to an **agency-completed** account **also** opens in restricted manage mode
+- that last case shows `onboardingComplete` = true and is **already in `manageMode`**, while **not** falsely claiming `completedByThisLink` = true
+- a reload carrying a valid onboarding cookie preserves **all three** facts correctly, restoring `onboardingComplete` and `completedByThisLink` **separately** from the derived `manageMode`
+- Back does not re-trigger token exchange, does not repaint a submitted credential field, and forward/back navigation exposes no stale sensitive state
+- expired or revoked sessions show the neutral client invalid-link screen
+- no `/accounts/*` API URL is ever requested by the client wizard
+- no horizontal body overflow at **390px · 768px · 1440px**, with wide tables and financial grids scrolling only inside their own container
+- no raw provider errors, credentials, tokens, internal IDs or stack traces appear anywhere in the browser
+
+#### 5.4.10 Schema and dependencies
+**No Phase 5C migration is required.** The existing fields are sufficient: `onboarding_links.{account_id, token_hash, expires_at, revoked_at, first_used_at, completed_at}` · `accounts.onboarding_complete` · `onboarding_provider_choices.choice`.
+
+**No new backend dependency is required.** Do not add speculative fields: `manage_expires_at`, `last_used_at`, an onboarding session nonce, an onboarding session table, a per-device session id, IP binding, user-agent binding, or a use counter. Each would convert a stateless, per-request-verified principal into stored state that revocation already handles.
+
+#### 5.4.11 Phase 5C implementation sequence
+Build one subphase per instruction and stop at its criteria.
+| Sub | Deliverable |
+|---|---|
+| 5C-1 | Client session restore + the restricted manage-mode contract: expose `onboardingComplete`; expose `completedByThisLink`; derive `manageMode` from `onboardingComplete` **OR** `completedByThisLink`; keep every UI completion attribution based **only** on `completedByThisLink`; centralize manage-mode enforcement; prove agency completion restricts **every** active client link **without** stamping `completed_at`; prove a reload restores all three facts; preserve expiry and revocation behaviour |
+| 5C-2 | Provider requested/skip/connect behaviour: add client request routes for Klaviyo and Recharge; allow `requested ↔ skipped` only while unconnected; keep all four states distinct; keep Shopify agency-operated |
+| 5C-3 | Client financial route verification: prove every §5.4.7 guarantee through the `/onboarding/*` routes, including `/onboarding/ad-spend/zero`, its `requires_replace` conflict, and account-isolation proofs |
+| 5C-4 | Completion and route hardening: preserve idempotent completion; rate-limit sensitive client write routes; keep raw provider exception text out of every rendered field; refuse token exchange when the linked account cannot be safely loaded |
+| 5C-5 | Client onboarding frontend: public `/onboarding` route, token exchange, client-only shell, provider and financial steps, review/completion, invalid-link and manage-mode states — never any agency navigation |
+| 5C-6 | Playwright browser/security acceptance (§5.4.9): fragment removal, history and reload behaviour, cookie behaviour, responsive widths — real frontend against the real backend with mocked provider APIs |
 
 ---
 
