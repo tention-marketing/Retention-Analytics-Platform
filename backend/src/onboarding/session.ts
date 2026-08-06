@@ -1,7 +1,8 @@
 import { createHmac, timingSafeEqual } from 'node:crypto';
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { config } from '../config.js';
-import { getLinkById, linkLiveness, type OnboardingLinkRow } from './links.js';
+import { getLinkWithAccountState, linkLiveness, type OnboardingLinkRow } from './links.js';
+import { deriveManageMode } from './manageMode.js';
 
 // Scoped onboarding session (D2, Correction 5).
 //
@@ -32,9 +33,26 @@ export const GENERIC_LINK_ERROR = {
   message: 'This setup link is not valid. Ask your account manager for a new one.',
 } as const;
 
+/**
+ * The client principal, rebuilt from live table state on every request.
+ *
+ * The three lifecycle facts are carried here rather than re-queried per handler
+ * so that the guard, `/onboarding/me` and every route agree within one request —
+ * two reads of the same fact in one request is how a page ends up disagreeing
+ * with the permission that was just enforced on it.
+ *
+ * NONE of these comes from the cookie. See requireOnboardingLink below.
+ */
 export interface OnboardingPrincipal {
   accountId: number;
   linkId: number;
+  /** `accounts.onboarding_complete` — the account passed Gate 1 at least once. */
+  onboardingComplete: boolean;
+  /** `onboarding_links.completed_at IS NOT NULL` — THIS link completed. Audit fact. */
+  completedByThisLink: boolean;
+  /** Permission state: onboardingComplete OR completedByThisLink (§5.4.1). */
+  manageMode: boolean;
+  expiresAt: Date;
 }
 
 declare module 'fastify' {
@@ -108,9 +126,18 @@ export function clearOnboardingSession(reply: FastifyReply): void {
 /**
  * preHandler for every client-facing onboarding route.
  *
- * Re-reads the link row on every request so revocation and expiry take effect
- * inside an already-open session, and re-checks that the row still belongs to
- * the account the cookie claims.
+ * Re-reads the link row AND its account's completion latch on every request, so
+ * revocation, expiry and the manage-mode transition all take effect inside an
+ * already-open session, and re-checks that the row still belongs to the account
+ * the cookie claims.
+ *
+ * THE COOKIE IS NOT AN AUTHORITY ON ANYTHING BUT IDENTITY. It carries a link id,
+ * an account id and an issued-at, and the link id is used only to look the row
+ * up again. The three lifecycle facts are computed here from that fresh read —
+ * never trusted from the cookie, never cached — which is what makes agency
+ * completion restrict an open client session on its next request with no
+ * re-exchange, and what makes a repeated exchange unable to hand back
+ * unrestricted setup access.
  */
 export async function requireOnboardingLink(
   req: FastifyRequest,
@@ -124,11 +151,12 @@ export async function requireOnboardingLink(
     return;
   }
 
-  const link = await getLinkById(payload.l);
-  if (!link || link.account_id !== payload.a) {
+  const resolved = await getLinkWithAccountState(payload.l);
+  if (!resolved || resolved.link.account_id !== payload.a) {
     await reply.code(401).send(GENERIC_LINK_ERROR);
     return;
   }
+  const { link, onboardingComplete } = resolved;
   if (!linkLiveness(link).ok) {
     // Expired or revoked mid-session: clear the cookie so the browser stops
     // presenting a dead credential.
@@ -137,7 +165,15 @@ export async function requireOnboardingLink(
     return;
   }
 
-  req.onboarding = { accountId: link.account_id, linkId: link.id };
+  const completedByThisLink = link.completed_at !== null;
+  req.onboarding = {
+    accountId: link.account_id,
+    linkId: link.id,
+    onboardingComplete,
+    completedByThisLink,
+    manageMode: deriveManageMode({ onboardingComplete, completedByThisLink }),
+    expiresAt: link.expires_at,
+  };
 }
 
 /**

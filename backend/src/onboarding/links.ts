@@ -117,6 +117,50 @@ export async function getLinkById(linkId: number): Promise<OnboardingLinkRow | n
   return rows[0] ?? null;
 }
 
+export interface LinkWithAccountState {
+  link: OnboardingLinkRow;
+  /** `accounts.onboarding_complete` for this link's account. */
+  onboardingComplete: boolean;
+}
+
+/**
+ * The link row plus its account's completion latch, in ONE round trip.
+ *
+ * This is what every authenticated client request reads (session.ts), because
+ * all three lifecycle facts have to come from live table state rather than from
+ * the cookie: agency completion must restrict an already-open client session on
+ * its very next request, and a stored copy of the latch could not do that.
+ *
+ * LEFT JOIN, and NOT because an orphan is expected. `onboarding_links.account_id`
+ * carries a foreign key to `accounts(id)`; because no ON DELETE action is
+ * specified, PostgreSQL's default NO ACTION applies and the database REFUSES to
+ * delete an account while any onboarding link still references it. Normal
+ * account deletion therefore cannot produce an orphaned link — the delete fails
+ * instead, or the links are removed first.
+ *
+ * The LEFT JOIN is kept purely as defence in depth against database state this
+ * code did not create: a manually inconsistent row, legacy data predating the
+ * constraint, or an externally modified database. In that case a missing account
+ * simply reads as not-complete rather than crashing or silently reporting the
+ * link as absent. Rejecting a token whose account cannot be safely loaded
+ * remains deferred to Phase 5C-4.
+ */
+export async function getLinkWithAccountState(
+  linkId: number,
+): Promise<LinkWithAccountState | null> {
+  const { rows } = await query<OnboardingLinkRow & { onboarding_complete: boolean | null }>(
+    `SELECT l.*, a.onboarding_complete
+       FROM onboarding_links l
+       LEFT JOIN accounts a ON a.id = l.account_id
+      WHERE l.id = $1`,
+    [linkId],
+  );
+  const row = rows[0];
+  if (!row) return null;
+  const { onboarding_complete, ...link } = row;
+  return { link: link as OnboardingLinkRow, onboardingComplete: onboarding_complete === true };
+}
+
 export async function markFirstUsed(linkId: number): Promise<void> {
   await query(
     `UPDATE onboarding_links SET first_used_at = now()

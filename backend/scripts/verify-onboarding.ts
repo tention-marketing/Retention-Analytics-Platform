@@ -65,6 +65,7 @@ const currency = await import('../src/onboarding/currency.js');
 const state = await import('../src/onboarding/state.js');
 const choices = await import('../src/onboarding/choices.js');
 const capabilities = await import('../src/onboarding/capabilities.js');
+const manageMode = await import('../src/onboarding/manageMode.js');
 
 // ---------------------------------------------------------------------------
 // Redis precondition — the FIRST thing this suite does, before anything else.
@@ -2030,12 +2031,29 @@ async function groupH(app: App, agencyCookie: string): Promise<void> {
     await state.isOnboardingComplete(acc));
 
   // Reconnecting Klaviyo must not disturb Shopify data.
+  //
+  // UPDATED FOR PHASE 5C-1, and the expected outcome is now the opposite one.
+  // This account completed through its client link at step 3, so the link is in
+  // restricted manage mode and §5.4.4 denies re-connecting an ALREADY CONNECTED
+  // provider. The reconnect is therefore refused with 409 rather than rotating
+  // the credential. The invariants this block was written to protect are
+  // unchanged and still asserted below: Shopify's orders, Shopify's connection
+  // row and RCM readiness all survive the attempt.
+  //
+  // PRE-COMPLETION credential rotation is NOT weakened by this and keeps its own
+  // coverage: group B rotates a Klaviyo key on an account that never completes
+  // ("reconnect rotates the stored credential"), and group L section G proves
+  // the same key is left untouched once manage mode engages.
   const ordersBefore = Number((await query<{ n: string }>(
     `SELECT count(*) n FROM orders WHERE account_id = $1`, [acc])).rows[0].n);
-  await app.inject({
+  const reconnect = await app.inject({
     method: 'POST', url: '/onboarding/connections/klaviyo', headers: { cookie: link.cookie },
     remoteAddress: nextIp(), payload: { apiKey: 'pk_later_rotated_0000000000000000000' },
   });
+  check('a completed link may no longer re-connect a connected Klaviyo (5C-1)',
+    reconnect.statusCode === 409
+    && (reconnect.json() as { code?: string }).code === 'provider_already_connected',
+    { status: reconnect.statusCode, body: reconnect.json() });
   check('reconnecting Klaviyo left Shopify orders intact',
     Number((await query<{ n: string }>(
       `SELECT count(*) n FROM orders WHERE account_id = $1`, [acc])).rows[0].n) === ordersBefore);
@@ -3195,8 +3213,22 @@ async function groupK(app: App, agencyCookie: string): Promise<void> {
     method: 'POST', url: '/onboarding/session', remoteAddress: nextIp(),
     payload: { token: clientLink.token },
   });
+  // UPDATED FOR PHASE 5C-1. This check previously read manageMode as a synonym
+  // for "this link has a completed_at", which was the pre-5C-1 definition. The
+  // locked contract (§5.4.1) makes manageMode a PERMISSION state derived from
+  // onboardingComplete OR completedByThisLink, and keeps completedByThisLink as
+  // a separate audit fact. Here a client completion set BOTH, so the expected
+  // lifecycle triple is true/true/true — the assertion is widened to all three
+  // facts rather than inferring one from the other. Group L proves the case that
+  // separates them: an agency-completed account whose link never completed.
+  const reExchangeBody = reExchange.json() as {
+    onboardingComplete: boolean; completedByThisLink: boolean; manageMode: boolean;
+  };
   check('13. re-exchanging that token reports manageMode:true',
-    (reExchange.json() as { manageMode: boolean }).manageMode === true, reExchange.json());
+    reExchangeBody.manageMode === true, reExchangeBody);
+  check('13. and reports the account latch and this link\'s own completion separately',
+    reExchangeBody.onboardingComplete === true && reExchangeBody.completedByThisLink === true,
+    reExchangeBody);
 
   // --- 14. A link scoped to B cannot complete A ---------------------------
   const accA = await makeAccount('complete_tenant_a');
@@ -3318,6 +3350,848 @@ async function mintOnboardingLinkFor(
 }
 
 // ===========================================================================
+// L. Phase 5C-1 — restricted manage mode and the three lifecycle facts
+// ===========================================================================
+//
+// §5.4.1 locks THREE facts that must never be collapsed into one another:
+//
+//   onboardingComplete    accounts.onboarding_complete — the account passed
+//                         Gate 1 at least once, through EITHER route
+//   completedByThisLink   onboarding_links.completed_at — an AUDIT fact about
+//                         one specific link
+//   manageMode            a PERMISSION state, derived as
+//                         onboardingComplete OR completedByThisLink
+//
+// The load-bearing case, and the reason the OR exists, is C below: an agency
+// completes the account while a client link is open and has never completed
+// anything. That link must immediately become restricted (manageMode true)
+// while its completed_at stays null, so the UI can truthfully say "setup is
+// complete" without ever claiming this client did it.
+//
+// Every fact here is read from live PostgreSQL on each request. Section E proves
+// that by mutating the tables under an already-issued cookie.
+
+/** The lifecycle triple, in the shape both client responses return. */
+interface Lifecycle {
+  onboardingComplete: boolean;
+  completedByThisLink: boolean;
+  manageMode: boolean;
+  expiresAt: string;
+}
+
+function triple(l: Lifecycle): string {
+  return `${l.onboardingComplete}/${l.completedByThisLink}/${l.manageMode}`;
+}
+
+/**
+ * Substrings and key shapes a lifecycle response must never contain.
+ *
+ * Split from COMPLETION_FORBIDDEN because the two surfaces answer different
+ * questions: this one is specifically about the client lifecycle payloads, and
+ * it adds the link identifier — the internal id that names WHICH bearer link is
+ * in hand, and which a client has no use for.
+ */
+const LIFECYCLE_FORBIDDEN_KEYS = [
+  /"account_?[Ii]d"/, /"link_?[Ii]d"/, /"token/, /"linkToken"/,
+] as const;
+const LIFECYCLE_FORBIDDEN_TEXT = [
+  'token_hash', 'credentials', 'credentials_encrypted', 'apiKey', 'api_key',
+  'clientSecret', 'client_secret', 'accessToken', 'access_token',
+  'jobId', 'jobState', 'failedReason', 'recentErrors', 'backfill:',
+  'stack', 'node_modules', 'node:internal', '/Users/', 'ECONNREFUSED',
+  'verify5a-not-a-credential',
+] as const;
+
+function checkLifecycleHygiene(label: string, raw: string): void {
+  for (const re of LIFECYCLE_FORBIDDEN_KEYS) {
+    check(`${label}: carries no ${re.source} key`, !re.test(raw), raw.slice(0, 240));
+  }
+  for (const needle of LIFECYCLE_FORBIDDEN_TEXT) {
+    check(`${label}: carries no "${needle}"`, !raw.includes(needle));
+  }
+  check(`${label}: carries no embedded stack frame`, !/\\n\s*at /.test(raw));
+}
+
+async function groupL(app: App, agencyCookie: string): Promise<void> {
+  group('L', 'Phase 5C-1 restricted manage mode');
+
+  const me = async (cookie: string) => app.inject({
+    method: 'GET', url: '/onboarding/me', headers: { cookie }, remoteAddress: nextIp(),
+  });
+  const exchange = async (token: string) => app.inject({
+    method: 'POST', url: '/onboarding/session', remoteAddress: nextIp(), payload: { token },
+  });
+  const clientComplete = async (cookie: string) => app.inject({
+    method: 'POST', url: '/onboarding/complete', headers: { cookie }, remoteAddress: nextIp(),
+    payload: {},
+  });
+  const agencyComplete = async (accountId: number) => app.inject({
+    method: 'POST', url: `/accounts/${accountId}/onboarding/complete`,
+    headers: { cookie: agencyCookie }, remoteAddress: nextIp(), payload: {},
+  });
+  /** An account that satisfies Gate 1 with Klaviyo alone. */
+  const completableAccount = async (name: string): Promise<number> => {
+    const id = await makeAccount(name);
+    await seedConnectedProvider(id, 'klaviyo');
+    await choices.setSkipped(id, 'shopify');
+    await choices.setSkipped(id, 'recharge');
+    return id;
+  };
+  const linkRow = async (linkId: number) => links.getLinkById(linkId);
+
+  // =======================================================================
+  // A. Initial state — a new incomplete account, a new active link
+  // =======================================================================
+  const a1 = await makeAccount('5c1_initial');
+  const aMint = await app.inject({
+    method: 'POST', url: `/accounts/${a1}/onboarding-links`,
+    headers: { cookie: agencyCookie }, remoteAddress: nextIp(), payload: {},
+  });
+  const aToken = (aMint.json() as { token: string }).token;
+  const aExchange = await exchange(aToken);
+  const aCookie = cookieFrom(aExchange, 'tention_onb')!;
+  const aExchangeBody = aExchange.json() as Lifecycle & { workspaceName: string };
+  const aMeRes = await me(aCookie);
+  const aMeBody = aMeRes.json() as Lifecycle;
+
+  check('A. exchange on a fresh account reports false/false/false',
+    triple(aExchangeBody) === 'false/false/false', aExchangeBody);
+  check('A. /onboarding/me reports false/false/false',
+    triple(aMeBody) === 'false/false/false', aMeBody);
+  check('A. the two responses agree on all three facts',
+    triple(aExchangeBody) === triple(aMeBody), { aExchangeBody, aMeBody });
+  check('A. both responses carry the same expiresAt',
+    aExchangeBody.expiresAt === aMeBody.expiresAt,
+    { exchange: aExchangeBody.expiresAt, me: aMeBody.expiresAt });
+  check('A. expiresAt is a valid ISO-8601 timestamp',
+    typeof aExchangeBody.expiresAt === 'string'
+    && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z$/.test(aExchangeBody.expiresAt)
+    && !Number.isNaN(Date.parse(aExchangeBody.expiresAt)),
+    aExchangeBody.expiresAt);
+  check('A. expiresAt round-trips to the stored link expiry',
+    Date.parse(aExchangeBody.expiresAt)
+      === (await linkRow((aMint.json() as { id: number }).id))?.expires_at.getTime());
+  check('A. all three facts are present as distinct keys, not inferred',
+    ['onboardingComplete', 'completedByThisLink', 'manageMode']
+      .every((k) => k in (aMeBody as unknown as Record<string, unknown>)),
+    Object.keys(aMeBody as unknown as object));
+  checkLifecycleHygiene('A exchange', aExchange.body);
+  checkLifecycleHygiene('A me', aMeRes.body);
+
+  // =======================================================================
+  // B. Client completion — both facts become true, expiry never moves
+  // =======================================================================
+  const b1 = await completableAccount('5c1_client_complete');
+  const bLink = await mintAndExchange(app, agencyCookie, b1);
+  const bBefore = await linkRow(bLink.linkId);
+  const bDone = await clientComplete(bLink.cookie);
+  check('B. client completion succeeds', bDone.statusCode === 200,
+    { status: bDone.statusCode, body: bDone.json() });
+  check('B. accounts.onboarding_complete became true', await state.isOnboardingComplete(b1));
+  const bStamped = await linkRow(bLink.linkId);
+  check('B. this link\'s completed_at is stamped', bStamped?.completed_at !== null);
+  const bStampedAt = bStamped?.completed_at?.getTime();
+
+  const bMe = (await me(bLink.cookie)).json() as Lifecycle;
+  check('B. /onboarding/me reports true/true/true', triple(bMe) === 'true/true/true', bMe);
+  const bReExchange = (await exchange(bLink.token)).json() as Lifecycle;
+  check('B. re-exchanging the same raw token reports true/true/true',
+    triple(bReExchange) === 'true/true/true', bReExchange);
+  check('B. re-exchange did not extend expiresAt',
+    bReExchange.expiresAt === bMe.expiresAt
+    && Date.parse(bReExchange.expiresAt) === bBefore?.expires_at.getTime(),
+    { reExchange: bReExchange.expiresAt, before: bBefore?.expires_at });
+
+  const bRepeat = await clientComplete(bLink.cookie);
+  const bAfterRepeat = await linkRow(bLink.linkId);
+  check('B. a repeated client completion is idempotent (200, not a conflict)',
+    bRepeat.statusCode === 200, { status: bRepeat.statusCode, body: bRepeat.json() });
+  check('B. the repeat did NOT move completed_at',
+    bAfterRepeat?.completed_at?.getTime() === bStampedAt,
+    { first: bStampedAt, after: bAfterRepeat?.completed_at });
+  check('B. the repeat did NOT extend expires_at',
+    bAfterRepeat?.expires_at.getTime() === bBefore?.expires_at.getTime());
+  check('B. the repeat left the link unrevoked and active',
+    bAfterRepeat?.revoked_at === null
+    && (await links.listLinks(b1)).find((l) => l.id === bLink.linkId)?.status === 'active');
+  check('B. manageMode is still true after the repeat',
+    ((await me(bLink.cookie)).json() as Lifecycle).manageMode === true);
+
+  // =======================================================================
+  // C. Agency completion with an active client link — THE case for the OR
+  // =======================================================================
+  const c1 = await completableAccount('5c1_agency_complete');
+  const cLink = await mintAndExchange(app, agencyCookie, c1);
+  const cBefore = await linkRow(cLink.linkId);
+  const cInitial = (await me(cLink.cookie)).json() as Lifecycle;
+  check('C. before agency completion the link reports false/false/false',
+    triple(cInitial) === 'false/false/false', cInitial);
+
+  const cAgency = await agencyComplete(c1);
+  check('C. the real authenticated agency route completed the account',
+    cAgency.statusCode === 200, { status: cAgency.statusCode, body: cAgency.json() });
+
+  // THE ASSERTION THIS WHOLE GROUP EXISTS FOR: same cookie, no re-exchange.
+  const cAfterRes = await me(cLink.cookie);
+  const cAfter = cAfterRes.json() as Lifecycle;
+  check('C. the SAME cookie, with no re-exchange, now reports true/false/true',
+    triple(cAfter) === 'true/false/true', cAfter);
+  check('C. the response does not claim this link completed anything',
+    cAfter.completedByThisLink === false, cAfter);
+  const cLinkAfter = await linkRow(cLink.linkId);
+  check('C. the link\'s completed_at remains NULL',
+    cLinkAfter?.completed_at === null, cLinkAfter?.completed_at);
+  check('C. expires_at is unchanged',
+    cLinkAfter?.expires_at.getTime() === cBefore?.expires_at.getTime());
+  check('C. revoked_at is unchanged (still NULL)', cLinkAfter?.revoked_at === null);
+  check('C. the agency listing still reports the link as active',
+    (await links.listLinks(c1)).find((l) => l.id === cLink.linkId)?.status === 'active');
+  check('C. the link still authenticates — restricted, not ended',
+    cAfterRes.statusCode === 200, cAfterRes.statusCode);
+  checkLifecycleHygiene('C me', cAfterRes.body);
+
+  const cReExchange = await exchange(cLink.token);
+  const cReBody = cReExchange.json() as Lifecycle;
+  check('C. re-exchanging the same raw token also reports true/false/true',
+    triple(cReBody) === 'true/false/true', cReBody);
+  check('C. re-exchange did not restore unrestricted setup access',
+    cReBody.manageMode === true, cReBody);
+  check('C. re-exchange did not extend expiry',
+    Date.parse(cReBody.expiresAt) === cBefore?.expires_at.getTime());
+  checkLifecycleHygiene('C re-exchange', cReExchange.body);
+
+  // manageMode BEFORE the link-specific stamp — captured above as cAfter.
+  const cClientDone = await clientComplete(cLink.cookie);
+  check('C. the restricted link may still complete, idempotently',
+    cClientDone.statusCode === 200, { status: cClientDone.statusCode, body: cClientDone.json() });
+  const cStamped = await linkRow(cLink.linkId);
+  check('C. that client completion stamped THIS link\'s completed_at',
+    cStamped?.completed_at !== null);
+  const cFinal = (await me(cLink.cookie)).json() as Lifecycle;
+  check('C. the resulting state is true/true/true', triple(cFinal) === 'true/true/true', cFinal);
+  check('C. manageMode was true BOTH before and after the link-specific stamp',
+    cAfter.manageMode === true && cFinal.manageMode === true,
+    { before: cAfter.manageMode, after: cFinal.manageMode });
+  check('C. only the audit fact changed across that completion',
+    cAfter.onboardingComplete === cFinal.onboardingComplete
+    && cAfter.completedByThisLink === false && cFinal.completedByThisLink === true,
+    { before: cAfter, after: cFinal });
+  const cStampedAt = cStamped?.completed_at?.getTime();
+  await clientComplete(cLink.cookie);
+  check('C. a further repeat still does not move completed_at',
+    (await linkRow(cLink.linkId))?.completed_at?.getTime() === cStampedAt);
+  check('C. and still does not extend expires_at',
+    (await linkRow(cLink.linkId))?.expires_at.getTime() === cBefore?.expires_at.getTime());
+
+  // =======================================================================
+  // D. Defensive OR state — latch false, this link completed
+  // =======================================================================
+  //
+  // Not reachable through the routes: the client completion path sets the latch
+  // and the stamp together. It is constructed directly so the OR is proven to be
+  // a real disjunction rather than an expression whose second operand is never
+  // load-bearing. Deriving manageMode from onboardingComplete alone would leave
+  // this link unrestricted.
+  const d1 = await makeAccount('5c1_defensive_or');
+  const dLink = await mintAndExchange(app, agencyCookie, d1);
+  await query(`UPDATE onboarding_links SET completed_at = now() WHERE id = $1`, [dLink.linkId]);
+  const dLatchBefore = await state.isOnboardingComplete(d1);
+  const dStampBefore = (await linkRow(dLink.linkId))?.completed_at?.getTime();
+  check('D. fixture precondition: the account latch is false', dLatchBefore === false);
+  check('D. fixture precondition: the link has a completed_at', dStampBefore !== undefined);
+
+  const dMeRes = await me(dLink.cookie);
+  const dMe = dMeRes.json() as Lifecycle;
+  check('D. /onboarding/me reports false/true/true', triple(dMe) === 'false/true/true', dMe);
+  const dRe = (await exchange(dLink.token)).json() as Lifecycle;
+  check('D. session restore reports false/true/true too', triple(dRe) === 'false/true/true', dRe);
+  check('D. the two agree', triple(dMe) === triple(dRe), { dMe, dRe });
+  check('D. reading did not silently set the account latch',
+    (await state.isOnboardingComplete(d1)) === false);
+  check('D. reading did not silently move the link stamp',
+    (await linkRow(dLink.linkId))?.completed_at?.getTime() === dStampBefore);
+  checkLifecycleHygiene('D me', dMeRes.body);
+
+  // Fixture restored; the throwaway account itself is removed by cleanupAccounts.
+  await query(`UPDATE onboarding_links SET completed_at = NULL WHERE id = $1`, [dLink.linkId]);
+  check('D. the fixture was restored (completed_at back to NULL)',
+    (await linkRow(dLink.linkId))?.completed_at === null);
+
+  // =======================================================================
+  // E. Fresh PostgreSQL recomputation under ONE already-issued cookie
+  // =======================================================================
+  const e1 = await makeAccount('5c1_recompute');
+  const eLink = await mintAndExchange(app, agencyCookie, e1);
+  check('E. baseline under the issued cookie is false/false/false',
+    triple((await me(eLink.cookie)).json() as Lifecycle) === 'false/false/false');
+
+  await query(`UPDATE accounts SET onboarding_complete = true WHERE id = $1`, [e1]);
+  check('E1. flipping accounts.onboarding_complete changes manageMode on the NEXT request',
+    triple((await me(eLink.cookie)).json() as Lifecycle) === 'true/false/true');
+
+  await query(`UPDATE accounts SET onboarding_complete = false WHERE id = $1`, [e1]);
+  await query(`UPDATE onboarding_links SET completed_at = now() WHERE id = $1`, [eLink.linkId]);
+  check('E2. flipping completed_at changes completedByThisLink and manageMode',
+    triple((await me(eLink.cookie)).json() as Lifecycle) === 'false/true/true');
+
+  await query(`UPDATE onboarding_links SET completed_at = NULL WHERE id = $1`, [eLink.linkId]);
+  check('E3. clearing both facts drops the session back to unrestricted setup',
+    triple((await me(eLink.cookie)).json() as Lifecycle) === 'false/false/false');
+  check('E3. no new cookie was ever issued for those transitions',
+    (await me(eLink.cookie)).headers['set-cookie'] === undefined);
+  check('E3. and no token was re-exchanged to obtain them', true);
+
+  // E4. The cookie itself carries no lifecycle permission field.
+  const eCookieValue = eLink.cookie.split('=').slice(1).join('=');
+  const ePayloadRaw = Buffer.from(
+    eCookieValue.slice(0, eCookieValue.lastIndexOf('.')), 'base64url',
+  ).toString('utf8');
+  const ePayload = JSON.parse(ePayloadRaw) as Record<string, unknown>;
+  check('E4. the signed cookie payload holds exactly {l, a, i}',
+    Object.keys(ePayload).sort().join(',') === 'a,i,l', ePayload);
+  check('E4. it carries no lifecycle or permission field',
+    !/manageMode|onboardingComplete|completedByThisLink|completed_at|complete/i.test(ePayloadRaw),
+    ePayloadRaw);
+
+  // E5. A correctly SIGNED cookie that asserts its own lifecycle is ignored.
+  const forgedLifecycle = (() => {
+    const body = Buffer.from(JSON.stringify({
+      l: eLink.linkId, a: e1, i: Math.floor(Date.now() / 1000),
+      manageMode: false, onboardingComplete: false, completedByThisLink: false,
+    }), 'utf8').toString('base64url');
+    const mac = createHmac('sha256', config.sessionSecret).update(body).digest('base64url');
+    return `tention_onb=${body}.${mac}`;
+  })();
+  await query(`UPDATE accounts SET onboarding_complete = true WHERE id = $1`, [e1]);
+  const eForged = await me(forgedLifecycle);
+  check('E5. a correctly signed cookie claiming manageMode:false cannot override the database',
+    eForged.statusCode === 200
+    && triple(eForged.json() as Lifecycle) === 'true/false/true', eForged.json());
+  await query(`UPDATE accounts SET onboarding_complete = false WHERE id = $1`, [e1]);
+
+  // =======================================================================
+  // F. The central action contract
+  // =======================================================================
+  const EXPECTED_ACTIONS: Record<string, string> = {
+    'POST /onboarding/logout': 'session.logout',
+    'GET /onboarding/me': 'status.read',
+    'GET /onboarding/progress': 'progress.read',
+    'POST /onboarding/connections/klaviyo': 'connections.klaviyo.connect',
+    'POST /onboarding/connections/recharge': 'connections.recharge.connect',
+    'POST /onboarding/connections/shopify/request': 'connections.shopify.request',
+    'POST /onboarding/connections/:provider/skip': 'connections.choice.skip',
+    'PUT /onboarding/currency': 'currency.update',
+    'GET /onboarding/skus': 'costs.read',
+    'GET /onboarding/costs': 'costs.read',
+    'PUT /onboarding/cogs': 'cogs.update',
+    'PUT /onboarding/ocas': 'ocas.update',
+    'GET /onboarding/ad-spend': 'ad_spend.read',
+    'PUT /onboarding/ad-spend': 'ad_spend.update',
+    'POST /onboarding/ad-spend/zero': 'ad_spend.zero_confirm',
+    'POST /onboarding/complete': 'completion.submit',
+  };
+
+  // Read the declarations off the REAL route table rather than off the source
+  // text: what enforceManageMode reads at runtime is routeOptions.config, so
+  // that is what has to be inspected.
+  const routeApp = buildApp();
+  const declared = new Map<string, string | undefined>();
+  routeApp.addHook('onRoute', (r) => {
+    const methods = Array.isArray(r.method) ? r.method : [r.method];
+    for (const m of methods) {
+      if (!r.url.startsWith('/onboarding')) continue;
+      declared.set(`${m} ${r.url}`, (r.config as { clientAction?: string } | undefined)?.clientAction);
+    }
+  });
+  await routeApp.ready();
+
+  // Fastify auto-registers a HEAD twin for every GET (exposeHeadRoutes). The
+  // twins are counted separately below rather than inflating the total: they are
+  // generated, not declared, and the assertion that matters for them is that the
+  // generation carries the declaration across — a HEAD twin without a
+  // clientAction would be an undefended copy of a defended route.
+  const headTwins = [...declared.entries()].filter(([k]) => k.startsWith('HEAD '));
+  const authenticated = [...declared.entries()]
+    .filter(([k]) => !k.startsWith('HEAD ') && k !== 'POST /onboarding/session');
+  check('F. there are exactly 16 authenticated scoped onboarding routes',
+    authenticated.length === 16, authenticated.map(([k]) => k));
+  check('F. every auto-generated HEAD twin inherits its GET route\'s clientAction',
+    headTwins.length > 0
+    && headTwins.every(([k, v]) => v === declared.get(k.replace(/^HEAD /, 'GET '))),
+    headTwins.map(([k, v]) => `${k}:${v}`));
+  check('F. every authenticated route declares a clientAction',
+    authenticated.every(([, v]) => typeof v === 'string' && v.length > 0),
+    authenticated.filter(([, v]) => !v).map(([k]) => k));
+  for (const [route, action] of Object.entries(EXPECTED_ACTIONS)) {
+    check(`F. ${route} declares ${action}`, declared.get(route) === action,
+      { expected: action, actual: declared.get(route) });
+  }
+  check('F. POST /onboarding/session is public exchange and declares no client action',
+    declared.has('POST /onboarding/session')
+    && declared.get('POST /onboarding/session') === undefined,
+    declared.get('POST /onboarding/session'));
+  check('F. every declared action is a member of the closed vocabulary',
+    authenticated.every(([, v]) =>
+      (manageMode.CLIENT_ONBOARDING_ACTIONS as readonly string[]).includes(v as string)),
+    authenticated.map(([, v]) => v));
+  await routeApp.close();
+
+  // --- F. default-deny, exercised through enforceManageMode itself --------
+  //
+  // An ISOLATED Fastify fixture, not a production test route: §5.4.4 requires
+  // every future client route to be denied unless explicitly allowlisted, and
+  // adding a route to the real app to prove that would be adding exactly the
+  // kind of surface the rule exists to prevent. The principal is injected
+  // directly so the guard is the only thing under test.
+  const { default: Fastify } = await import('fastify');
+  const guardApp = Fastify({ logger: false });
+  guardApp.decorateRequest('onboarding', null);
+  let injectedManageMode = true;
+  guardApp.addHook('preHandler', async (req) => {
+    (req as unknown as { onboarding: unknown }).onboarding = {
+      accountId: 1, linkId: 1, onboardingComplete: injectedManageMode,
+      completedByThisLink: false, manageMode: injectedManageMode,
+      expiresAt: new Date(Date.now() + 86_400_000),
+    };
+  });
+  guardApp.addHook('preHandler', manageMode.enforceManageMode);
+  guardApp.get('/undeclared', async () => ({ reached: true }));
+  guardApp.get('/unknown-action',
+    { config: { clientAction: 'not.a.real.action' as never } },
+    async () => ({ reached: true }));
+  guardApp.get('/allowed',
+    { config: { clientAction: 'status.read' } },
+    async () => ({ reached: true }));
+  await guardApp.ready();
+
+  const gUndeclared = await guardApp.inject({ method: 'GET', url: '/undeclared' });
+  const gUnknown = await guardApp.inject({ method: 'GET', url: '/unknown-action' });
+  const gAllowed = await guardApp.inject({ method: 'GET', url: '/allowed' });
+  check('F. a route with NO clientAction is refused with 403',
+    gUndeclared.statusCode === 403, gUndeclared.statusCode);
+  check('F. a route declaring an unknown action is refused with 403',
+    gUnknown.statusCode === 403, gUnknown.statusCode);
+  check('F. the handler was never reached in either case',
+    !gUndeclared.body.includes('reached') && !gUnknown.body.includes('reached'),
+    { undeclared: gUndeclared.body, unknown: gUnknown.body });
+  check('F. both refusals return the SAME stable neutral body',
+    gUndeclared.body === gUnknown.body, { a: gUndeclared.body, b: gUnknown.body });
+  check('F. the refusal body is exactly the single shared constant',
+    gUndeclared.body === JSON.stringify(manageMode.MANAGE_MODE_DENIED), gUndeclared.body);
+  // The shared constant deliberately says "Ask your account manager", so the word
+  // "account" is expected prose. What must be absent is anything that identifies
+  // the ACTION, the allowlist, or a specific account or link.
+  check('F. the refusal names no action, allowlist, account id or link id',
+    !/not\.a\.real\.action|allowlist|status\.read|clientAction|manageMode/.test(gUndeclared.body)
+    && !/account_?[Ii]d|link_?[Ii]d|\d/.test(gUndeclared.body),
+    gUndeclared.body);
+  check('F. the refusal reveals nothing about which of the two faults occurred',
+    gUndeclared.body === gUnknown.body
+    && !/declar|unknown|missing/i.test(gUndeclared.body), gUndeclared.body);
+  check('F. an allowlisted action still passes the guard',
+    gAllowed.statusCode === 200 && gAllowed.body.includes('reached'), gAllowed.statusCode);
+
+  // The same fixture with manageMode FALSE: a missing declaration must still
+  // fail closed. A guard that only bites after completion is a bug that arrives
+  // months late, on somebody else's shift.
+  injectedManageMode = false;
+  check('F. a missing declaration fails closed in first-time setup mode too',
+    (await guardApp.inject({ method: 'GET', url: '/undeclared' })).statusCode === 403);
+  check('F. an unknown action fails closed in first-time setup mode too',
+    (await guardApp.inject({ method: 'GET', url: '/unknown-action' })).statusCode === 403);
+  check('F. a declared, allowlisted action still works in first-time setup mode',
+    (await guardApp.inject({ method: 'GET', url: '/allowed' })).statusCode === 200);
+  await guardApp.close();
+
+  check('F. isAllowedInManageMode agrees with the declared vocabulary',
+    manageMode.CLIENT_ONBOARDING_ACTIONS.every((a) => manageMode.isAllowedInManageMode(a))
+    && !manageMode.isAllowedInManageMode('not.a.real.action')
+    && !manageMode.isAllowedInManageMode(undefined));
+  check('F. deriveManageMode is the OR, not either operand alone',
+    manageMode.deriveManageMode({ onboardingComplete: false, completedByThisLink: false }) === false
+    && manageMode.deriveManageMode({ onboardingComplete: true, completedByThisLink: false }) === true
+    && manageMode.deriveManageMode({ onboardingComplete: false, completedByThisLink: true }) === true
+    && manageMode.deriveManageMode({ onboardingComplete: true, completedByThisLink: true }) === true);
+
+  // =======================================================================
+  // G. Manage-mode provider restrictions
+  // =======================================================================
+
+  // --- G. Klaviyo -------------------------------------------------------
+  const g1 = await makeAccount('5c1_klaviyo_locked');
+  const gLink = await mintAndExchange(app, agencyCookie, g1);
+  const K_ORIGINAL = 'pk_5c1_original_key_000000000000000000';
+  const K_REPLACEMENT = 'pk_5c1_replacement_key_0000000000000';
+  const gConnect = await app.inject({
+    method: 'POST', url: '/onboarding/connections/klaviyo', headers: { cookie: gLink.cookie },
+    remoteAddress: nextIp(), payload: { apiKey: K_ORIGINAL },
+  });
+  check('G. Klaviyo connects normally BEFORE completion',
+    [200, 202].includes(gConnect.statusCode), gConnect.json());
+  for (const p of ['shopify', 'recharge']) {
+    await app.inject({
+      method: 'POST', url: `/onboarding/connections/${p}/skip`,
+      headers: { cookie: gLink.cookie }, remoteAddress: nextIp(), payload: {},
+    });
+  }
+  check('G. first-time skip still works on an incomplete account',
+    (await choices.getProviderStatuses(g1))
+      .filter((p) => p.state === 'skipped').map((p) => p.provider).join(',') === 'shopify,recharge');
+  check('G. client completion engages manage mode',
+    (await clientComplete(gLink.cookie)).statusCode === 200
+    && ((await me(gLink.cookie)).json() as Lifecycle).manageMode === true);
+
+  const gRowBefore = (await query<{ credentials_encrypted: string; status: string }>(
+    `SELECT credentials_encrypted, status FROM connections
+      WHERE account_id = $1 AND provider = 'klaviyo'`, [g1])).rows[0];
+  fetchLog = [];
+  const gRefused = await app.inject({
+    method: 'POST', url: '/onboarding/connections/klaviyo', headers: { cookie: gLink.cookie },
+    remoteAddress: nextIp(), payload: { apiKey: K_REPLACEMENT },
+  });
+  check('G. Klaviyo re-connect in manage mode is refused with 409',
+    gRefused.statusCode === 409, { status: gRefused.statusCode, body: gRefused.json() });
+  check('G. the refusal code is the stable provider_already_connected',
+    (gRefused.json() as { code: string }).code === 'provider_already_connected', gRefused.json());
+  check('G. the replacement credential was never verified — no outbound call at all',
+    fetchLog.length === 0, fetchLog.map((f) => f.url));
+  check('G. the refusal never echoes the submitted credential',
+    !gRefused.body.includes(K_REPLACEMENT));
+  const gRowAfter = (await query<{ credentials_encrypted: string; status: string }>(
+    `SELECT credentials_encrypted, status FROM connections
+      WHERE account_id = $1 AND provider = 'klaviyo'`, [g1])).rows[0];
+  check('G. the stored ciphertext is byte-for-byte unchanged',
+    gRowAfter.credentials_encrypted === gRowBefore.credentials_encrypted);
+  check('G. and it still decrypts to the ORIGINAL key, not the replacement',
+    JSON.parse(decrypt(gRowAfter.credentials_encrypted)).apiKey === K_ORIGINAL);
+  check('G. the connection row is still exactly one, still connected',
+    gRowAfter.status === 'connected'
+    && Number((await query<{ n: string }>(
+      `SELECT count(*) n FROM connections WHERE account_id = $1 AND provider = 'klaviyo'`,
+      [g1])).rows[0].n) === 1);
+
+  // --- G. Recharge ------------------------------------------------------
+  const g2 = await makeAccount('5c1_recharge_locked');
+  const g2Link = await mintAndExchange(app, agencyCookie, g2);
+  const R_ORIGINAL = 'recharge_5c1_original_token';
+  const R_REPLACEMENT = 'recharge_5c1_replacement_token';
+  check('G. Recharge connects normally BEFORE completion',
+    [200, 202].includes((await app.inject({
+      method: 'POST', url: '/onboarding/connections/recharge', headers: { cookie: g2Link.cookie },
+      remoteAddress: nextIp(), payload: { token: R_ORIGINAL },
+    })).statusCode));
+  for (const p of ['shopify', 'klaviyo']) {
+    await app.inject({
+      method: 'POST', url: `/onboarding/connections/${p}/skip`,
+      headers: { cookie: g2Link.cookie }, remoteAddress: nextIp(), payload: {},
+    });
+  }
+  await clientComplete(g2Link.cookie);
+  const g2Before = (await query<{ credentials_encrypted: string }>(
+    `SELECT credentials_encrypted FROM connections WHERE account_id = $1 AND provider = 'recharge'`,
+    [g2])).rows[0];
+  fetchLog = [];
+  const g2Refused = await app.inject({
+    method: 'POST', url: '/onboarding/connections/recharge', headers: { cookie: g2Link.cookie },
+    remoteAddress: nextIp(), payload: { token: R_REPLACEMENT },
+  });
+  check('G. Recharge re-connect in manage mode is refused with 409',
+    g2Refused.statusCode === 409
+    && (g2Refused.json() as { code: string }).code === 'provider_already_connected',
+    { status: g2Refused.statusCode, body: g2Refused.json() });
+  check('G. Recharge: no verification call was made for the replacement token',
+    fetchLog.length === 0, fetchLog.map((f) => f.url));
+  check('G. Recharge: the refusal never echoes the submitted token',
+    !g2Refused.body.includes(R_REPLACEMENT));
+  const g2After = (await query<{ credentials_encrypted: string }>(
+    `SELECT credentials_encrypted FROM connections WHERE account_id = $1 AND provider = 'recharge'`,
+    [g2])).rows[0];
+  check('G. Recharge: the stored ciphertext is unchanged',
+    g2After.credentials_encrypted === g2Before.credentials_encrypted);
+  check('G. Recharge: it still decrypts to the ORIGINAL token',
+    JSON.parse(decrypt(g2After.credentials_encrypted)).token === R_ORIGINAL);
+
+  // --- G. Shopify domain request, and skip, against a CONNECTED provider --
+  const g3 = await makeAccount('5c1_shopify_locked');
+  await seedConnectedProvider(g3, 'shopify', `5c1-locked-${Date.now()}.myshopify.com`);
+  await choices.setSkipped(g3, 'klaviyo');
+  await choices.setSkipped(g3, 'recharge');
+  const g3Link = await mintAndExchange(app, agencyCookie, g3);
+  await agencyComplete(g3);
+  check('G. the Shopify-connected account is in manage mode',
+    ((await me(g3Link.cookie)).json() as Lifecycle).manageMode === true);
+
+  const g3ChoicesBefore = (await query<{ j: string }>(
+    `SELECT COALESCE(jsonb_agg(to_jsonb(t) ORDER BY to_jsonb(t)::text), '[]'::jsonb)::text AS j
+       FROM onboarding_provider_choices t WHERE account_id = $1`, [g3])).rows[0].j;
+  const g3ConnBefore = (await query<{ j: string }>(
+    `SELECT COALESCE(jsonb_agg(to_jsonb(t) ORDER BY to_jsonb(t)::text), '[]'::jsonb)::text AS j
+       FROM connections t WHERE account_id = $1`, [g3])).rows[0].j;
+  const g3Request = await app.inject({
+    method: 'POST', url: '/onboarding/connections/shopify/request',
+    headers: { cookie: g3Link.cookie }, remoteAddress: nextIp(),
+    payload: { shopDomain: `5c1-different-${Date.now()}.myshopify.com` },
+  });
+  check('G. a domain request against a CONNECTED Shopify is refused with 409',
+    g3Request.statusCode === 409
+    && (g3Request.json() as { code: string }).code === 'provider_already_connected',
+    { status: g3Request.statusCode, body: g3Request.json() });
+  check('G. the refusal created or modified NO provider-choice row',
+    (await query<{ j: string }>(
+      `SELECT COALESCE(jsonb_agg(to_jsonb(t) ORDER BY to_jsonb(t)::text), '[]'::jsonb)::text AS j
+         FROM onboarding_provider_choices t WHERE account_id = $1`, [g3])).rows[0].j
+      === g3ChoicesBefore);
+  check('G. the connected Shopify row is byte-for-byte unchanged',
+    (await query<{ j: string }>(
+      `SELECT COALESCE(jsonb_agg(to_jsonb(t) ORDER BY to_jsonb(t)::text), '[]'::jsonb)::text AS j
+         FROM connections t WHERE account_id = $1`, [g3])).rows[0].j === g3ConnBefore);
+
+  const g3Skip = await app.inject({
+    method: 'POST', url: '/onboarding/connections/shopify/skip',
+    headers: { cookie: g3Link.cookie }, remoteAddress: nextIp(), payload: {},
+  });
+  check('G. a CONNECTED provider cannot be skipped in manage mode',
+    g3Skip.statusCode === 409
+    && (g3Skip.json() as { code: string }).code === 'provider_already_connected',
+    { status: g3Skip.statusCode, body: g3Skip.json() });
+  check('G. the skip refusal left the connections row intact',
+    (await query<{ j: string }>(
+      `SELECT COALESCE(jsonb_agg(to_jsonb(t) ORDER BY to_jsonb(t)::text), '[]'::jsonb)::text AS j
+         FROM connections t WHERE account_id = $1`, [g3])).rows[0].j === g3ConnBefore);
+  check('G. Shopify is STILL reported as connected, never as skipped',
+    (await choices.getProviderStatuses(g3)).find((p) => p.provider === 'shopify')?.state
+      === 'connected');
+  check('G. the choices table was not touched by the skip refusal either',
+    (await query<{ j: string }>(
+      `SELECT COALESCE(jsonb_agg(to_jsonb(t) ORDER BY to_jsonb(t)::text), '[]'::jsonb)::text AS j
+         FROM onboarding_provider_choices t WHERE account_id = $1`, [g3])).rows[0].j
+      === g3ChoicesBefore);
+
+  // --- G. An UNCONNECTED requested provider may still be skipped ---------
+  const g4 = await makeAccount('5c1_requested_to_skipped');
+  await seedConnectedProvider(g4, 'klaviyo');
+  await choices.setShopifyRequested(g4, `5c1-req-${Date.now()}.myshopify.com`);
+  await choices.setSkipped(g4, 'recharge');
+  const g4Link = await mintAndExchange(app, agencyCookie, g4);
+  await agencyComplete(g4);
+  check('G. the requested-Shopify account is in manage mode',
+    ((await me(g4Link.cookie)).json() as Lifecycle).manageMode === true);
+  check('G. Shopify starts as requested and unconnected',
+    (await choices.getProviderStatuses(g4)).find((p) => p.provider === 'shopify')?.state
+      === 'requested');
+  const g4Skip = await app.inject({
+    method: 'POST', url: '/onboarding/connections/shopify/skip',
+    headers: { cookie: g4Link.cookie }, remoteAddress: nextIp(), payload: {},
+  });
+  check('G. an UNCONNECTED requested provider may become skipped in manage mode',
+    g4Skip.statusCode === 200, { status: g4Skip.statusCode, body: g4Skip.json() });
+  check('G. and its state really is skipped now',
+    (await choices.getProviderStatuses(g4)).find((p) => p.provider === 'shopify')?.state
+      === 'skipped');
+  check('G. no connections row was invented for the skipped provider',
+    Number((await query<{ n: string }>(
+      `SELECT count(*) n FROM connections WHERE account_id = $1 AND provider = 'shopify'`,
+      [g4])).rows[0].n) === 0);
+
+  // =======================================================================
+  // H. Currency and financial regression, through the manage-mode surface
+  // =======================================================================
+  const h1 = await completableAccount('5c1_financial');
+  const hLink = await mintAndExchange(app, agencyCookie, h1);
+  await agencyComplete(h1);
+  check('H. the financial fixture account is in manage mode',
+    ((await me(hLink.cookie)).json() as Lifecycle).manageMode === true);
+
+  const hCurrency = await app.inject({
+    method: 'PUT', url: '/onboarding/currency', headers: { cookie: hLink.cookie },
+    remoteAddress: nextIp(), payload: { currency: 'eur' },
+  });
+  check('H. manual-authority currency is still client-editable in manage mode',
+    hCurrency.statusCode === 200, hCurrency.json());
+  check('H. it was normalized and stored with manual authority',
+    (await currency.getCurrencyState(h1))?.currency === 'EUR'
+    && (await currency.getCurrencyState(h1))?.currency_source === 'manual');
+
+  const hCogs = await app.inject({
+    method: 'PUT', url: '/onboarding/cogs', headers: { cookie: hLink.cookie },
+    remoteAddress: nextIp(), payload: { method: 'blended', blendedMarginPct: 55 },
+  });
+  const hOcas = await app.inject({
+    method: 'PUT', url: '/onboarding/ocas', headers: { cookie: hLink.cookie },
+    remoteAddress: nextIp(), payload: { ocasMonthly: 4200 },
+  });
+  const hSpend = await app.inject({
+    method: 'PUT', url: '/onboarding/ad-spend', headers: { cookie: hLink.cookie },
+    remoteAddress: nextIp(),
+    payload: {
+      rows: [{
+        channel: 'Meta', amount: 500,
+        startMonth: monthsAgo(1).slice(0, 7), endMonth: monthsAgo(1).slice(0, 7),
+      }],
+    },
+  });
+  // An unconfirmed zero must still be refused in manage mode — §5.4.7 keeps
+  // "zero ad spend requires explicit confirmation", and manage mode grants the
+  // ACTION, never a relaxation of the rule inside it.
+  const hZeroUnconfirmed = await app.inject({
+    method: 'POST', url: '/onboarding/ad-spend/zero', headers: { cookie: hLink.cookie },
+    remoteAddress: nextIp(), payload: { months: [monthsAgo(2).slice(0, 7)] },
+  });
+  check('H. an UNCONFIRMED zero-spend declaration is still refused in manage mode',
+    hZeroUnconfirmed.statusCode === 400
+    && (hZeroUnconfirmed.json() as { error: string }).error === 'zero_unconfirmed',
+    hZeroUnconfirmed.json());
+  const hZero = await app.inject({
+    method: 'POST', url: '/onboarding/ad-spend/zero', headers: { cookie: hLink.cookie },
+    remoteAddress: nextIp(),
+    payload: { months: [monthsAgo(2).slice(0, 7)], confirmedZero: true },
+  });
+  check('H. COGS remains writable in manage mode', hCogs.statusCode === 200, hCogs.json());
+  check('H. OCAS remains writable in manage mode', hOcas.statusCode === 200, hOcas.json());
+  check('H. positive ad spend remains writable in manage mode',
+    hSpend.statusCode === 200, hSpend.json());
+  check('H. a zero-spend declaration remains available in manage mode',
+    hZero.statusCode === 200, hZero.json());
+  check('H. the stored financial values are exactly what was submitted',
+    Number((await costs.getAccountCosts(h1)).blended_margin_pct) === 55
+    && Number((await costs.getAccountCosts(h1)).ocas_monthly) === 4200);
+  check('H. positive spend and a zero declaration stayed mutually exclusive by month',
+    (await adspend.listAdSpend(h1)).every((r) => String(r.month).slice(0, 7) !== monthsAgo(2).slice(0, 7)),
+    (await adspend.listAdSpend(h1)).map((r) => String(r.month)));
+
+  // Shopify-authoritative currency is NOT client-overridable, in manage mode
+  // or out of it — mismatch resolution is agency-only (§5.4.7).
+  const h2 = await makeAccount('5c1_shopify_currency');
+  await seedConnectedProvider(h2, 'shopify', `5c1-cur-${Date.now()}.myshopify.com`);
+  await choices.setSkipped(h2, 'klaviyo');
+  await choices.setSkipped(h2, 'recharge');
+  await currency.applyShopifyCurrency(h2, 'USD');
+  const h2Link = await mintAndExchange(app, agencyCookie, h2);
+  await agencyComplete(h2);
+  const h2Before = await currency.getCurrencyState(h2);
+  const h2Override = await app.inject({
+    method: 'PUT', url: '/onboarding/currency', headers: { cookie: h2Link.cookie },
+    remoteAddress: nextIp(), payload: { currency: 'CAD' },
+  });
+  check('H. a client cannot overwrite a Shopify-authoritative currency',
+    h2Override.statusCode === 400
+    && (h2Override.json() as { error: string }).error === 'shopify_authoritative',
+    { status: h2Override.statusCode, body: h2Override.json() });
+  const h2After = await currency.getCurrencyState(h2);
+  check('H. both the stored currency and its authority are unchanged',
+    h2After?.currency === h2Before?.currency
+    && h2After?.currency_source === h2Before?.currency_source, { h2Before, h2After });
+  check('H. no automatic conversion happened — the value is still USD',
+    h2After?.currency === 'USD' && h2After?.shopify_currency_detected === 'USD', h2After);
+
+  // An account identifier from a client is still refused before anything else.
+  const hProbe = await app.inject({
+    method: 'PUT', url: '/onboarding/ocas', headers: { cookie: hLink.cookie },
+    remoteAddress: nextIp(), payload: { accountId: h2, ocasMonthly: 1 },
+  });
+  check('H. an account identifier in a manage-mode write is rejected with 400',
+    hProbe.statusCode === 400
+    && (hProbe.json() as { error: string }).error === 'account_identifier_not_permitted',
+    hProbe.json());
+  check('H. the named foreign account was not written to',
+    (await costs.getAccountCosts(h2))?.ocas_monthly == null,
+    (await costs.getAccountCosts(h2))?.ocas_monthly);
+  check('H. and the session\'s own OCAS was not changed by the rejected write',
+    Number((await costs.getAccountCosts(h1)).ocas_monthly) === 4200);
+
+  // =======================================================================
+  // I. Security regression on the manage-mode surface
+  // =======================================================================
+  const i1 = await completableAccount('5c1_revoked_manage');
+  const iLink = await mintAndExchange(app, agencyCookie, i1);
+  await agencyComplete(i1);
+  check('I. the link works while active, in manage mode',
+    (await me(iLink.cookie)).statusCode === 200);
+  await app.inject({
+    method: 'DELETE', url: `/accounts/${i1}/onboarding-links/${iLink.linkId}`,
+    headers: { cookie: agencyCookie }, remoteAddress: nextIp(),
+  });
+  const iRevoked = await me(iLink.cookie);
+  check('I. revocation ends a manage-mode session on the very next request',
+    iRevoked.statusCode === 401, iRevoked.statusCode);
+  check('I. the revoked session returns the neutral client failure',
+    JSON.stringify(iRevoked.json()) === JSON.stringify({
+      error: 'invalid_link',
+      message: 'This setup link is not valid. Ask your account manager for a new one.',
+    }), iRevoked.json());
+  check('I. re-exchanging a revoked token is refused just as neutrally',
+    (await exchange(iLink.token)).statusCode === 401);
+
+  const i2 = await completableAccount('5c1_expired_manage');
+  const i2Link = await mintAndExchange(app, agencyCookie, i2);
+  await agencyComplete(i2);
+  await query(`UPDATE onboarding_links SET expires_at = now() - interval '1 second' WHERE id = $1`,
+    [i2Link.linkId]);
+  check('I. expiry ends a manage-mode session on the very next request',
+    (await me(i2Link.cookie)).statusCode === 401);
+  check('I. and the expired token can no longer be exchanged',
+    (await exchange(i2Link.token)).statusCode === 401);
+
+  // Cookie lifetime capped by the link's own expiry.
+  const i3 = await completableAccount('5c1_cookie_cap');
+  const i3Mint = await app.inject({
+    method: 'POST', url: `/accounts/${i3}/onboarding-links`,
+    headers: { cookie: agencyCookie }, remoteAddress: nextIp(), payload: {},
+  });
+  const i3Body = i3Mint.json() as { id: number; token: string };
+  await query(`UPDATE onboarding_links SET expires_at = now() + interval '90 seconds' WHERE id = $1`,
+    [i3Body.id]);
+  const i3Exchange = await exchange(i3Body.token);
+  const i3Directive = cookieDirective(i3Exchange, 'tention_onb') ?? '';
+  const i3MaxAge = Number(/Max-Age=(\d+)/i.exec(i3Directive)?.[1] ?? -1);
+  check('I. the onboarding cookie carries a Max-Age', i3MaxAge > 0, i3Directive);
+  check('I. cookie lifetime is capped by the remaining life of its link',
+    i3MaxAge <= 90, { maxAge: i3MaxAge });
+
+  // Client and agency principals stay disjoint on the manage-mode surface too.
+  const i4 = await completableAccount('5c1_separation');
+  const i4Link = await mintAndExchange(app, agencyCookie, i4);
+  await agencyComplete(i4);
+  check('I. a manage-mode client cookie cannot reach an agency route',
+    (await app.inject({
+      method: 'GET', url: '/accounts', headers: { cookie: i4Link.cookie }, remoteAddress: nextIp(),
+    })).statusCode === 401);
+  check('I. a manage-mode client cookie cannot list or revoke onboarding links',
+    (await app.inject({
+      method: 'POST', url: `/accounts/${i4}/onboarding-links`,
+      headers: { cookie: i4Link.cookie }, remoteAddress: nextIp(), payload: {},
+    })).statusCode === 401);
+  check('I. an agency cookie still cannot reach the client onboarding surface',
+    (await app.inject({
+      method: 'GET', url: '/onboarding/me', headers: { cookie: agencyCookie },
+      remoteAddress: nextIp(),
+    })).statusCode === 401);
+
+  // Tenant isolation, with BOTH accounts complete so manage mode is engaged.
+  const i5 = await completableAccount('5c1_tenant_a');
+  const i6 = await completableAccount('5c1_tenant_b');
+  const i5Link = await mintAndExchange(app, agencyCookie, i5);
+  await agencyComplete(i5);
+  await agencyComplete(i6);
+  await costs.setOcas(i6, 777, false);
+  const i5Me = await me(i5Link.cookie);
+  check('I. a manage-mode session reads only its own workspace',
+    (i5Me.json() as { workspaceName: string }).workspaceName
+      === (await query<{ name: string }>(
+        `SELECT name FROM accounts WHERE id = $1`, [i5])).rows[0].name);
+  check('I. it cannot name another account in a write',
+    (await app.inject({
+      method: 'PUT', url: '/onboarding/ocas', headers: { cookie: i5Link.cookie },
+      remoteAddress: nextIp(), payload: { account_id: i6, ocasMonthly: 5 },
+    })).statusCode === 400);
+  check('I. the other account\'s OCAS is untouched',
+    Number((await costs.getAccountCosts(i6)).ocas_monthly) === 777);
+  checkLifecycleHygiene('I me', i5Me.body);
+  check('I. no .env credential leaked while this group ran',
+    envCredentialLeaked() === null, envCredentialLeaked());
+}
+
+// ===========================================================================
 // Main
 // ===========================================================================
 
@@ -3367,6 +4241,7 @@ async function main(): Promise<void> {
     await groupI(app, agencyCookie);
     await groupJ(app, agencyCookie);
     await groupK(app, agencyCookie);
+    await groupL(app, agencyCookie);
   } finally {
     console.log('\nCleanup');
     await cleanupAccounts();
@@ -3439,7 +4314,7 @@ async function main(): Promise<void> {
     D: 'Session isolation', E: 'Cross-tenant', F: 'Credential fallback',
     G: 'Link states + rate limit', H: 'Later connection',
     I: 'Fastify 5 regressions', J: 'Agency API hardening',
-    K: 'Agency completion (5B-2G)',
+    K: 'Agency completion (5B-2G)', L: 'Manage mode (5C-1)',
   };
   for (const [letter, t] of Object.entries(groupTotals)) {
     const mark = t.fail === 0 ? '✓' : '✗';
