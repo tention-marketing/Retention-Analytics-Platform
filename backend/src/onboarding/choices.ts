@@ -22,7 +22,7 @@ export function isProvider(v: unknown): v is Provider {
  */
 export type ProviderState =
   | 'connected'
-  | 'requested'   // shopify only: client confirmed a domain, agency setup pending
+  | 'requested'   // answered: agency setup pending (shopify carries a domain, the others do not)
   | 'skipped'
   | 'undecided';  // no connection and no (or 'pending') choice row
 
@@ -88,6 +88,62 @@ export async function setSkipped(accountId: number, provider: Provider): Promise
      VALUES ($1, $2, 'skipped', NULL)
      ON CONFLICT (account_id, provider)
      DO UPDATE SET choice = 'skipped', requested_domain = NULL, updated_at = now()`,
+    [accountId, provider],
+  );
+}
+
+/**
+ * The providers a client may request agency setup for WITHOUT a domain (5C-2).
+ *
+ * Klaviyo and Recharge are the only two, and Shopify is excluded because its
+ * request carries a client-confirmed *.myshopify.com domain and is protected by
+ * a unique index on that domain — it uses the domain-bearing Shopify route, and
+ * the domain-less path below would silently drop the one field that makes it
+ * meaningful.
+ *
+ * THIS CONSTANT IS THE SINGLE SOURCE OF TRUTH, and the type is derived FROM it
+ * rather than beside it. Written as `Exclude<Provider, 'shopify'>` the two could
+ * drift: a fourth provider added to PROVIDERS would silently widen the type
+ * while the runtime allowlist stayed at two, and the compiler would stop
+ * flagging a call the guard still rejects. Deriving the type means a future
+ * Provider value is NOT automatically requestable — adding one requires an
+ * explicit edit here, which is the decision that deserves to be explicit.
+ */
+export const REQUESTABLE_PROVIDERS = ['klaviyo', 'recharge'] as const;
+export type RequestableProvider = (typeof REQUESTABLE_PROVIDERS)[number];
+
+export function isRequestableProvider(v: unknown): v is RequestableProvider {
+  return typeof v === 'string' && (REQUESTABLE_PROVIDERS as readonly string[]).includes(v);
+}
+
+/**
+ * Record an agency-assist request for Klaviyo or Recharge (5C-2).
+ *
+ * ONE implementation for both, parameterised by provider — the two differ in no
+ * respect, and a per-provider copy would be two places for the same rule to
+ * drift. It mirrors setSkipped exactly, because a request and a skip are the
+ * same kind of fact: an ANSWER recorded in onboarding_provider_choices, with no
+ * connections row, no credential, no queue job and no provider call. That is
+ * what keeps `requested` from ever being counted as a connection (§5.4.5) while
+ * still satisfying the "answered" half of Gate 1.
+ *
+ * `requested_domain` is written as NULL explicitly, not merely left alone. A
+ * stale domain surviving a skipped → requested transition would be a value no
+ * client had confirmed, and for these two providers there is no such thing as a
+ * domain to confirm. Writing NULL also keeps these rows outside the partial
+ * unique index on requested_domain, which is scoped to Shopify.
+ *
+ * Idempotent: re-requesting refreshes updated_at and nothing else.
+ */
+export async function setRequested(
+  accountId: number,
+  provider: RequestableProvider,
+): Promise<void> {
+  await query(
+    `INSERT INTO onboarding_provider_choices (account_id, provider, choice, requested_domain)
+     VALUES ($1, $2, 'requested', NULL)
+     ON CONFLICT (account_id, provider)
+     DO UPDATE SET choice = 'requested', requested_domain = NULL, updated_at = now()`,
     [accountId, provider],
   );
 }

@@ -29,6 +29,7 @@ export const CLIENT_ONBOARDING_ACTIONS = [
   'connections.klaviyo.connect',
   'connections.recharge.connect',
   'connections.shopify.request',
+  'connections.choice.request',
   'connections.choice.skip',
   'currency.update',
   'cogs.update',
@@ -91,6 +92,11 @@ const MANAGE_MODE_ALLOWLIST: ReadonlySet<string> = new Set<ClientOnboardingActio
   'connections.klaviyo.connect',
   'connections.recharge.connect',
   'connections.shopify.request',
+  // §5.4.4 allows changing `requested` → `skipped` and `skipped` → `requested`
+  // for an UNCONNECTED provider. The connected-provider restriction on both is a
+  // resource-state rule enforced at the route, not a category denial here —
+  // see the division of labour described above.
+  'connections.choice.request',
   'connections.choice.skip',
   'currency.update',
   'cogs.update',

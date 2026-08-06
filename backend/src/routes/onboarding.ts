@@ -7,8 +7,8 @@ import {
 import { resolveToken, linkLiveness, markFirstUsed, markLinkCompleted } from '../onboarding/links.js';
 import { connectKlaviyo, connectRecharge } from '../onboarding/connect.js';
 import {
-  getProviderStatuses, isProvider, setSkipped, setShopifyRequested, isConnected,
-  type Provider,
+  getProviderStatuses, isProvider, isRequestableProvider, setSkipped, setRequested,
+  setShopifyRequested, isConnected, type Provider,
 } from '../onboarding/choices.js';
 import { normalizeShopDomain, findDomainConflict, domainConflictMessage } from '../onboarding/domain.js';
 import {
@@ -84,42 +84,80 @@ const PROVIDER_LABELS: Record<Provider, string> = {
   recharge: 'Recharge',
 };
 
+interface ConnectedRefusal {
+  code: 'provider_already_connected';
+  message: string;
+}
+
 /**
- * THE manage-mode connected-provider refusal, shared by every route that would
- * otherwise change a provider that is already connected (§5.4.4: in manage mode a
- * connected provider may not be re-connected, marked requested, or marked
- * skipped).
+ * THE connectedness test and THE refusal it produces — one query, one message,
+ * one shape, for every route that would otherwise touch a connected provider.
  *
- * ONE query, ONE message, three call sites — not because repetition is ugly, but
- * because the manage-mode test and the connectedness test have to stay bound
- * together. Either one alone is a different, wrong rule: connectedness alone
- * would break first-time credential rotation, and manage mode alone would freeze
- * providers the client is still allowed to connect.
- *
- * Returns null when the action is permitted, so callers read as a guard clause:
- *   - before Gate 1 — always null. Reconnecting to rotate a credential is
- *     unchanged first-time setup behaviour and is NOT touched here.
- *   - in manage mode — null unless the provider is genuinely connected. An
- *     unconnected `requested` or `skipped` provider stays fully editable.
- *
- * Call this BEFORE reading the request body, so a refusal never depends on — or
- * acknowledges — a submitted credential, and never runs verification against a
- * provider API. The response carries a stable code and a fixed sentence: no
- * account id, no link id, no credential, no connection row, no allowlist detail.
+ * Both guards below delegate here rather than issuing their own `isConnected`
+ * call, so there is exactly one definition of "is this provider connected" and
+ * exactly one sentence a client can be told about it. What differs between the
+ * two guards is only WHEN the question is asked — which is the part that
+ * actually differs in the contract.
  */
-async function refuseIfAlreadyConnected(
-  req: FastifyRequest,
+async function connectedRefusal(
+  accountId: number,
   provider: Provider,
-): Promise<{ code: 'provider_already_connected'; message: string } | null> {
-  const session = principal(req);
-  if (!session.manageMode) return null;
-  if (!(await isConnected(session.accountId, provider))) return null;
+): Promise<ConnectedRefusal | null> {
+  if (!(await isConnected(accountId, provider))) return null;
   return {
     code: 'provider_already_connected',
     message:
       `${PROVIDER_LABELS[provider]} is already connected. ` +
       'Ask your account manager to change it.',
   };
+}
+
+/**
+ * CREDENTIAL guard, for the connect routes. Manage-mode-only, deliberately.
+ *
+ * §5.4.4 denies re-connecting an already connected provider once the account has
+ * passed Gate 1, but pre-completion credential rotation is a supported part of
+ * first-time setup — a client who pastes the wrong key must be able to paste the
+ * right one. So this returns null outright before Gate 1 and only consults
+ * connectedness in manage mode.
+ *
+ * Call it BEFORE reading the request body, so a refusal never depends on — or
+ * acknowledges — a submitted credential, and never runs verification against a
+ * provider API.
+ */
+async function refuseIfAlreadyConnected(
+  req: FastifyRequest,
+  provider: Provider,
+): Promise<ConnectedRefusal | null> {
+  const session = principal(req);
+  if (!session.manageMode) return null;
+  return connectedRefusal(session.accountId, provider);
+}
+
+/**
+ * CHOICE-STATE guard, for the request and skip routes. Unconditional on mode.
+ *
+ * §5.4.5: "A **connected** provider cannot be moved back to `requested` or
+ * `skipped` without an explicit disconnect feature." That rule has no
+ * completion qualifier and must not acquire one — a connected provider recorded
+ * as skipped would be a stored answer contradicting a live connection, and the
+ * only honest way out of connected is a disconnect, which stays outside Phase
+ * 5C entirely.
+ *
+ * This is why it is a SEPARATE guard rather than a mode argument on the one
+ * above: the credential rule is about when re-entry is allowed, and this one is
+ * about a transition that is never allowed. Collapsing them would mean either
+ * blocking pre-completion rotation or permitting a connected provider to be
+ * skipped during setup.
+ *
+ * Unconnected providers are untouched by this, so `requested` ↔ `skipped` and
+ * `undecided` → either both remain fully available.
+ */
+async function refuseChoiceChangeIfConnected(
+  req: FastifyRequest,
+  provider: Provider,
+): Promise<ConnectedRefusal | null> {
+  return connectedRefusal(principal(req).accountId, provider);
 }
 
 export async function onboardingRoutes(app: FastifyInstance): Promise<void> {
@@ -372,6 +410,68 @@ export async function onboardingRoutes(app: FastifyInstance): Promise<void> {
       },
     );
 
+    /**
+     * 5C-2: agency-assist request for Klaviyo or Recharge.
+     *
+     * ONE parameterised route, not one per provider — the two behave
+     * identically, and a second copy would be a second place for the
+     * connected-provider guard to be forgotten.
+     *
+     * SHOPIFY CANNOT REACH THIS HANDLER. The static
+     * `/onboarding/connections/shopify/request` route above wins the match
+     * (find-my-way prefers a static segment over a parametric one), so a Shopify
+     * request goes to the domain-bearing route. isRequestableProvider still
+     * excludes it here as defence in depth, should that path ever be removed.
+     *
+     * THE BODY IS REJECTED, NOT IGNORED. This route's entire input is its path
+     * parameter: it takes no domain, no credential and no options (§5.4.6).
+     * Silently ignoring a submitted body would let a client send
+     * `{ apiKey: … }`, receive 200, and reasonably believe a credential had been
+     * accepted — a success response that means something other than what was
+     * sent. Refusing outright makes the contract legible from one request.
+     */
+    scoped.post(
+      '/onboarding/connections/:provider/request',
+      { config: { clientAction: 'connections.choice.request' } },
+      async (req, reply) => {
+        const accountId = acct(req);
+
+        // FIRST, before the parameter is validated, before the connectedness
+        // lookup and before any write.
+        //
+        // `!== undefined` rather than a truthiness test: a JSON body of `false`,
+        // `0`, `""` or `null` is still a submitted body, and each of those is
+        // falsy. Fastify leaves req.body undefined only when no body was sent.
+        //
+        // The response is a fixed constant. It names no field, echoes no value,
+        // and does not say whether what arrived looked like a credential — a
+        // refusal that reported "apiKey is not permitted here" would confirm the
+        // field name back to whoever probed with it, and one that quoted the
+        // value would put a credential in a response body.
+        if (req.body !== undefined) {
+          return reply.code(400).send({ error: 'request_body_not_permitted' });
+        }
+
+        const provider = (req.params as { provider?: string }).provider;
+        if (!isRequestableProvider(provider)) {
+          return reply.code(400).send({ error: 'bad_provider' });
+        }
+        const refusal = await refuseChoiceChangeIfConnected(req, provider);
+        if (refusal) return reply.code(409).send(refusal);
+
+        // Records an ANSWER in onboarding_provider_choices only: no connections
+        // row, no credential, no queue job, no provider call (§5.4.5). The
+        // provider therefore satisfies the "answered" half of Gate 1 while still
+        // not counting as a genuine connection.
+        await setRequested(accountId, provider);
+        return reply.send({
+          provider, state: 'requested',
+          message: 'Thanks — your account manager will finish connecting this platform.',
+          providers: await getProviderStatuses(accountId),
+        });
+      },
+    );
+
     scoped.post(
       '/onboarding/connections/:provider/skip',
       { config: { clientAction: 'connections.choice.skip' } },
@@ -381,13 +481,12 @@ export async function onboardingRoutes(app: FastifyInstance): Promise<void> {
         if (!isProvider(provider)) {
           return reply.code(400).send({ error: 'bad_provider' });
         }
-        // §5.4.4: marking a CONNECTED provider skipped is denied in manage mode.
-        // The refusal returns before setSkipped, so the connections row is never
-        // read for writing, never altered and never deleted — the provider stays
-        // connected, and disconnect remains an agency operation outside Phase 5C.
-        // An unconnected `requested` provider is untouched by this and may still
-        // become `skipped`.
-        const refusal = await refuseIfAlreadyConnected(req, provider);
+        // §5.4.5: a CONNECTED provider can never be marked skipped — before or
+        // after completion. The refusal returns before setSkipped, so the
+        // connections row is never read for writing, never altered and never
+        // deleted; disconnect stays outside Phase 5C. An unconnected `requested`
+        // provider is untouched by this and may still become `skipped`.
+        const refusal = await refuseChoiceChangeIfConnected(req, provider);
         if (refusal) return reply.code(409).send(refusal);
 
         // A skip records intent in onboarding_provider_choices ONLY — no

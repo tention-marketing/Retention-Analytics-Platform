@@ -3679,6 +3679,11 @@ async function groupL(app: App, agencyCookie: string): Promise<void> {
     'POST /onboarding/connections/klaviyo': 'connections.klaviyo.connect',
     'POST /onboarding/connections/recharge': 'connections.recharge.connect',
     'POST /onboarding/connections/shopify/request': 'connections.shopify.request',
+    // Added by Phase 5C-2. The route count below moves 16 → 17 for the same
+    // reason: one new authenticated route exists, so the contract this group
+    // pins is one entry larger. Nothing here was relaxed — the map is checked
+    // entry by entry, so a wider map is a stricter assertion.
+    'POST /onboarding/connections/:provider/request': 'connections.choice.request',
     'POST /onboarding/connections/:provider/skip': 'connections.choice.skip',
     'PUT /onboarding/currency': 'currency.update',
     'GET /onboarding/skus': 'costs.read',
@@ -3713,8 +3718,8 @@ async function groupL(app: App, agencyCookie: string): Promise<void> {
   const headTwins = [...declared.entries()].filter(([k]) => k.startsWith('HEAD '));
   const authenticated = [...declared.entries()]
     .filter(([k]) => !k.startsWith('HEAD ') && k !== 'POST /onboarding/session');
-  check('F. there are exactly 16 authenticated scoped onboarding routes',
-    authenticated.length === 16, authenticated.map(([k]) => k));
+  check('F. there are exactly 17 authenticated scoped onboarding routes',
+    authenticated.length === 17, authenticated.map(([k]) => k));
   check('F. every auto-generated HEAD twin inherits its GET route\'s clientAction',
     headTwins.length > 0
     && headTwins.every(([k, v]) => v === declared.get(k.replace(/^HEAD /, 'GET '))),
@@ -4192,6 +4197,853 @@ async function groupL(app: App, agencyCookie: string): Promise<void> {
 }
 
 // ===========================================================================
+// M. Phase 5C-2 provider request and choice transitions
+// ===========================================================================
+//
+// §5.4.5 adds client-scoped agency-assist REQUESTS for Klaviyo and Recharge, and
+// the whole point of the state is that it is an ANSWER and not a connection:
+// requesting satisfies the "answered" half of Gate 1 while leaving completion
+// blocked until something is genuinely connected. So the load-bearing proofs
+// here are negative ones — a request writes no connections row, contacts no
+// provider, enqueues no job, and never reports connected.
+//
+// The route is also strictly bodyless. It takes a path parameter and nothing
+// else, and a supplied body is REFUSED rather than ignored: a client that sent
+// `{ apiKey: … }` and got a 200 would reasonably conclude a credential had been
+// accepted.
+
+/** One account's rows in one table, as deterministic text. */
+async function tableSnapshot(table: string, accountId: number): Promise<string> {
+  const { rows } = await query<{ j: string }>(
+    `SELECT COALESCE(jsonb_agg(to_jsonb(t) ORDER BY to_jsonb(t)::text), '[]'::jsonb)::text AS j
+       FROM ${table} t WHERE account_id = $1`,
+    [accountId],
+  );
+  return rows[0].j;
+}
+
+/**
+ * Every body shape the route must refuse.
+ *
+ * Sent as raw JSON text with an explicit Content-Type rather than through
+ * inject's payload serialisation, so `0`, `false`, `""` and `null` arrive as
+ * those exact JSON values. They are the cases a truthiness check would wave
+ * through, which is precisely why they are here.
+ */
+const BODY_CASES: [string, string][] = [
+  ['{}', '{}'],
+  ['null', 'null'],
+  ['[]', '[]'],
+  ['[1, 2]', '[1,2]'],
+  ['0', '0'],
+  ['5', '5'],
+  ['false', 'false'],
+  ['true', 'true'],
+  ['""', '""'],
+  ['"text"', '"text"'],
+  ['{ unknown }', '{"unknown":"value"}'],
+  ['{ shopDomain }', '{"shopDomain":"synthetic.myshopify.com"}'],
+  ['{ clientId }', '{"clientId":"synthetic-client-id"}'],
+  ['{ clientSecret }', '{"clientSecret":"synthetic-secret"}'],
+  ['{ apiKey }', '{"apiKey":"synthetic-key"}'],
+  ['{ token }', '{"token":"synthetic-token"}'],
+  ['{ several credential-shaped fields }',
+    '{"apiKey":"synthetic-key","token":"synthetic-token","clientId":"synthetic-client-id",'
+    + '"clientSecret":"synthetic-secret","shopDomain":"synthetic.myshopify.com"}'],
+];
+
+/** Field names and values from BODY_CASES that a refusal must never echo. */
+const REFLECTION_NEEDLES = [
+  'shopDomain', 'clientId', 'clientSecret', 'apiKey', 'token', 'unknown',
+  'synthetic-key', 'synthetic-token', 'synthetic-secret', 'synthetic-client-id',
+  'synthetic.myshopify.com', 'value', 'text',
+] as const;
+
+const BODY_REFUSAL = '{"error":"request_body_not_permitted"}';
+
+/**
+ * Identifier fields a 5C-2 response must never carry, matched as JSON KEYS.
+ *
+ * Deliberately not a substring test. The account-identifier refusal's stable
+ * error CODE is `account_identifier_not_permitted`, which contains the letters
+ * "account_id" while carrying no account id at all — a substring test flags that
+ * as a leak and is simply wrong. What must be absent is the field: a quoted key
+ * followed by a colon, which is the only way a value could actually be attached.
+ */
+const M_FORBIDDEN_KEYS = [
+  /"account_?[Ii]d"\s*:/, /"account"\s*:/, /"link_?[Ii]d"\s*:/,
+  /"connection_?[Ii]d"\s*:/, /"id"\s*:/,
+] as const;
+
+/** Values and field names that can never legitimately appear at all. */
+const M_FORBIDDEN_TEXT = [
+  'credentials', 'credentials_encrypted', 'apiKey', 'api_key', 'clientSecret',
+  'client_secret', 'clientId', 'client_id', 'accessToken', 'access_token',
+  'token_hash', 'password', 'jobId', 'jobState', 'failedReason',
+  'recentErrors', 'backfill:', 'stack', 'node_modules', 'node:internal',
+  '/Users/', 'SELECT ', 'INSERT ', 'UPDATE ', 'DELETE ', 'pg_', 'ECONNREFUSED',
+  'verify5a-not-a-credential',
+] as const;
+
+function checkMHygiene(label: string, raw: string): void {
+  for (const re of M_FORBIDDEN_KEYS) {
+    check(`${label}: carries no ${re.source} key`, !re.test(raw), raw.slice(0, 240));
+  }
+  for (const needle of M_FORBIDDEN_TEXT) {
+    check(`${label}: carries no "${needle}"`, !raw.includes(needle));
+  }
+  check(`${label}: carries no embedded stack frame`, !/\\n\s*at /.test(raw));
+}
+
+async function groupM(app: App, agencyCookie: string): Promise<void> {
+  group('M', 'Phase 5C-2 provider request and choice transitions');
+
+  const collected: [string, string][] = [];
+  const record = (label: string, res: { body: string }) => {
+    collected.push([label, res.body]);
+    return res;
+  };
+
+  const requestUrl = (p: string) => `/onboarding/connections/${p}/request`;
+  const skipUrl = (p: string) => `/onboarding/connections/${p}/skip`;
+
+  /** The bodyless call the route is designed for: no payload, no Content-Type. */
+  const requestBodyless = async (cookie: string, provider: string) => app.inject({
+    method: 'POST', url: requestUrl(provider), headers: { cookie }, remoteAddress: nextIp(),
+  });
+  const skipCall = async (cookie: string, provider: string) => app.inject({
+    method: 'POST', url: skipUrl(provider), headers: { cookie }, remoteAddress: nextIp(),
+    payload: {},
+  });
+  const choiceRow = async (accountId: number, provider: string) => (await query<{
+    choice: string; requested_domain: string | null; n: string;
+  }>(
+    `SELECT choice, requested_domain, count(*) OVER () AS n
+       FROM onboarding_provider_choices WHERE account_id = $1 AND provider = $2`,
+    [accountId, provider],
+  )).rows[0] ?? null;
+  const choiceRowCount = async (accountId: number, provider: string) => Number((await query<{ n: string }>(
+    `SELECT count(*) n FROM onboarding_provider_choices WHERE account_id = $1 AND provider = $2`,
+    [accountId, provider],
+  )).rows[0].n);
+  const connRowCount = async (accountId: number, provider: string) => Number((await query<{ n: string }>(
+    `SELECT count(*) n FROM connections WHERE account_id = $1 AND provider = $2`,
+    [accountId, provider],
+  )).rows[0].n);
+  const stateOf = async (accountId: number, provider: string) =>
+    (await choices.getProviderStatuses(accountId)).find((p) => p.provider === provider)?.state;
+
+  interface RequestBody {
+    provider: string; state: string; message: string;
+    providers: { provider: string; state: string }[];
+  }
+
+  /** Assert a successful request response and its persisted shape. */
+  async function checkRequestSucceeded(
+    label: string, res: { statusCode: number; body: string }, accountId: number, provider: string,
+  ): Promise<void> {
+    record(label, res);
+    check(`${label}: 200`, res.statusCode === 200, { status: res.statusCode, body: res.body });
+    const body = JSON.parse(res.body) as RequestBody;
+    check(`${label}: top-level provider is ${provider}`, body.provider === provider, body.provider);
+    check(`${label}: top-level state is requested`, body.state === 'requested', body.state);
+    check(`${label}: the provider array reports it requested`,
+      body.providers.find((p) => p.provider === provider)?.state === 'requested',
+      body.providers);
+    check(`${label}: it is NOT reported connected anywhere in the response`,
+      !body.providers.some((p) => p.provider === provider && p.state === 'connected')
+      && body.state !== 'connected', body);
+    check(`${label}: exactly one choice row exists`, (await choiceRowCount(accountId, provider)) === 1);
+    const row = await choiceRow(accountId, provider);
+    check(`${label}: choice='requested'`, row?.choice === 'requested', row?.choice);
+    check(`${label}: requested_domain IS NULL`, row?.requested_domain === null, row?.requested_domain);
+    check(`${label}: no connection row exists`, (await connRowCount(accountId, provider)) === 0);
+    check(`${label}: derived state is requested`, (await stateOf(accountId, provider)) === 'requested');
+  }
+
+  // =======================================================================
+  // A. Route and action contract
+  // =======================================================================
+  const routeApp = buildApp();
+  const declaredM = new Map<string, string | undefined>();
+  routeApp.addHook('onRoute', (r) => {
+    const methods = Array.isArray(r.method) ? r.method : [r.method];
+    for (const m of methods) {
+      if (!r.url.startsWith('/onboarding')) continue;
+      declaredM.set(`${m} ${r.url}`, (r.config as { clientAction?: string } | undefined)?.clientAction);
+    }
+  });
+  await routeApp.ready();
+  const authenticatedM = [...declaredM.entries()]
+    .filter(([k]) => !k.startsWith('HEAD ') && k !== 'POST /onboarding/session');
+  check('A. the real app has 17 authenticated scoped onboarding routes',
+    authenticatedM.length === 17, authenticatedM.map(([k]) => k));
+  check('A. all 17 declare a clientAction',
+    authenticatedM.every(([, v]) => typeof v === 'string' && v.length > 0),
+    authenticatedM.filter(([, v]) => !v).map(([k]) => k));
+  check('A. POST /onboarding/connections/:provider/request declares connections.choice.request',
+    declaredM.get('POST /onboarding/connections/:provider/request') === 'connections.choice.request',
+    declaredM.get('POST /onboarding/connections/:provider/request'));
+  check('A. the static Shopify request route is still separately registered',
+    declaredM.get('POST /onboarding/connections/shopify/request') === 'connections.shopify.request');
+  check('A. POST /onboarding/session is still public token exchange with no clientAction',
+    declaredM.has('POST /onboarding/session')
+    && declaredM.get('POST /onboarding/session') === undefined);
+  await routeApp.close();
+
+  check('A. connections.choice.request is in the centralized action vocabulary',
+    (manageMode.CLIENT_ONBOARDING_ACTIONS as readonly string[]).includes('connections.choice.request'));
+  check('A. connections.choice.request is in the centralized manage-mode allowlist',
+    manageMode.isAllowedInManageMode('connections.choice.request'));
+  // 17 routes, 16 DISTINCT actions: GET /onboarding/skus and GET
+  // /onboarding/costs deliberately share `costs.read`, because an action names a
+  // category of thing a session may do, not a URL. 5C-2 added one action to the
+  // 15 that existed before it.
+  check('A. the vocabulary holds 16 distinct actions for 17 routes',
+    manageMode.CLIENT_ONBOARDING_ACTIONS.length === 16,
+    manageMode.CLIENT_ONBOARDING_ACTIONS.length);
+  check('A. every declared route action is a member of that vocabulary',
+    authenticatedM.every(([, v]) =>
+      (manageMode.CLIENT_ONBOARDING_ACTIONS as readonly string[]).includes(v as string)),
+    authenticatedM.map(([, v]) => v));
+  check('A. costs.read is the only action serving more than one route',
+    authenticatedM.filter(([, v]) => v === 'costs.read').length === 2
+    && new Set(authenticatedM.map(([, v]) => v)).size === 16,
+    authenticatedM.map(([k, v]) => `${k}→${v}`));
+  check('A. an unknown action is still not allowlisted',
+    !manageMode.isAllowedInManageMode('connections.choice.invent'));
+
+  // =======================================================================
+  // B. Authentication and account scope
+  // =======================================================================
+  const b1 = await makeAccount('5c2_auth');
+  const bLink = await mintAndExchange(app, agencyCookie, b1);
+
+  const bAnon = await app.inject({
+    method: 'POST', url: requestUrl('klaviyo'), remoteAddress: nextIp(),
+  });
+  check('B. no cookie is refused with 401', bAnon.statusCode === 401, bAnon.statusCode);
+  const bAgency = await app.inject({
+    method: 'POST', url: requestUrl('klaviyo'), headers: { cookie: agencyCookie },
+    remoteAddress: nextIp(),
+  });
+  check('B. an agency cookie is refused with 401', bAgency.statusCode === 401, bAgency.statusCode);
+  check('B. neither refusal created a choice row',
+    (await choiceRowCount(b1, 'klaviyo')) === 0);
+  const bValid = await requestBodyless(bLink.cookie, 'klaviyo');
+  check('B. a valid onboarding-link cookie reaches the client route',
+    bValid.statusCode === 200, { status: bValid.statusCode, body: bValid.body });
+  record('B valid', bValid);
+
+  // Account identifiers: rejected by the hook, before the handler.
+  const b2 = await makeAccount('5c2_auth_other');
+  const bOtherBefore = await tableSnapshot('onboarding_provider_choices', b2);
+  for (const key of ['accountId', 'account_id', 'account']) {
+    const res = await app.inject({
+      method: 'POST', url: requestUrl('recharge'),
+      headers: { cookie: bLink.cookie, 'content-type': 'application/json' },
+      remoteAddress: nextIp(), payload: `{"${key}":${b2}}`,
+    });
+    record(`B body ${key}`, res);
+    check(`B. a body ${key} is rejected by rejectClientAccountId, not by the body guard`,
+      res.statusCode === 400
+      && (JSON.parse(res.body) as { error: string }).error === 'account_identifier_not_permitted',
+      { status: res.statusCode, body: res.body });
+    const q = await app.inject({
+      method: 'POST', url: `${requestUrl('recharge')}?${key}=${b2}`,
+      headers: { cookie: bLink.cookie }, remoteAddress: nextIp(),
+    });
+    record(`B query ${key}`, q);
+    check(`B. a query-string ${key} is rejected the same way`,
+      q.statusCode === 400
+      && (JSON.parse(q.body) as { error: string }).error === 'account_identifier_not_permitted',
+      { status: q.statusCode, body: q.body });
+  }
+  check('B. no account-identifier attempt wrote anything to the named account',
+    (await tableSnapshot('onboarding_provider_choices', b2)) === bOtherBefore
+    && (await tableSnapshot('connections', b2)) === '[]');
+  check('B. nor to the session\'s own account beyond its one real request',
+    (await choiceRowCount(b1, 'recharge')) === 0);
+  check('B. account identity came only from the principal — B\'s klaviyo row is on A',
+    (await choiceRowCount(b1, 'klaviyo')) === 1 && (await choiceRowCount(b2, 'klaviyo')) === 0);
+
+  // =======================================================================
+  // C. Strictly bodyless contract
+  // =======================================================================
+  for (const provider of ['klaviyo', 'recharge'] as const) {
+    const c = await makeAccount(`5c2_body_${provider}`);
+    const cLink = await mintAndExchange(app, agencyCookie, c);
+
+    // The bodyless call proceeds.
+    const ok = await requestBodyless(cLink.cookie, provider);
+    check(`C. ${provider}: no body and no Content-Type proceeds`, ok.statusCode === 200,
+      { status: ok.statusCode, body: ok.body });
+    record(`C ${provider} bodyless`, ok);
+
+    // Reset to a known state, then prove the whole matrix mutates nothing.
+    const choicesBefore = await tableSnapshot('onboarding_provider_choices', c);
+    const connsBefore = await tableSnapshot('connections', c);
+    const dbsizeBefore = await redis.dbsize();
+    fetchLog = [];
+    const rejections: string[] = [];
+
+    for (const [label, raw] of BODY_CASES) {
+      const res = await app.inject({
+        method: 'POST', url: requestUrl(provider),
+        headers: { cookie: cLink.cookie, 'content-type': 'application/json' },
+        remoteAddress: nextIp(), payload: raw,
+      });
+      rejections.push(`${res.statusCode}|${res.body}`);
+      check(`C. ${provider} body ${label}: 400 request_body_not_permitted`,
+        res.statusCode === 400 && res.body === BODY_REFUSAL,
+        { status: res.statusCode, body: res.body });
+    }
+    check(`C. ${provider}: every body rejection is BYTE-IDENTICAL`,
+      new Set(rejections).size === 1, [...new Set(rejections)]);
+    check(`C. ${provider}: no rejection reflects a submitted field name or value`,
+      rejections.every((r) => !REFLECTION_NEEDLES.some((n) => r.includes(n))),
+      rejections.filter((r) => REFLECTION_NEEDLES.some((n) => r.includes(n))));
+    check(`C. ${provider}: no provider-choice row was created or modified`,
+      (await tableSnapshot('onboarding_provider_choices', c)) === choicesBefore);
+    check(`C. ${provider}: no connection row was created or modified`,
+      (await tableSnapshot('connections', c)) === connsBefore
+      && (await tableSnapshot('connections', c)) === '[]');
+    check(`C. ${provider}: no outbound provider request occurred`,
+      fetchLog.length === 0, fetchLog.map((f) => f.url));
+    check(`C. ${provider}: no Redis key was added`,
+      (await redis.dbsize()) === dbsizeBefore,
+      { before: dbsizeBefore, after: await redis.dbsize() });
+    check(`C. ${provider}: no backfill job was created`,
+      (await queues.klaviyoPollQueue().getJob(queues.klaviyoBackfillJobId(c))
+        .catch(() => null)) == null
+      && (await queues.rechargeBackfillQueue().getJob(queues.rechargeBackfillJobId(c))
+        .catch(() => null)) == null);
+
+    // Content-Type: application/json with NO payload — Fastify's own empty-JSON
+    // behaviour, deliberately left alone rather than forced to a different
+    // answer by changing the global content-type parser.
+    const emptyJson = await app.inject({
+      method: 'POST', url: requestUrl(provider),
+      headers: { cookie: cLink.cookie, 'content-type': 'application/json' },
+      remoteAddress: nextIp(),
+    });
+    record(`C ${provider} empty-json`, emptyJson);
+    check(`C. ${provider}: application/json with no payload is Fastify's 400, before the handler`,
+      emptyJson.statusCode === 400
+      && (JSON.parse(emptyJson.body) as { code?: string }).code === 'FST_ERR_CTP_EMPTY_JSON_BODY',
+      { status: emptyJson.statusCode, body: emptyJson.body });
+    check(`C. ${provider}: the empty-JSON refusal changed no state`,
+      (await tableSnapshot('onboarding_provider_choices', c)) === choicesBefore
+      && (await tableSnapshot('connections', c)) === connsBefore);
+  }
+
+  // --- C. Ordering proofs ------------------------------------------------
+  const cOrder = await makeAccount('5c2_body_order');
+  await seedConnectedProvider(cOrder, 'klaviyo');
+  const cOrderLink = await mintAndExchange(app, agencyCookie, cOrder);
+  const cOrderChoices = await tableSnapshot('onboarding_provider_choices', cOrder);
+  const cOrderConns = await tableSnapshot('connections', cOrder);
+
+  const connectedWithBody = await app.inject({
+    method: 'POST', url: requestUrl('klaviyo'),
+    headers: { cookie: cOrderLink.cookie, 'content-type': 'application/json' },
+    remoteAddress: nextIp(), payload: '{"apiKey":"synthetic-key"}',
+  });
+  record('C connected+body', connectedWithBody);
+  check('C. a CONNECTED provider plus a body returns request_body_not_permitted, not provider_already_connected',
+    connectedWithBody.statusCode === 400 && connectedWithBody.body === BODY_REFUSAL,
+    { status: connectedWithBody.statusCode, body: connectedWithBody.body });
+
+  const unknownWithBody = await app.inject({
+    method: 'POST', url: requestUrl('not_a_provider'),
+    headers: { cookie: cOrderLink.cookie, 'content-type': 'application/json' },
+    remoteAddress: nextIp(), payload: '{"unknown":"value"}',
+  });
+  record('C unknown+body', unknownWithBody);
+  check('C. an UNKNOWN provider plus a body returns request_body_not_permitted, not bad_provider',
+    unknownWithBody.statusCode === 400 && unknownWithBody.body === BODY_REFUSAL,
+    { status: unknownWithBody.statusCode, body: unknownWithBody.body });
+  check('C. both ordering probes mutated nothing',
+    (await tableSnapshot('onboarding_provider_choices', cOrder)) === cOrderChoices
+    && (await tableSnapshot('connections', cOrder)) === cOrderConns);
+
+  // =======================================================================
+  // D. Provider routing, and Shopify's static-route precedence
+  // =======================================================================
+  const d1 = await makeAccount('5c2_routing');
+  const dLink = await mintAndExchange(app, agencyCookie, d1);
+
+  const dUnknown = await requestBodyless(dLink.cookie, 'not_a_provider');
+  record('D unknown', dUnknown);
+  check('D. an unknown provider is 400 bad_provider',
+    dUnknown.statusCode === 400
+    && (JSON.parse(dUnknown.body) as { error: string }).error === 'bad_provider',
+    { status: dUnknown.statusCode, body: dUnknown.body });
+  check('D. klaviyo is accepted', (await requestBodyless(dLink.cookie, 'klaviyo')).statusCode === 200);
+  check('D. recharge is accepted', (await requestBodyless(dLink.cookie, 'recharge')).statusCode === 200);
+
+  // STATIC-ROUTE PRECEDENCE, proven rather than assumed.
+  //
+  // find-my-way prefers a static segment over a parametric one, so
+  // /onboarding/connections/shopify/request reaches the DOMAIN-BEARING route and
+  // never the generic handler. The two are distinguishable by their responses:
+  // the generic handler answers a bodyless shopify call with `bad_provider`,
+  // while the static route answers it with the domain validator's `empty`.
+  const dShopifyBodyless = await requestBodyless(dLink.cookie, 'shopify');
+  record('D shopify bodyless', dShopifyBodyless);
+  check('D. a bodyless Shopify request reaches the STATIC domain route, not the generic one',
+    dShopifyBodyless.statusCode === 400
+    && (JSON.parse(dShopifyBodyless.body) as { code?: string; error?: string }).code === 'empty'
+    && (JSON.parse(dShopifyBodyless.body) as { error?: string }).error === undefined,
+    { status: dShopifyBodyless.statusCode, body: dShopifyBodyless.body });
+
+  const dDomain = `5c2-static-${Date.now()}.myshopify.com`;
+  const dShopifyOk = await app.inject({
+    method: 'POST', url: requestUrl('shopify'), headers: { cookie: dLink.cookie },
+    remoteAddress: nextIp(), payload: { shopDomain: dDomain.toUpperCase() },
+  });
+  record('D shopify domain', dShopifyOk);
+  check('D. a valid synthetic Shopify domain request keeps its existing behaviour',
+    dShopifyOk.statusCode === 200
+    && (JSON.parse(dShopifyOk.body) as { shopDomain: string }).shopDomain === dDomain,
+    { status: dShopifyOk.statusCode, body: dShopifyOk.body });
+  const dShopifyRow = await choiceRow(d1, 'shopify');
+  check('D. Shopify still stores its requested_domain — the domainless path was NOT used',
+    dShopifyRow?.choice === 'requested' && dShopifyRow?.requested_domain === dDomain,
+    dShopifyRow);
+  check('D. the Shopify request created no connection row',
+    (await connRowCount(d1, 'shopify')) === 0);
+
+  const dShopifyBadDomain = await app.inject({
+    method: 'POST', url: requestUrl('shopify'), headers: { cookie: dLink.cookie },
+    remoteAddress: nextIp(), payload: { shopDomain: 'not-a-shopify-store.example.com' },
+  });
+  record('D shopify bad domain', dShopifyBadDomain);
+  check('D. an invalid Shopify domain keeps its existing safe response',
+    dShopifyBadDomain.statusCode === 400
+    && (JSON.parse(dShopifyBadDomain.body) as { code: string }).code === 'not_myshopify',
+    { status: dShopifyBadDomain.statusCode, body: dShopifyBadDomain.body });
+
+  fetchLog = [];
+  const dShopifyCreds = await app.inject({
+    method: 'POST', url: requestUrl('shopify'), headers: { cookie: dLink.cookie },
+    remoteAddress: nextIp(),
+    payload: {
+      shopDomain: dDomain, clientId: 'synthetic-client-id',
+      clientSecret: 'synthetic-secret', useEnvCredentials: true,
+    },
+  });
+  record('D shopify creds', dShopifyCreds);
+  check('D. Shopify credentials on the client request surface are never accepted',
+    (await connRowCount(d1, 'shopify')) === 0 && fetchLog.length === 0,
+    { conns: await connRowCount(d1, 'shopify'), fetches: fetchLog.map((f) => f.url) });
+  check('D. and the response echoes neither the client id nor the secret',
+    !dShopifyCreds.body.includes('synthetic-client-id')
+    && !dShopifyCreds.body.includes('synthetic-secret'));
+
+  // =======================================================================
+  // E / F. Full transition matrices, per provider
+  // =======================================================================
+  for (const provider of ['klaviyo', 'recharge'] as const) {
+    const t = await makeAccount(`5c2_transitions_${provider}`);
+    const tLink = await mintAndExchange(app, agencyCookie, t);
+    const P = provider === 'klaviyo' ? 'E' : 'F';
+
+    // 1. no row / undecided → requested
+    check(`${P}. ${provider} starts undecided with no choice row`,
+      (await choiceRowCount(t, provider)) === 0 && (await stateOf(t, provider)) === 'undecided');
+    await checkRequestSucceeded(
+      `${P}1. ${provider} undecided → requested`, await requestBodyless(tLink.cookie, provider), t, provider);
+
+    // 2. choice='pending' → requested (the state supersedeChoiceOnConnect leaves)
+    await choices.supersedeChoiceOnConnect(t, provider);
+    check(`${P}2. ${provider} is 'pending' and therefore reads as undecided`,
+      (await choiceRow(t, provider))?.choice === 'pending'
+      && (await stateOf(t, provider)) === 'undecided');
+    await checkRequestSucceeded(
+      `${P}2. ${provider} pending → requested`, await requestBodyless(tLink.cookie, provider), t, provider);
+
+    // 3. skipped → requested
+    const skipRes = await skipCall(tLink.cookie, provider);
+    check(`${P}3. ${provider} requested → skipped succeeds`, skipRes.statusCode === 200,
+      { status: skipRes.statusCode, body: skipRes.body });
+    record(`${P}3 ${provider} skip`, skipRes);
+    check(`${P}3. ${provider} is now skipped`, (await stateOf(t, provider)) === 'skipped');
+    await checkRequestSucceeded(
+      `${P}3. ${provider} skipped → requested`, await requestBodyless(tLink.cookie, provider), t, provider);
+
+    // 4. requested → requested, idempotently
+    const beforeDup = await choiceRow(t, provider);
+    const dup = await requestBodyless(tLink.cookie, provider);
+    await checkRequestSucceeded(
+      `${P}4. ${provider} requested → requested (duplicate)`, dup, t, provider);
+    check(`${P}4. ${provider}: the duplicate added no second choice row`,
+      (await choiceRowCount(t, provider)) === 1);
+    check(`${P}4. ${provider}: choice and requested_domain are unchanged by the duplicate`,
+      (await choiceRow(t, provider))?.choice === beforeDup?.choice
+      && (await choiceRow(t, provider))?.requested_domain === beforeDup?.requested_domain);
+
+    // 5. requested → skipped
+    const skip2 = await skipCall(tLink.cookie, provider);
+    record(`${P}5 ${provider} skip`, skip2);
+    check(`${P}5. ${provider} requested → skipped`,
+      skip2.statusCode === 200 && (await stateOf(t, provider)) === 'skipped',
+      { status: skip2.statusCode, state: await stateOf(t, provider) });
+    check(`${P}5. ${provider}: skipping cleared requested_domain and kept one row`,
+      (await choiceRow(t, provider))?.requested_domain === null
+      && (await choiceRowCount(t, provider)) === 1);
+
+    // 6. skipped → requested again
+    await checkRequestSucceeded(
+      `${P}6. ${provider} skipped → requested again`,
+      await requestBodyless(tLink.cookie, provider), t, provider);
+    check(`${P}6. ${provider}: still exactly one choice row after six transitions`,
+      (await choiceRowCount(t, provider)) === 1);
+    check(`${P}6. ${provider}: still no connection row after six transitions`,
+      (await connRowCount(t, provider)) === 0);
+  }
+
+  // =======================================================================
+  // G. A request has no connection side effects
+  // =======================================================================
+  const g1 = await makeAccount('5c2_side_effects');
+  const gLink = await mintAndExchange(app, agencyCookie, g1);
+  const gAccountBefore = await completionSnapshot(g1);
+  const gDbsizeBefore = await redis.dbsize();
+  fetchLog = [];
+
+  const gK = await requestBodyless(gLink.cookie, 'klaviyo');
+  const gR = await requestBodyless(gLink.cookie, 'recharge');
+  record('G klaviyo', gK);
+  record('G recharge', gR);
+  check('G. both requests succeeded', gK.statusCode === 200 && gR.statusCode === 200);
+  check('G. NO outbound provider request was made — no verification function was reached',
+    fetchLog.length === 0, fetchLog.map((f) => f.url));
+  check('G. no .env credential could have leaked, since nothing was sent',
+    envCredentialLeaked() === null, envCredentialLeaked());
+  check('G. the connections table is still empty for this account',
+    (await tableSnapshot('connections', g1)) === '[]');
+  check('G. no credentials_encrypted value exists anywhere for this account',
+    Number((await query<{ n: string }>(
+      `SELECT count(*) n FROM connections WHERE account_id = $1 AND credentials_encrypted IS NOT NULL`,
+      [g1])).rows[0].n) === 0);
+  check('G. no BullMQ job was created for either provider',
+    (await queues.klaviyoPollQueue().getJob(queues.klaviyoBackfillJobId(g1)).catch(() => null)) == null
+    && (await queues.rechargeBackfillQueue().getJob(queues.rechargeBackfillJobId(g1)).catch(() => null)) == null
+    && (await queues.backfillQueue().getJob(queues.backfillJobId(g1)).catch(() => null)) == null);
+  check('G. Redis gained no key from either request',
+    (await redis.dbsize()) === gDbsizeBefore);
+  check('G. no sync status was fabricated — progress reports nothing connected',
+    (await capabilities.getCapabilities(g1)).connected.length === 0);
+  check('G. no capability was granted by requesting',
+    (await capabilities.getCapabilities(g1)).available.length === 0);
+  check('G. requesting is recorded as requested, not connected, in capabilities',
+    (await capabilities.getCapabilities(g1)).requested.sort().join(',') === 'klaviyo,recharge',
+    (await capabilities.getCapabilities(g1)).requested);
+  check('G. ONLY onboarding_provider_choices changed on this account',
+    (await completionSnapshot(g1)) !== gAccountBefore
+    && (await tableSnapshot('connections', g1)) === '[]'
+    && (await tableSnapshot('ad_spend', g1)) === '[]'
+    && (await tableSnapshot('sku_costs', g1)) === '[]'
+    && (await tableSnapshot('account_costs', g1)) === '[]');
+  check('G. requested does NOT satisfy the genuine-connected requirement',
+    (await state.canCompleteOnboarding(g1)).blockers
+      .some((b) => b.code === 'no_platform_connected'),
+    (await state.canCompleteOnboarding(g1)).blockers.map((b) => b.code));
+
+  // =======================================================================
+  // H. Connected-provider refusal — request AND skip, before and after Gate 1
+  // =======================================================================
+  for (const provider of ['klaviyo', 'recharge'] as const) {
+    // --- before completion ---------------------------------------------
+    const h = await makeAccount(`5c2_connected_pre_${provider}`);
+    await seedConnectedProvider(h, provider);
+    const hLink = await mintAndExchange(app, agencyCookie, h);
+    check(`H. ${provider}: the account has NOT completed (first-time setup mode)`,
+      !(await state.isOnboardingComplete(h)));
+    const hChoices = await tableSnapshot('onboarding_provider_choices', h);
+    const hConns = await tableSnapshot('connections', h);
+    fetchLog = [];
+
+    const hReq = await requestBodyless(hLink.cookie, provider);
+    record(`H ${provider} pre request`, hReq);
+    check(`H. ${provider}: requesting a CONNECTED provider before completion is 409`,
+      hReq.statusCode === 409
+      && (JSON.parse(hReq.body) as { code: string }).code === 'provider_already_connected',
+      { status: hReq.statusCode, body: hReq.body });
+    const hSkip = await skipCall(hLink.cookie, provider);
+    record(`H ${provider} pre skip`, hSkip);
+    check(`H. ${provider}: skipping a CONNECTED provider before completion is 409 (newly unconditional)`,
+      hSkip.statusCode === 409
+      && (JSON.parse(hSkip.body) as { code: string }).code === 'provider_already_connected',
+      { status: hSkip.statusCode, body: hSkip.body });
+    check(`H. ${provider}: both refusals are byte-identical`, hReq.body === hSkip.body,
+      { req: hReq.body, skip: hSkip.body });
+    check(`H. ${provider}: the choice table is unchanged`,
+      (await tableSnapshot('onboarding_provider_choices', h)) === hChoices);
+    check(`H. ${provider}: the connection row and its encrypted credential are unchanged`,
+      (await tableSnapshot('connections', h)) === hConns);
+    check(`H. ${provider}: it is still reported connected, never skipped`,
+      (await stateOf(h, provider)) === 'connected');
+    check(`H. ${provider}: no provider request and no queue job resulted`,
+      fetchLog.length === 0
+      && (await queues.klaviyoPollQueue().getJob(queues.klaviyoBackfillJobId(h)).catch(() => null)) == null
+      && (await queues.rechargeBackfillQueue().getJob(queues.rechargeBackfillJobId(h)).catch(() => null)) == null,
+      fetchLog.map((f) => f.url));
+
+    // --- in manage mode --------------------------------------------------
+    const hm = await makeAccount(`5c2_connected_manage_${provider}`);
+    await seedConnectedProvider(hm, provider);
+    for (const other of PROVIDER_TRIO.filter((p) => p !== provider)) {
+      await choices.setSkipped(hm, other);
+    }
+    const hmLink = await mintAndExchange(app, agencyCookie, hm);
+    await app.inject({
+      method: 'POST', url: `/accounts/${hm}/onboarding/complete`,
+      headers: { cookie: agencyCookie }, remoteAddress: nextIp(), payload: {},
+    });
+    check(`H. ${provider}: the account is now in manage mode`,
+      (await state.isOnboardingComplete(hm)));
+    const hmChoices = await tableSnapshot('onboarding_provider_choices', hm);
+    const hmConns = await tableSnapshot('connections', hm);
+    fetchLog = [];
+
+    const hmReq = await requestBodyless(hmLink.cookie, provider);
+    const hmSkip = await skipCall(hmLink.cookie, provider);
+    record(`H ${provider} manage request`, hmReq);
+    record(`H ${provider} manage skip`, hmSkip);
+    check(`H. ${provider}: requesting a CONNECTED provider in manage mode is the same 409`,
+      hmReq.statusCode === 409 && hmReq.body === hReq.body,
+      { status: hmReq.statusCode, body: hmReq.body });
+    check(`H. ${provider}: skipping a CONNECTED provider in manage mode is the same 409`,
+      hmSkip.statusCode === 409 && hmSkip.body === hReq.body,
+      { status: hmSkip.statusCode, body: hmSkip.body });
+    check(`H. ${provider}: manage-mode refusals mutated nothing`,
+      (await tableSnapshot('onboarding_provider_choices', hm)) === hmChoices
+      && (await tableSnapshot('connections', hm)) === hmConns
+      && fetchLog.length === 0);
+    check(`H. ${provider}: the refusal message is stable and names no account or link`,
+      (JSON.parse(hmReq.body) as { message: string }).message
+        === `${provider === 'klaviyo' ? 'Klaviyo' : 'Recharge'} is already connected. `
+          + 'Ask your account manager to change it.',
+      hmReq.body);
+    check(`H. ${provider}: the refusal does not say whether a credential was submitted`,
+      !/credential|apiKey|token|key/i.test(hmReq.body), hmReq.body);
+  }
+
+  // =======================================================================
+  // I. Connect preservation — requested/skipped → genuinely connected
+  // =======================================================================
+  for (const provider of ['klaviyo', 'recharge'] as const) {
+    for (const start of ['requested', 'skipped'] as const) {
+      const i = await makeAccount(`5c2_connect_${provider}_${start}`);
+      const iLink = await mintAndExchange(app, agencyCookie, i);
+      if (start === 'requested') await requestBodyless(iLink.cookie, provider);
+      else await skipCall(iLink.cookie, provider);
+      check(`I. ${provider}: starts ${start}`, (await stateOf(i, provider)) === start);
+
+      const secret = provider === 'klaviyo'
+        ? `pk_5c2_${start}_key_00000000000000000`
+        : `recharge_5c2_${start}_token`;
+      const connected = await app.inject({
+        method: 'POST', url: `/onboarding/connections/${provider}`,
+        headers: { cookie: iLink.cookie }, remoteAddress: nextIp(),
+        payload: provider === 'klaviyo' ? { apiKey: secret } : { token: secret },
+      });
+      record(`I ${provider} ${start} connect`, connected);
+      check(`I. ${provider}: ${start} → connected succeeds`,
+        [200, 202].includes(connected.statusCode), connected.body);
+      check(`I. ${provider}: a real connection is the only connected fact`,
+        (await stateOf(i, provider)) === 'connected');
+      check(`I. ${provider}: exactly one connection row exists`,
+        (await connRowCount(i, provider)) === 1);
+      const row = (await query<{ credentials_encrypted: string; status: string }>(
+        `SELECT credentials_encrypted, status FROM connections
+          WHERE account_id = $1 AND provider = $2`, [i, provider])).rows[0];
+      check(`I. ${provider}: the credential is encrypted at rest`,
+        !row.credentials_encrypted.includes(secret));
+      check(`I. ${provider}: and decrypts back to what was submitted`,
+        JSON.parse(decrypt(row.credentials_encrypted))[provider === 'klaviyo' ? 'apiKey' : 'token']
+          === secret);
+      check(`I. ${provider}: the ${start} choice was superseded to 'pending'`,
+        (await choiceRow(i, provider))?.choice === 'pending',
+        (await choiceRow(i, provider))?.choice);
+      check(`I. ${provider}: the response never echoes the credential`,
+        !connected.body.includes(secret));
+    }
+  }
+
+  // =======================================================================
+  // J. Completion-gate truth
+  // =======================================================================
+  const j1 = await makeAccount('5c2_gate_mixed');
+  const jLink = await mintAndExchange(app, agencyCookie, j1);
+  await app.inject({
+    method: 'POST', url: '/onboarding/connections/klaviyo', headers: { cookie: jLink.cookie },
+    remoteAddress: nextIp(), payload: { apiKey: 'pk_5c2_gate_key_0000000000000000000' },
+  });
+  await requestBodyless(jLink.cookie, 'recharge');
+  await skipCall(jLink.cookie, 'shopify');
+  const jStates = await choices.getProviderStatuses(j1);
+  check('J. the account is connected / requested / skipped across the three providers',
+    jStates.map((p) => `${p.provider}:${p.state}`).join(',')
+      === 'shopify:skipped,klaviyo:connected,recharge:requested', jStates);
+  const jGate = await state.canCompleteOnboarding(j1);
+  check('J. that combination satisfies the basic provider-answer gate',
+    jGate.complete === true, jGate.blockers.map((b) => b.code));
+  check('J. a requested provider counts as ANSWERED — no provider_undecided blocker',
+    !jGate.blockers.some((b) => b.code === 'provider_undecided'));
+  check('J. and is not counted among the genuine connections',
+    jGate.connectedCount === 1, jGate.connectedCount);
+  const jDone = await app.inject({
+    method: 'POST', url: '/onboarding/complete', headers: { cookie: jLink.cookie },
+    remoteAddress: nextIp(), payload: {},
+  });
+  record('J complete', jDone);
+  check('J. completion succeeds through the real route', jDone.statusCode === 200, jDone.body);
+  check('J. no financial input was required', !(await hasAnyFinancialInput(j1)));
+  const jBody = JSON.parse(jDone.body) as { rcmReady: boolean; rcmBlockers: { code: string }[] };
+  check('J. RCM readiness stays separate and is NOT ready', jBody.rcmReady === false);
+  check('J. and it is the missing Shopify connection, not the request, that blocks RCM',
+    jBody.rcmBlockers.some((b) => b.code === 'shopify_not_connected'),
+    jBody.rcmBlockers.map((b) => b.code));
+  check('J. Recharge is STILL requested after completion, never relabelled connected',
+    (await stateOf(j1, 'recharge')) === 'requested');
+  check('J. and no connection row was invented for it',
+    (await connRowCount(j1, 'recharge')) === 0);
+
+  // Requested-only / skipped-only, with zero genuine connections.
+  const j2 = await makeAccount('5c2_gate_requests_only');
+  const j2Link = await mintAndExchange(app, agencyCookie, j2);
+  await requestBodyless(j2Link.cookie, 'klaviyo');
+  await requestBodyless(j2Link.cookie, 'recharge');
+  await skipCall(j2Link.cookie, 'shopify');
+  const j2Gate = await state.canCompleteOnboarding(j2);
+  check('J. every provider answered but NONE connected still fails the gate',
+    j2Gate.complete === false, j2Gate.blockers.map((b) => b.code));
+  check('J. the blocker is no_platform_connected, not provider_undecided',
+    j2Gate.blockers.some((b) => b.code === 'no_platform_connected')
+    && !j2Gate.blockers.some((b) => b.code === 'provider_undecided'),
+    j2Gate.blockers.map((b) => b.code));
+  const j2Done = await app.inject({
+    method: 'POST', url: '/onboarding/complete', headers: { cookie: j2Link.cookie },
+    remoteAddress: nextIp(), payload: {},
+  });
+  record('J requests-only complete', j2Done);
+  check('J. the real completion route refuses it with 409', j2Done.statusCode === 409, j2Done.body);
+  check('J. onboarding_complete did NOT become true merely because providers were requested',
+    !(await state.isOnboardingComplete(j2)));
+  check('J. and the historical latch is untouched for that account',
+    (await query<{ c: boolean }>(
+      `SELECT onboarding_complete c FROM accounts WHERE id = $1`, [j2])).rows[0].c === false);
+
+  // =======================================================================
+  // K. Manage-mode requested ↔ skipped on an UNCONNECTED provider
+  // =======================================================================
+  const k1 = await makeAccount('5c2_manage_transitions');
+  await seedConnectedProvider(k1, 'klaviyo');
+  await choices.setSkipped(k1, 'shopify');
+  await choices.setSkipped(k1, 'recharge');
+  const kLink = await mintAndExchange(app, agencyCookie, k1);
+  await app.inject({
+    method: 'POST', url: `/accounts/${k1}/onboarding/complete`,
+    headers: { cookie: agencyCookie }, remoteAddress: nextIp(), payload: {},
+  });
+  const kMe = await app.inject({
+    method: 'GET', url: '/onboarding/me', headers: { cookie: kLink.cookie }, remoteAddress: nextIp(),
+  });
+  check('K. the link is in manage mode',
+    (JSON.parse(kMe.body) as { manageMode: boolean }).manageMode === true);
+
+  const kToRequested = await requestBodyless(kLink.cookie, 'recharge');
+  record('K skipped→requested', kToRequested);
+  check('K. an UNCONNECTED provider may go skipped → requested in manage mode',
+    kToRequested.statusCode === 200 && (await stateOf(k1, 'recharge')) === 'requested',
+    { status: kToRequested.statusCode, state: await stateOf(k1, 'recharge') });
+  const kToSkipped = await skipCall(kLink.cookie, 'recharge');
+  record('K requested→skipped', kToSkipped);
+  check('K. and requested → skipped, on the SAME cookie with no token exchange',
+    kToSkipped.statusCode === 200 && (await stateOf(k1, 'recharge')) === 'skipped',
+    { status: kToSkipped.statusCode, state: await stateOf(k1, 'recharge') });
+  const kBack = await requestBodyless(kLink.cookie, 'recharge');
+  check('K. and back again, still with no re-exchange',
+    kBack.statusCode === 200 && (await stateOf(k1, 'recharge')) === 'requested');
+  check('K. the CONNECTED provider may do neither',
+    (await requestBodyless(kLink.cookie, 'klaviyo')).statusCode === 409
+    && (await skipCall(kLink.cookie, 'klaviyo')).statusCode === 409);
+  check('K. and it is still connected after both refusals',
+    (await stateOf(k1, 'klaviyo')) === 'connected');
+
+  // =======================================================================
+  // M. Expiry, revocation and isolation on the new route
+  // =======================================================================
+  const m1 = await makeAccount('5c2_revoked');
+  const mLink = await mintAndExchange(app, agencyCookie, m1);
+  check('M. the new route works while the link is live',
+    (await requestBodyless(mLink.cookie, 'klaviyo')).statusCode === 200);
+  const mBefore = await tableSnapshot('onboarding_provider_choices', m1);
+  await app.inject({
+    method: 'DELETE', url: `/accounts/${m1}/onboarding-links/${mLink.linkId}`,
+    headers: { cookie: agencyCookie }, remoteAddress: nextIp(),
+  });
+  const mRevoked = await requestBodyless(mLink.cookie, 'recharge');
+  record('M revoked', mRevoked);
+  check('M. a revoked link fails on the very next request to the new route',
+    mRevoked.statusCode === 401, mRevoked.statusCode);
+  check('M. the revoked refusal is the neutral client failure',
+    JSON.parse(mRevoked.body).error === 'invalid_link', mRevoked.body);
+  check('M. the revoked response clears the onboarding cookie, per the existing contract',
+    (cookieDirective(mRevoked, 'tention_onb') ?? '').startsWith('tention_onb=;'),
+    cookieDirective(mRevoked, 'tention_onb'));
+  check('M. and nothing changed after the revoked attempt',
+    (await tableSnapshot('onboarding_provider_choices', m1)) === mBefore);
+
+  const m2 = await makeAccount('5c2_expired');
+  const m2Link = await mintAndExchange(app, agencyCookie, m2);
+  await query(`UPDATE onboarding_links SET expires_at = now() - interval '1 second' WHERE id = $1`,
+    [m2Link.linkId]);
+  const mExpired = await requestBodyless(m2Link.cookie, 'klaviyo');
+  record('M expired', mExpired);
+  check('M. an expired link fails on the very next request to the new route',
+    mExpired.statusCode === 401, mExpired.statusCode);
+  check('M. and wrote nothing', (await tableSnapshot('onboarding_provider_choices', m2)) === '[]');
+
+  const m3 = await makeAccount('5c2_isolation_a');
+  const m4 = await makeAccount('5c2_isolation_b');
+  const m3Link = await mintAndExchange(app, agencyCookie, m3);
+  await choices.setSkipped(m4, 'recharge');
+  const m4Before = await tableSnapshot('onboarding_provider_choices', m4);
+  await requestBodyless(m3Link.cookie, 'recharge');
+  check('M. one account\'s request cannot alter another account\'s choices',
+    (await tableSnapshot('onboarding_provider_choices', m4)) === m4Before);
+  check('M. nor another account\'s connections',
+    (await tableSnapshot('connections', m4)) === '[]');
+  check('M. no agency route became reachable from the client cookie',
+    (await app.inject({
+      method: 'GET', url: '/accounts', headers: { cookie: m3Link.cookie }, remoteAddress: nextIp(),
+    })).statusCode === 401
+    && (await app.inject({
+      method: 'POST', url: `/accounts/${m4}/onboarding-links`,
+      headers: { cookie: m3Link.cookie }, remoteAddress: nextIp(), payload: {},
+    })).statusCode === 401);
+
+  // =======================================================================
+  // L. Response hygiene, over every response this group produced
+  // =======================================================================
+  for (const [label, body] of collected) checkMHygiene(`L ${label}`, body);
+  check('L. no response in this group leaked a synthetic credential value',
+    collected.every(([, b]) =>
+      !['synthetic-key', 'synthetic-token', 'synthetic-secret', 'synthetic-client-id']
+        .some((n) => b.includes(n))),
+    collected.filter(([, b]) => b.includes('synthetic-')).map(([l]) => l));
+  check('L. no .env credential leaked while this group ran',
+    envCredentialLeaked() === null, envCredentialLeaked());
+}
+
+/** The three providers, for loops that need "the other two". */
+const PROVIDER_TRIO = ['shopify', 'klaviyo', 'recharge'] as const;
+
+// ===========================================================================
 // Main
 // ===========================================================================
 
@@ -4242,6 +5094,7 @@ async function main(): Promise<void> {
     await groupJ(app, agencyCookie);
     await groupK(app, agencyCookie);
     await groupL(app, agencyCookie);
+    await groupM(app, agencyCookie);
   } finally {
     console.log('\nCleanup');
     await cleanupAccounts();
@@ -4315,6 +5168,7 @@ async function main(): Promise<void> {
     G: 'Link states + rate limit', H: 'Later connection',
     I: 'Fastify 5 regressions', J: 'Agency API hardening',
     K: 'Agency completion (5B-2G)', L: 'Manage mode (5C-1)',
+    M: 'Provider requests (5C-2)',
   };
   for (const [letter, t] of Object.entries(groupTotals)) {
     const mark = t.fail === 0 ? '✓' : '✗';
