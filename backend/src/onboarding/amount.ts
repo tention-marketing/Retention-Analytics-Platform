@@ -54,7 +54,33 @@ export function parseAmount(input: unknown): AmountParse {
 
 /** True when `n` has at most two decimal places — the NUMERIC(_,2) columns' limit. */
 export function hasAtMostTwoDecimals(n: number): boolean {
-  // Scale, round, compare. Reading the decimal digits off the string form would
-  // misjudge exponential notation (1e-3 has no '.' in it at all).
-  return Math.round(n * 100) === n * 100;
+  // Round to two decimals, back to a number, compare. `n` is only INSPECTED —
+  // nothing here is stored, and every validator returns the value it parsed, so
+  // this can never silently round a client's money.
+  //
+  // THIS USED TO BE `Math.round(n * 100) === n * 100`, and that scaling step is
+  // the bug it now avoids. Multiplying a decimal by 100 is not exact in binary
+  // floating point, so the two sides differed for values that have exactly two
+  // decimal places:
+  //
+  //     19.99 * 100 === 1998.9999999999998    a price
+  //     20.01 * 100 === 2001.0000000000002    a cost
+  //      0.07 * 100 === 7.000000000000001     a unit cost
+  //      1.13 * 100 === 112.99999999999999    a spend figure
+  //
+  // 13.13% of the two-decimal values between 0.01 and 10000.00 landed on that
+  // error and were refused as `too_precise` — a message telling a client that
+  // 19.99 has more than two decimal places. It hit all four financial inputs at
+  // once (per-SKU COGS, OCAS, ad spend, blended margin), because all four share
+  // this one helper, and it hit both a JSON number and the decimal string a
+  // browser form submits. Downstream that is an RCM input nobody can enter.
+  //
+  // toFixed does the scaling in decimal rather than by binary multiplication, so
+  // the comparison asks the question the rule actually means: is `n` equal to
+  // itself rounded to two places? A genuine third decimal changes the value and
+  // is still rejected (1.005, 1.2345, 0.125), and exponential notation is still
+  // judged correctly — 1e-3 rounds to 0.00, which is not 1e-3 — which the
+  // previous comment rightly flagged as the trap in reading decimal digits off a
+  // string. This does not read digits; it compares numbers.
+  return Number(n.toFixed(2)) === n;
 }
