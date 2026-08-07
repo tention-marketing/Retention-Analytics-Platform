@@ -117,14 +117,75 @@ export async function getLinkById(linkId: number): Promise<OnboardingLinkRow | n
   return rows[0] ?? null;
 }
 
-export interface LinkWithAccountState {
-  link: OnboardingLinkRow;
-  /** `accounts.onboarding_complete` for this link's account. */
+/**
+ * The account fields a client session needs, once the account has been PROVEN
+ * loadable. Reaching this type at all is the proof — see safeAccountState().
+ */
+export interface SafeAccountState {
+  /** `accounts.name`. NOT NULL in the schema, so a loaded account always has one. */
+  name: string;
+  /** `accounts.onboarding_complete` — a real boolean, never an absent value. */
   onboardingComplete: boolean;
 }
 
 /**
- * The link row plus its account's completion latch, in ONE round trip.
+ * THE safety predicate (Phase 5C-4). One definition, two call shapes below.
+ *
+ * WHY A NULL LATCH IS UNSAFE RATHER THAN FALSE. `accounts.onboarding_complete`
+ * is `BOOLEAN DEFAULT false` and NULLABLE, and a LEFT JOIN against a missing
+ * account produces exactly the same NULL. Both used to be flattened by
+ * `onboarding_complete === true`, which reads either one as `false` — and per
+ * §5.4.1 a false latch means manageMode is false, which is UNRESTRICTED
+ * first-time setup access. So the one value meaning "this account's lifecycle
+ * cannot be determined" was granting the widest permission the client surface
+ * has. It is now refused instead.
+ *
+ * A genuine stored `false` is untouched and remains completely valid: the
+ * distinction is between a boolean that was read and a value that was absent.
+ */
+function safeAccountState(
+  name: string | null | undefined,
+  onboardingComplete: boolean | null | undefined,
+): SafeAccountState | null {
+  if (typeof name !== 'string') return null;
+  // Deliberately a type check, not a truthiness check: `false` must pass.
+  if (typeof onboardingComplete !== 'boolean') return null;
+  return { name, onboardingComplete };
+}
+
+/**
+ * The account state behind an already-resolved link, or null when it cannot be
+ * safely loaded. Used by the token-exchange route, which has the link row from
+ * resolveToken() and needs only the account half.
+ *
+ * Callers MUST collapse a null into the same neutral client failure every other
+ * link fault produces: whether an account is missing is not a client's business
+ * (§5.4.8).
+ */
+export async function loadSafeAccountState(accountId: number): Promise<SafeAccountState | null> {
+  const { rows } = await query<{ name: string | null; onboarding_complete: boolean | null }>(
+    `SELECT name, onboarding_complete FROM accounts WHERE id = $1`,
+    [accountId],
+  );
+  const row = rows[0];
+  if (!row) return null;
+  return safeAccountState(row.name, row.onboarding_complete);
+}
+
+/**
+ * A DISCRIMINATED UNION, not a nullable field.
+ *
+ * `account` exists only on the ok branch, so a caller cannot read the
+ * completion latch without having handled the unsafe case first — the compiler
+ * enforces what a comment used to ask for. `reason` is for server-side
+ * diagnostics only and must never reach a client.
+ */
+export type LinkAccountLoad =
+  | { ok: true; link: OnboardingLinkRow; account: SafeAccountState }
+  | { ok: false; reason: 'link_not_found' | 'account_unsafe' };
+
+/**
+ * The link row plus its account's safely-loaded state, in ONE round trip.
  *
  * This is what every authenticated client request reads (session.ts), because
  * all three lifecycle facts have to come from live table state rather than from
@@ -140,25 +201,26 @@ export interface LinkWithAccountState {
  *
  * The LEFT JOIN is kept purely as defence in depth against database state this
  * code did not create: a manually inconsistent row, legacy data predating the
- * constraint, or an externally modified database. In that case a missing account
- * simply reads as not-complete rather than crashing or silently reporting the
- * link as absent. Rejecting a token whose account cannot be safely loaded
- * remains deferred to Phase 5C-4.
+ * constraint, or an externally modified database. Phase 5C-4 completes that
+ * defence — such a row now yields `account_unsafe` and is refused, rather than
+ * reading as not-complete and handing back unrestricted setup access.
  */
-export async function getLinkWithAccountState(
-  linkId: number,
-): Promise<LinkWithAccountState | null> {
-  const { rows } = await query<OnboardingLinkRow & { onboarding_complete: boolean | null }>(
-    `SELECT l.*, a.onboarding_complete
+export async function getLinkWithAccountState(linkId: number): Promise<LinkAccountLoad> {
+  const { rows } = await query<OnboardingLinkRow & {
+    account_name: string | null; onboarding_complete: boolean | null;
+  }>(
+    `SELECT l.*, a.name AS account_name, a.onboarding_complete
        FROM onboarding_links l
        LEFT JOIN accounts a ON a.id = l.account_id
       WHERE l.id = $1`,
     [linkId],
   );
   const row = rows[0];
-  if (!row) return null;
-  const { onboarding_complete, ...link } = row;
-  return { link: link as OnboardingLinkRow, onboardingComplete: onboarding_complete === true };
+  if (!row) return { ok: false, reason: 'link_not_found' };
+  const { account_name, onboarding_complete, ...link } = row;
+  const account = safeAccountState(account_name, onboarding_complete);
+  if (!account) return { ok: false, reason: 'account_unsafe' };
+  return { ok: true, link: link as OnboardingLinkRow, account };
 }
 
 export async function markFirstUsed(linkId: number): Promise<void> {

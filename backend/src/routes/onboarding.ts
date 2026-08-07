@@ -4,7 +4,10 @@ import {
   requireOnboardingLink, rejectClientAccountId, issueOnboardingSession,
   clearOnboardingSession, GENERIC_LINK_ERROR,
 } from '../onboarding/session.js';
-import { resolveToken, linkLiveness, markFirstUsed, markLinkCompleted } from '../onboarding/links.js';
+import {
+  resolveToken, linkLiveness, markFirstUsed, markLinkCompleted, loadSafeAccountState,
+} from '../onboarding/links.js';
+import { publicConnectFailure } from '../onboarding/failures.js';
 import { connectKlaviyo, connectRecharge } from '../onboarding/connect.js';
 import {
   getProviderStatuses, isProvider, isRequestableProvider, setSkipped, setRequested,
@@ -40,6 +43,31 @@ import { enforceManageMode, deriveManageMode } from '../onboarding/manageMode.js
 //   5. Every authenticated route below declares a `clientAction`, and
 //      enforceManageMode refuses one that does not. Manage-mode permissions are
 //      never a hand-written boolean in a handler — see onboarding/manageMode.ts.
+
+/**
+ * The per-route throttle every SENSITIVE authenticated client write carries
+ * (Phase 5C-4).
+ *
+ * ONE constant, spread into each route's config, so eleven routes cannot drift
+ * into eleven slightly different policies. It is not an abstraction over the
+ * plugin — the two fields are passed through verbatim, and everything else
+ * (global:false, the Redis store, req.ip keying, skipOnError, the default 429
+ * builder) stays exactly as index.ts registered it.
+ *
+ * @fastify/rate-limit keys as `fastify-rate-limit-<METHOD><route>-<key>`, so each
+ * route gets its OWN bucket for free: a loop against /ocas cannot exhaust the
+ * budget for /complete.
+ *
+ * 10/minute reuses the convention already set by POST /onboarding/session and
+ * POST /auth/login. It cannot obstruct the wizard — a human filling in a 7-step
+ * form makes far fewer than ten calls per route per minute, and the heaviest
+ * legitimate pattern (saving an ad-spend grid) is one submit per save.
+ *
+ * READS AND LOGOUT ARE DELIBERATELY NOT LIMITED. The GET routes are idempotent
+ * and are polled while a backfill runs, and throttling logout could only ever
+ * strip someone's ability to end their own session.
+ */
+const CLIENT_WRITE_RATE_LIMIT = { max: 10, timeWindow: '1 minute' } as const;
 
 /** account_id, always from the session. Never a parameter. */
 function acct(req: FastifyRequest): number {
@@ -205,23 +233,37 @@ export async function onboardingRoutes(app: FastifyInstance): Promise<void> {
       if (!resolved.ok) return reply.code(401).send(GENERIC_LINK_ERROR);
       if (!linkLiveness(resolved.link).ok) return reply.code(401).send(GENERIC_LINK_ERROR);
 
+      // Phase 5C-4: PROVE THE ACCOUNT IS LOADABLE BEFORE WRITING OR ISSUING
+      // ANYTHING.
+      //
+      // This read used to sit AFTER markFirstUsed() and issueOnboardingSession(),
+      // which meant a link whose account could not be loaded still stamped
+      // first_used_at, still handed out a cookie, and then answered with
+      // `workspaceName: null` and `onboardingComplete: false` — a false latch
+      // being precisely what grants UNRESTRICTED first-time setup access
+      // (§5.4.1). Moving it above both side effects is the whole repair: there is
+      // no cookie to revoke and no timestamp to walk back, because neither
+      // happens on this path.
+      //
+      // The refusal is the SAME neutral envelope a malformed, unknown, expired or
+      // revoked token gets, so a client cannot learn that an account is missing
+      // (§5.4.8). There is deliberately no client-facing account_not_found.
+      const account = await loadSafeAccountState(resolved.link.account_id);
+      if (!account) return reply.code(401).send(GENERIC_LINK_ERROR);
+
       await markFirstUsed(resolved.link.id);
       issueOnboardingSession(reply, resolved.link);
 
-      const { rows } = await query<{ name: string; onboarding_complete: boolean }>(
-        'SELECT name, onboarding_complete FROM accounts WHERE id = $1',
-        [resolved.link.account_id],
-      );
       // Workspace name is revealed ONLY after the token validates.
       //
       // manageMode here is the SAME derivation the per-request guard uses, read
-      // from the same two columns — so a freshly exchanged session and an
+      // through the same loader — so a freshly exchanged session and an
       // already-open one cannot disagree, and re-exchanging a token on a
       // completed account cannot hand back unrestricted setup access.
       return reply.send({
-        workspaceName: rows[0]?.name ?? null,
+        workspaceName: account.name,
         ...lifecycleFields({
-          onboardingComplete: rows[0]?.onboarding_complete === true,
+          onboardingComplete: account.onboardingComplete,
           completedByThisLink: resolved.link.completed_at !== null,
           expiresAt: resolved.link.expires_at,
         }),
@@ -320,7 +362,12 @@ export async function onboardingRoutes(app: FastifyInstance): Promise<void> {
     // credentials to this account.
     scoped.post(
       '/onboarding/connections/klaviyo',
-      { config: { clientAction: 'connections.klaviyo.connect' } },
+      {
+        config: {
+          clientAction: 'connections.klaviyo.connect',
+          rateLimit: CLIENT_WRITE_RATE_LIMIT,
+        },
+      },
       async (req, reply) => {
         const accountId = acct(req);
         const refusal = await refuseIfAlreadyConnected(req, 'klaviyo');
@@ -331,8 +378,13 @@ export async function onboardingRoutes(app: FastifyInstance): Promise<void> {
           { apiKey: typeof apiKey === 'string' ? apiKey : '' },
         );
         if (!result.ok) {
+          // Phase 5C-4: the STATUS and the machine CODE are unchanged; only the
+          // sentence is now application-owned. `result.message` carries the raw
+          // provider exception — Klaviyo's client puts the whole HTTP response
+          // body in it — and is deliberately not read here.
+          const safe = publicConnectFailure(result.code, 'klaviyo');
           return reply.code(result.code === 'verification_failed' ? 502 : 400)
-            .send({ connected: false, code: result.code, message: result.message });
+            .send({ connected: false, code: safe.code, message: safe.message });
         }
         return reply.code(result.queued ? 202 : 200).send({
           connected: true,
@@ -344,7 +396,12 @@ export async function onboardingRoutes(app: FastifyInstance): Promise<void> {
 
     scoped.post(
       '/onboarding/connections/recharge',
-      { config: { clientAction: 'connections.recharge.connect' } },
+      {
+        config: {
+          clientAction: 'connections.recharge.connect',
+          rateLimit: CLIENT_WRITE_RATE_LIMIT,
+        },
+      },
       async (req, reply) => {
         const accountId = acct(req);
         const refusal = await refuseIfAlreadyConnected(req, 'recharge');
@@ -355,8 +412,11 @@ export async function onboardingRoutes(app: FastifyInstance): Promise<void> {
           { token: typeof token === 'string' ? token : '' },
         );
         if (!result.ok) {
+          // As above. Recharge's client redacts NOTHING, so its raw message is
+          // the most dangerous of the three to forward — and is not forwarded.
+          const safe = publicConnectFailure(result.code, 'recharge');
           return reply.code(result.code === 'verification_failed' ? 502 : 400)
-            .send({ connected: false, code: result.code, message: result.message });
+            .send({ connected: false, code: safe.code, message: safe.message });
         }
         return reply.code(result.queued ? 202 : 200).send({
           connected: true,
@@ -374,7 +434,12 @@ export async function onboardingRoutes(app: FastifyInstance): Promise<void> {
      */
     scoped.post(
       '/onboarding/connections/shopify/request',
-      { config: { clientAction: 'connections.shopify.request' } },
+      {
+        config: {
+          clientAction: 'connections.shopify.request',
+          rateLimit: CLIENT_WRITE_RATE_LIMIT,
+        },
+      },
       async (req, reply) => {
         const accountId = acct(req);
         // FIRST, before the body is read at all: a connected Shopify store cannot
@@ -432,7 +497,12 @@ export async function onboardingRoutes(app: FastifyInstance): Promise<void> {
      */
     scoped.post(
       '/onboarding/connections/:provider/request',
-      { config: { clientAction: 'connections.choice.request' } },
+      {
+        config: {
+          clientAction: 'connections.choice.request',
+          rateLimit: CLIENT_WRITE_RATE_LIMIT,
+        },
+      },
       async (req, reply) => {
         const accountId = acct(req);
 
@@ -474,7 +544,12 @@ export async function onboardingRoutes(app: FastifyInstance): Promise<void> {
 
     scoped.post(
       '/onboarding/connections/:provider/skip',
-      { config: { clientAction: 'connections.choice.skip' } },
+      {
+        config: {
+          clientAction: 'connections.choice.skip',
+          rateLimit: CLIENT_WRITE_RATE_LIMIT,
+        },
+      },
       async (req, reply) => {
         const accountId = acct(req);
         const provider = (req.params as { provider?: string }).provider;
@@ -505,7 +580,7 @@ export async function onboardingRoutes(app: FastifyInstance): Promise<void> {
 
     scoped.put(
       '/onboarding/currency',
-      { config: { clientAction: 'currency.update' } },
+      { config: { clientAction: 'currency.update', rateLimit: CLIENT_WRITE_RATE_LIMIT } },
       async (req, reply) => {
         // setManualCurrency is the guard for §5.4.7: it refuses to overwrite a
         // Shopify-authoritative currency and preserves both sides of a mismatch,
@@ -548,13 +623,13 @@ export async function onboardingRoutes(app: FastifyInstance): Promise<void> {
 
     scoped.put(
       '/onboarding/cogs',
-      { config: { clientAction: 'cogs.update' } },
+      { config: { clientAction: 'cogs.update', rateLimit: CLIENT_WRITE_RATE_LIMIT } },
       async (req, reply) => handleCogsWrite(acct(req), req, reply),
     );
 
     scoped.put(
       '/onboarding/ocas',
-      { config: { clientAction: 'ocas.update' } },
+      { config: { clientAction: 'ocas.update', rateLimit: CLIENT_WRITE_RATE_LIMIT } },
       async (req, reply) => handleOcasWrite(acct(req), req, reply),
     );
 
@@ -573,13 +648,13 @@ export async function onboardingRoutes(app: FastifyInstance): Promise<void> {
 
     scoped.put(
       '/onboarding/ad-spend',
-      { config: { clientAction: 'ad_spend.update' } },
+      { config: { clientAction: 'ad_spend.update', rateLimit: CLIENT_WRITE_RATE_LIMIT } },
       async (req, reply) => handleAdSpendWrite(acct(req), req, reply),
     );
 
     scoped.post(
       '/onboarding/ad-spend/zero',
-      { config: { clientAction: 'ad_spend.zero_confirm' } },
+      { config: { clientAction: 'ad_spend.zero_confirm', rateLimit: CLIENT_WRITE_RATE_LIMIT } },
       async (req, reply) => handleZeroConfirm(acct(req), req, reply),
     );
 
@@ -589,7 +664,11 @@ export async function onboardingRoutes(app: FastifyInstance): Promise<void> {
 
     scoped.post(
       '/onboarding/complete',
-      { config: { clientAction: 'completion.submit' } },
+      // Phase 5C-4 adds the throttle and NOTHING else on this route: the gate
+      // re-check, the latch write, the completed_at IS NULL guard and every
+      // response field below are untouched. Concurrency safety already comes
+      // from that guarded UPDATE, so no transaction or lock is introduced.
+      { config: { clientAction: 'completion.submit', rateLimit: CLIENT_WRITE_RATE_LIMIT } },
       async (req, reply) => {
         const accountId = acct(req);
         const session = principal(req);

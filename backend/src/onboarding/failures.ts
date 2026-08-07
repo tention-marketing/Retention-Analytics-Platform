@@ -140,3 +140,103 @@ export function delayedFailure(provider: Provider, stage: string): SafeFailure {
     occurredAt: null,
   };
 }
+
+// ---------------------------------------------------------------------------
+// CONNECT-TIME failures, for the client surface (Phase 5C-4)
+// ---------------------------------------------------------------------------
+//
+// classifyFailure() above covers a SYNC that failed after a connection existed.
+// This is its connect-time sibling, and it lives in the same file for the same
+// reason: one home for every sentence a client may be shown about a provider, so
+// no route can hand-roll a variant that says more.
+//
+// WHAT IT FIXES. onboarding/connect.ts builds its `verification_failed` message
+// as `` `Klaviyo verification failed: ${(err as Error).message}` ``, and the
+// provider clients put the raw HTTP response body in that Error — Klaviyo redacts
+// only `pk_`-shaped strings and the `Klaviyo-API-Key` header, and Recharge redacts
+// nothing at all. A poisoned provider body therefore reached the client verbatim,
+// carrying whatever it contained: SQL fragments, absolute deploy-host paths,
+// stack frames, and non-Klaviyo credential shapes such as a `shpat_` token.
+//
+// THE RAW TEXT IS NOT DESTROYED. connect.ts is unchanged, so the agency routes
+// and sync_errors keep the full detail they need for troubleshooting. What
+// changes is only what crosses the CLIENT boundary: this helper reads the code
+// and nothing else.
+
+/**
+ * Derived FROM connect.ts rather than re-spelled beside it, so the two cannot
+ * drift: a new ConnectFailure code becomes a compile error in the exhaustive
+ * switch below instead of silently falling through to a default.
+ *
+ * `import type` — erased at build time, so failures.ts gains no runtime
+ * dependency on the provider clients connect.ts pulls in.
+ */
+export type ConnectFailureCode = import('./connect.js').ConnectFailure['code'];
+
+export interface PublicConnectFailure {
+  /** Unchanged from the internal failure. Safe to branch on in the frontend. */
+  code: ConnectFailureCode;
+  /** Fixed, application-owned wording. Never derived from provider text. */
+  message: string;
+}
+
+/** What this provider's credential is actually called, for accurate copy. */
+const CREDENTIAL_NOUN: Record<Provider, string> = {
+  shopify: 'app credentials',
+  klaviyo: 'private API key',
+  recharge: 'API token',
+};
+
+/**
+ * The client-facing form of a connect failure.
+ *
+ * EVERY branch returns a literal composed only of strings defined in this file.
+ * There is no default case and no parameter carrying provider text — the raw
+ * message is not even passed in, so it cannot be concatenated by accident.
+ */
+export function publicConnectFailure(
+  code: ConnectFailureCode,
+  provider: Provider,
+): PublicConnectFailure {
+  const label = PROVIDER_LABEL[provider];
+  switch (code) {
+    case 'missing_credentials':
+      return { code, message: `Enter your ${label} ${CREDENTIAL_NOUN[provider]} to continue.` };
+
+    case 'verification_failed':
+      // Covers a rejected credential, an unreachable provider and a provider
+      // 5xx alike, so it must not assert which one happened — "could not verify"
+      // is true of all three, where "rejected your key" would be wrong for an
+      // outage.
+      return {
+        code,
+        message:
+          `We could not verify those ${label} credentials. Check them and try again, ` +
+          'or ask your account manager for help.',
+      };
+
+    case 'account_not_found':
+      // Unreachable from a valid client request now that the session refuses a
+      // link whose account cannot be safely loaded (5C-4). Mapped anyway, and
+      // mapped to wording that CONFIRMS NOTHING about whether an account exists.
+      return { code, message: 'We could not complete this connection. Ask your account manager.' };
+
+    case 'invalid_domain':
+      return { code, message: `That ${label} store domain is not valid.` };
+
+    case 'domain_conflict':
+      // Same sentence as domain.ts's client-safe message: never names the other
+      // account.
+      return {
+        code,
+        message: `This ${label} store is already being set up. Contact your account manager.`,
+      };
+  }
+  // Exhaustive above. This makes a future unmapped code a TYPE error rather than
+  // a silent fallthrough that might return provider text.
+  return assertNever(code);
+}
+
+function assertNever(value: never): never {
+  throw new Error(`unmapped connect failure code: ${String(value)}`);
+}

@@ -152,11 +152,27 @@ export async function requireOnboardingLink(
   }
 
   const resolved = await getLinkWithAccountState(payload.l);
-  if (!resolved || resolved.link.account_id !== payload.a) {
+  if (!resolved.ok) {
+    if (resolved.reason === 'account_unsafe') {
+      // Phase 5C-4. The link row is intact but its account's lifecycle state
+      // cannot be read, so there is no honest value to derive manageMode from —
+      // and the value this used to fall back to (`false`) is the one that grants
+      // UNRESTRICTED first-time setup access. Refused instead, and the cookie is
+      // cleared exactly as the expired/revoked branch below does, because a
+      // credential that cannot be evaluated is a dead credential.
+      //
+      // The reason is never sent: to the client this is indistinguishable from a
+      // malformed, unknown, expired or revoked link (§5.4.8).
+      clearOnboardingSession(reply);
+    }
     await reply.code(401).send(GENERIC_LINK_ERROR);
     return;
   }
-  const { link, onboardingComplete } = resolved;
+  if (resolved.link.account_id !== payload.a) {
+    await reply.code(401).send(GENERIC_LINK_ERROR);
+    return;
+  }
+  const { link, account } = resolved;
   if (!linkLiveness(link).ok) {
     // Expired or revoked mid-session: clear the cookie so the browser stops
     // presenting a dead credential.
@@ -165,6 +181,9 @@ export async function requireOnboardingLink(
     return;
   }
 
+  // A real boolean, proven present by safeAccountState(). A stored `false` is
+  // fully valid here; only an ABSENT value was ever the problem.
+  const onboardingComplete = account.onboardingComplete;
   const completedByThisLink = link.completed_at !== null;
   req.onboarding = {
     accountId: link.account_id,
