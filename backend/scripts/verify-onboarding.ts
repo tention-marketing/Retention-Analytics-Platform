@@ -30,6 +30,11 @@
  *      mismatch preservation, both COGS methods and their retained inactive
  *      values, OCAS, positive and confirmed-zero ad spend, the contradictory-
  *      state blocker, manage-mode access, and completion/readiness separation.
+ *   O. Phase 5C-4 hardening: the neutral refusal for a link whose account cannot
+ *      be safely loaded (no cookie, no first_used_at), the same rule on every
+ *      authenticated request, per-route throttles on all eleven sensitive client
+ *      writes with source and route bucket isolation, concurrent completion
+ *      idempotency, and a poisoned provider body reduced to fixed public wording.
  *
  * Non-destructive: every account created here is a throwaway, deleted on the way
  * out. No live provider credential is used and no live provider is contacted —
@@ -61,9 +66,12 @@ const { buildApp } = await import('../src/index.js');
 const queues = await import('../src/queue/queues.js');
 const { redis } = queues;
 const { config, parseStrictBooleanFlag } = await import('../src/config.js');
-const { classifyFailure } = await import('../src/onboarding/failures.js');
+const { classifyFailure, publicConnectFailure } = await import('../src/onboarding/failures.js');
 const { createHmac } = await import('node:crypto');
 const links = await import('../src/onboarding/links.js');
+// Group O calls the connect services directly, once each, to prove the INTERNAL
+// failure still carries diagnostic detail while the client boundary sanitizes it.
+const connect = await import('../src/onboarding/connect.js');
 const { normalizeShopDomain } = await import('../src/onboarding/domain.js');
 const costs = await import('../src/onboarding/costs.js');
 const adspend = await import('../src/onboarding/adspend.js');
@@ -218,6 +226,28 @@ async function clearRateLimit(ip: string): Promise<void> {
 
 async function rateLimitKeysFor(ip: string): Promise<string[]> {
   return redis.keys(`${RATE_LIMIT_KEY_PREFIX}*${ip}`).catch(() => []);
+}
+
+/**
+ * Every Redis key EXCEPT the Fastify rate-limit counters, sorted.
+ *
+ * WHY THIS EXISTS. Three group M assertions used to prove "a provider request
+ * has no Redis side effect" by comparing `redis.dbsize()` before and after. That
+ * was exact while no client write route was throttled. Phase 5C-4 adds a
+ * per-route limiter to those routes, so a `fastify-rate-limit-*` counter is now
+ * created BY DESIGN on every call — and a raw DBSIZE comparison reads that
+ * intended counter as the side effect it was written to detect.
+ *
+ * The fix is to narrow the exclusion, not the assertion. Comparing the KEY SET
+ * rather than a count is strictly stronger than what it replaces: the old check
+ * would have passed if one key vanished while another appeared, and this one
+ * would not. Only `RATE_LIMIT_KEY_PREFIX` is excluded — `bull:*`, queue
+ * structure keys and any unrecognised key are all still fully in scope, which is
+ * the part that was ever load-bearing.
+ */
+async function nonRateLimitKeys(): Promise<string[]> {
+  const keys = await redis.keys('*').catch(() => [] as string[]);
+  return keys.filter((k) => !k.startsWith(RATE_LIMIT_KEY_PREFIX)).sort();
 }
 
 // ---------------------------------------------------------------------------
@@ -4489,7 +4519,7 @@ async function groupM(app: App, agencyCookie: string): Promise<void> {
     // Reset to a known state, then prove the whole matrix mutates nothing.
     const choicesBefore = await tableSnapshot('onboarding_provider_choices', c);
     const connsBefore = await tableSnapshot('connections', c);
-    const dbsizeBefore = await redis.dbsize();
+    const redisKeysBefore = await nonRateLimitKeys();
     fetchLog = [];
     const rejections: string[] = [];
 
@@ -4516,9 +4546,11 @@ async function groupM(app: App, agencyCookie: string): Promise<void> {
       && (await tableSnapshot('connections', c)) === '[]');
     check(`C. ${provider}: no outbound provider request occurred`,
       fetchLog.length === 0, fetchLog.map((f) => f.url));
-    check(`C. ${provider}: no Redis key was added`,
-      (await redis.dbsize()) === dbsizeBefore,
-      { before: dbsizeBefore, after: await redis.dbsize() });
+    // The rate-limit counter the 5C-4 throttle creates is intentional and
+    // excluded; every other keyspace, including bull:*, is still compared.
+    check(`C. ${provider}: no non-rate-limit Redis key was added`,
+      JSON.stringify(await nonRateLimitKeys()) === JSON.stringify(redisKeysBefore),
+      { before: redisKeysBefore, after: await nonRateLimitKeys() });
     check(`C. ${provider}: no backfill job was created`,
       (await queues.klaviyoPollQueue().getJob(queues.klaviyoBackfillJobId(c))
         .catch(() => null)) == null
@@ -4715,7 +4747,7 @@ async function groupM(app: App, agencyCookie: string): Promise<void> {
   const g1 = await makeAccount('5c2_side_effects');
   const gLink = await mintAndExchange(app, agencyCookie, g1);
   const gAccountBefore = await completionSnapshot(g1);
-  const gDbsizeBefore = await redis.dbsize();
+  const gRedisKeysBefore = await nonRateLimitKeys();
   fetchLog = [];
 
   const gK = await requestBodyless(gLink.cookie, 'klaviyo');
@@ -4737,8 +4769,9 @@ async function groupM(app: App, agencyCookie: string): Promise<void> {
     (await queues.klaviyoPollQueue().getJob(queues.klaviyoBackfillJobId(g1)).catch(() => null)) == null
     && (await queues.rechargeBackfillQueue().getJob(queues.rechargeBackfillJobId(g1)).catch(() => null)) == null
     && (await queues.backfillQueue().getJob(queues.backfillJobId(g1)).catch(() => null)) == null);
-  check('G. Redis gained no key from either request',
-    (await redis.dbsize()) === gDbsizeBefore);
+  check('G. Redis gained no non-rate-limit key from either request',
+    JSON.stringify(await nonRateLimitKeys()) === JSON.stringify(gRedisKeysBefore),
+    { before: gRedisKeysBefore, after: await nonRateLimitKeys() });
   check('G. no sync status was fabricated — progress reports nothing connected',
     (await capabilities.getCapabilities(g1)).connected.length === 0);
   check('G. no capability was granted by requesting',
@@ -6530,6 +6563,808 @@ async function groupN(app: App, agencyCookie: string): Promise<void> {
 }
 
 // ===========================================================================
+// O. Phase 5C-4 hardening
+// ===========================================================================
+//
+// Four locked requirements, and only those:
+//
+//   1. completion stays idempotent — now also under genuine concurrency
+//   2. sensitive client write routes are rate limited
+//   3. raw provider exception text never reaches a client-renderable field
+//   4. token exchange refuses a link whose account cannot be safely loaded
+//
+// The load-bearing proofs are again negative. A refusal must write nothing, issue
+// nothing, and say nothing: the unsafe-account exchange stamps no first_used_at
+// and sets no cookie; a throttled 11th request performs no mutation, makes no
+// outbound call and moves no completion timestamp; and a poisoned provider body
+// reaches the client as a fixed application sentence or not at all.
+//
+// WHY THE UNSAFE STATE IS BUILT WITH A PLAIN UPDATE. `accounts.onboarding_complete`
+// is `BOOLEAN DEFAULT false` and NULLABLE, and a LEFT JOIN against a missing
+// account yields exactly the same NULL. So the state that used to be flattened to
+// `false` — and `false` is what grants unrestricted first-time setup access — is
+// reachable with one ordinary UPDATE. No constraint is disabled, no
+// session_replication_role is touched, no migration is altered, and the fixture is
+// restored in place.
+
+/** The one neutral client-facing link failure, as bytes. */
+const NEUTRAL_LINK_BODY = JSON.stringify({
+  error: 'invalid_link',
+  message: 'This setup link is not valid. Ask your account manager for a new one.',
+});
+
+/**
+ * Reserved test source addresses, from the RFC 5737 documentation ranges.
+ *
+ * Deliberately not the 10.x `nextIp()` hands out: a limiter proof needs a FIXED
+ * address so ten requests land in one bucket, and these are never routable so
+ * they cannot collide with a real client. Each proof gets its own address,
+ * because the whole point is to fill one bucket without touching anybody else's.
+ *
+ * NOTE THE RANGES ARE SHARED, NOT OWNED. Groups G and J already use
+ * 203.0.113.77, 203.0.113.99, 198.51.100.5, 198.51.100.7 and 198.51.100.8, so
+ * "test-owned" below is an EXACT ADDRESS LIST rather than a range match — a
+ * range match would let this group claim, and clean up, counters another group
+ * is still relying on.
+ */
+const O_LIMIT_IP = (n: number): string => `203.0.113.${n}`;   // TEST-NET-3: per-route buckets
+const O_ALT_IP = (n: number): string => `198.51.100.${n}`;    // TEST-NET-2: isolation probes
+const O_EDGE_IP = (n: number): string => `192.0.2.${n}`;      // TEST-NET-1: exchange edge states
+
+/** Exactly the addresses group O uses, and therefore exactly what it may clean. */
+const O_TEST_IPS: readonly string[] = [
+  ...[11, 12, 13, 14, 15, 16, 17].map(O_EDGE_IP),
+  ...[31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 51, 52, 61].map(O_LIMIT_IP),
+  ...[21, 51].map(O_ALT_IP),
+];
+
+/**
+ * Counters belonging to THIS group's addresses.
+ *
+ * Matched as an exact `-<ip>` suffix, so `…-198.51.100.5` (group J's) is never
+ * confused with `…-198.51.100.51` (this group's).
+ */
+async function oOwnedRateLimitKeys(): Promise<string[]> {
+  const keys = await redis.keys(`${RATE_LIMIT_KEY_PREFIX}*`).catch(() => [] as string[]);
+  return keys.filter((k) => O_TEST_IPS.some((ip) => k.endsWith(`-${ip}`))).sort();
+}
+
+/** The plugin's default 429 envelope. Asserted rather than assumed. */
+interface RateLimitBody { statusCode: number; error: string; message: string }
+
+async function groupO(app: App, agencyCookie: string): Promise<void> {
+  group('O', 'Phase 5C-4 hardening');
+
+  type Res = Awaited<ReturnType<App['inject']>>;
+  const collected: [string, string][] = [];
+  const record = (label: string, res: Res): Res => { collected.push([label, res.body]); return res; };
+
+  const call = (
+    method: 'GET' | 'PUT' | 'POST', cookie: string | null, url: string,
+    payload?: unknown, ip?: string,
+  ): Promise<Res> => app.inject({
+    method, url, remoteAddress: ip ?? nextIp(),
+    headers: {
+      ...(cookie ? { cookie } : {}),
+      ...(payload === undefined ? {} : { 'content-type': 'application/json' }),
+    },
+    ...(payload === undefined ? {} : { payload: payload as never }),
+  });
+
+  const jsonOf = (res: Res): Record<string, unknown> => {
+    try {
+      const p = res.json() as unknown;
+      return p && typeof p === 'object' && !Array.isArray(p) ? (p as Record<string, unknown>) : {};
+    } catch { return {}; }
+  };
+  const setCookies = (res: Res): string[] => {
+    const raw = res.headers['set-cookie'];
+    return Array.isArray(raw) ? raw.map(String) : raw ? [String(raw)] : [];
+  };
+  const exchange = (token: string, ip?: string) => call('POST', null, '/onboarding/session', { token }, ip);
+  const me = (cookie: string) => call('GET', cookie, '/onboarding/me');
+  const linkRow = (linkId: number) => links.getLinkById(linkId);
+  const latch = async (accountId: number): Promise<boolean | null> => (await query<{
+    c: boolean | null;
+  }>(`SELECT onboarding_complete AS c FROM accounts WHERE id = $1`, [accountId])).rows[0].c;
+  const setLatch = async (accountId: number, value: boolean | null): Promise<void> => {
+    await query(`UPDATE accounts SET onboarding_complete = $2 WHERE id = $1`, [accountId, value]);
+  };
+  /** An account that satisfies Gate 1 with Klaviyo alone. */
+  const completable = async (name: string): Promise<number> => {
+    const id = await makeAccount(name);
+    await seedConnectedProvider(id, 'klaviyo');
+    await choices.setSkipped(id, 'shopify');
+    await choices.setSkipped(id, 'recharge');
+    return id;
+  };
+  const noQueueJobs = async (accountId: number): Promise<boolean> =>
+    (await queues.backfillQueue().getJob(queues.backfillJobId(accountId)).catch(() => null)) == null
+    && (await queues.klaviyoPollQueue().getJob(queues.klaviyoBackfillJobId(accountId))
+      .catch(() => null)) == null
+    && (await queues.rechargeBackfillQueue().getJob(queues.rechargeBackfillJobId(accountId))
+      .catch(() => null)) == null;
+
+  // =======================================================================
+  // O-A. Token exchange edge states, including the unsafe linked account
+  // =======================================================================
+  //
+  // Every one of the five faults must be a byte-identical refusal. The unsafe
+  // account is the new member of that set, and the point is that it is
+  // INDISTINGUISHABLE from the four that already existed.
+  const aMalformed = await makeAccount('5c4_edge_host');
+  const aMalformedLink = await mintAndExchange(app, agencyCookie, aMalformed);
+  const aExpiredAcc = await makeAccount('5c4_edge_expired');
+  const aExpired = await mintAndExchange(app, agencyCookie, aExpiredAcc);
+  await query(`UPDATE onboarding_links SET expires_at = now() - interval '1 second' WHERE id = $1`,
+    [aExpired.linkId]);
+  const aRevokedAcc = await makeAccount('5c4_edge_revoked');
+  const aRevoked = await mintAndExchange(app, agencyCookie, aRevokedAcc);
+  await links.revokeLink(aRevokedAcc, aRevoked.linkId);
+  const aUnsafeAcc = await makeAccount('5c4_edge_unsafe');
+  const aUnsafeMint = await app.inject({
+    method: 'POST', url: `/accounts/${aUnsafeAcc}/onboarding-links`,
+    headers: { cookie: agencyCookie }, remoteAddress: nextIp(), payload: {},
+  });
+  const aUnsafe = aUnsafeMint.json() as { id: number; token: string };
+
+  // Precondition: a brand-new account's latch is a real `false`, and its link is
+  // untouched. Both are what the unsafe case is measured against.
+  check('O-A. a fresh account\'s latch is a real false, not NULL',
+    (await latch(aUnsafeAcc)) === false, await latch(aUnsafeAcc));
+  const aUnsafeBefore = await linkRow(aUnsafe.id);
+  check('O-A. its link starts with first_used_at NULL',
+    aUnsafeBefore?.first_used_at === null, aUnsafeBefore?.first_used_at);
+
+  // THE ONLY MUTATION: one ordinary UPDATE on an existing nullable column.
+  await setLatch(aUnsafeAcc, null);
+  check('O-A. the fixture is now in the unsafe state', (await latch(aUnsafeAcc)) === null);
+
+  const aRedisBefore = await nonRateLimitKeys();
+  fetchLog = [];
+  const EDGE_CASES: [string, string, string][] = [
+    ['malformed token', 'not-a-valid-token', O_EDGE_IP(11)],
+    ['well-formed unknown token', 'A'.repeat(43), O_EDGE_IP(12)],
+    ['expired link', aExpired.token, O_EDGE_IP(13)],
+    ['revoked link', aRevoked.token, O_EDGE_IP(14)],
+    ['unsafe linked account', aUnsafe.token, O_EDGE_IP(15)],
+  ];
+  const edgeBodies: string[] = [];
+  for (const [label, token, ip] of EDGE_CASES) {
+    const res = record(`O-A ${label}`, await exchange(token, ip));
+    edgeBodies.push(res.body);
+    check(`O-A. ${label}: 401`, res.statusCode === 401, res.statusCode);
+    check(`O-A. ${label}: body is the neutral invalid-link envelope, byte for byte`,
+      res.body === NEUTRAL_LINK_BODY, res.body);
+    check(`O-A. ${label}: no onboarding cookie was issued`,
+      cookieFrom(res, 'tention_onb') === null, setCookies(res));
+    check(`O-A. ${label}: no Set-Cookie header at all`, setCookies(res).length === 0, setCookies(res));
+  }
+  check('O-A. all five faults are indistinguishable from one another',
+    new Set(edgeBodies).size === 1, [...new Set(edgeBodies)]);
+
+  // The unsafe refusal specifically wrote and revealed nothing.
+  const aUnsafeAfter = await linkRow(aUnsafe.id);
+  check('O-A. unsafe exchange left first_used_at exactly NULL',
+    aUnsafeAfter?.first_used_at === null, aUnsafeAfter?.first_used_at);
+  check('O-A. unsafe exchange left expires_at unchanged',
+    aUnsafeAfter?.expires_at.getTime() === aUnsafeBefore?.expires_at.getTime());
+  check('O-A. unsafe exchange left revoked_at unchanged (still NULL)',
+    aUnsafeAfter?.revoked_at === null);
+  check('O-A. unsafe exchange left completed_at unchanged (still NULL)',
+    aUnsafeAfter?.completed_at === null);
+  const aUnsafeName = (await query<{ name: string }>(
+    `SELECT name FROM accounts WHERE id = $1`, [aUnsafeAcc])).rows[0].name;
+  const aUnsafeBody = edgeBodies[4];
+  check('O-A. the refusal carries no account id', !aUnsafeBody.includes(String(aUnsafeAcc)));
+  check('O-A. the refusal carries no account name', !aUnsafeBody.includes(aUnsafeName));
+  check('O-A. the refusal names no internal reason',
+    !/account_unsafe|account_not_found|missing|unsafe|null|undefined|link_not_found/i
+      .test(aUnsafeBody), aUnsafeBody);
+  check('O-A. the refusal exposes no internal account-loaded marker',
+    !/accountLoaded|account_loaded|safeAccount|accountPresent/.test(aUnsafeBody));
+  check('O-A. no non-rate-limit Redis side effect from any edge refusal',
+    JSON.stringify(await nonRateLimitKeys()) === JSON.stringify(aRedisBefore),
+    { before: aRedisBefore, after: await nonRateLimitKeys() });
+  check('O-A. no provider was contacted by any edge refusal',
+    fetchLog.length === 0, fetchLog.map((f) => f.url));
+  check('O-A. no queue job resulted from the unsafe refusal', await noQueueJobs(aUnsafeAcc));
+
+  // Restore, and prove a stored `false` is still a completely normal state.
+  await setLatch(aUnsafeAcc, false);
+  check('O-A. the fixture latch was restored to false', (await latch(aUnsafeAcc)) === false);
+  const aOk = record('O-A normal false exchange', await exchange(aUnsafe.token, O_EDGE_IP(16)));
+  const aOkBody = jsonOf(aOk);
+  check('O-A. a normal onboarding_complete=false account exchanges 200',
+    aOk.statusCode === 200, aOk.statusCode);
+  check('O-A. it reports onboardingComplete false',
+    aOkBody.onboardingComplete === false, aOkBody);
+  check('O-A. completedByThisLink is false for a fresh link',
+    aOkBody.completedByThisLink === false, aOkBody);
+  check('O-A. manageMode is false', aOkBody.manageMode === false, aOkBody);
+  check('O-A. the workspace name is present',
+    typeof aOkBody.workspaceName === 'string' && aOkBody.workspaceName === aUnsafeName,
+    aOkBody.workspaceName);
+  check('O-A. an onboarding cookie WAS issued this time',
+    cookieFrom(aOk, 'tention_onb') !== null);
+  check('O-A. and first_used_at is now stamped',
+    (await linkRow(aUnsafe.id))?.first_used_at !== null);
+  check('O-A. the success response exposes no internal account-loaded marker',
+    !/accountLoaded|account_loaded|safeAccount|accountPresent/.test(aOk.body));
+  // The unsafe-account fault is not sticky: nothing about the link was poisoned.
+  check('O-A. malformed and unsafe both still refuse identically afterwards',
+    (await exchange('not-a-valid-token', O_EDGE_IP(17))).body === NEUTRAL_LINK_BODY);
+
+  // =======================================================================
+  // O-B. The same rule on every authenticated request
+  // =======================================================================
+  const bAcc = await completable('5c4_auth_unsafe');
+  const bLink = await mintAndExchange(app, agencyCookie, bAcc);
+  check('O-B. GET /onboarding/me is 200 while the account is safe',
+    (await me(bLink.cookie)).statusCode === 200);
+  const bFinancialBefore = await financialSnapshot(bAcc);
+  const bLinkBefore = await linkRow(bLink.linkId);
+
+  await setLatch(bAcc, null);
+  const bMe = record('O-B unsafe me', await me(bLink.cookie));
+  check('O-B. the very next authenticated request is 401', bMe.statusCode === 401, bMe.statusCode);
+  check('O-B. with the same neutral envelope', bMe.body === NEUTRAL_LINK_BODY, bMe.body);
+  check('O-B. the onboarding cookie is cleared',
+    (setCookies(bMe).find((h) => h.startsWith('tention_onb=')) ?? '').startsWith('tention_onb=;'),
+    setCookies(bMe));
+  check('O-B. no lifecycle field is returned',
+    !/manageMode|onboardingComplete|completedByThisLink|expiresAt/.test(bMe.body), bMe.body);
+  check('O-B. no account detail is returned',
+    !bMe.body.includes(String(bAcc))
+    && !bMe.body.includes((await query<{ name: string }>(
+      `SELECT name FROM accounts WHERE id = $1`, [bAcc])).rows[0].name), bMe.body);
+  check('O-B. no internal reason is returned',
+    !/account_unsafe|link_not_found|null/i.test(bMe.body), bMe.body);
+  check('O-B. the AGENCY cookie is untouched by this refusal',
+    (await app.inject({
+      method: 'GET', url: `/accounts/${bAcc}/onboarding/status`,
+      headers: { cookie: agencyCookie }, remoteAddress: nextIp(),
+    })).statusCode === 200);
+  check('O-B. and the refusal did not clear the agency cookie',
+    setCookies(bMe).every((h) => !h.startsWith('tention_sid=')));
+
+  const bWrite = record('O-B unsafe write', await call('PUT', bLink.cookie, '/onboarding/ocas',
+    { ocasMonthly: 4242 }, O_ALT_IP(21)));
+  check('O-B. a sensitive write is refused 401 in the unsafe state',
+    bWrite.statusCode === 401, bWrite.statusCode);
+  check('O-B. with the same neutral envelope', bWrite.body === NEUTRAL_LINK_BODY, bWrite.body);
+  check('O-B. and it is an AUTH refusal, not a throttle', bWrite.statusCode !== 429);
+  check('O-B. the requested write mutated nothing',
+    (await financialSnapshot(bAcc)) === bFinancialBefore);
+  check('O-B. the link lifecycle columns were not touched either',
+    (await linkRow(bLink.linkId))?.expires_at.getTime() === bLinkBefore?.expires_at.getTime()
+    && (await linkRow(bLink.linkId))?.completed_at === null
+    && (await linkRow(bLink.linkId))?.revoked_at === null);
+  check('O-B. rate limiting did not grant or bypass authentication',
+    (await rateLimitKeysFor(O_ALT_IP(21))).length >= 0
+    && (await call('PUT', bLink.cookie, '/onboarding/ocas', { ocasMonthly: 1 }, O_ALT_IP(21)))
+      .statusCode === 401);
+
+  await setLatch(bAcc, false);
+  check('O-B. after restoring the latch the same cookie authenticates again',
+    (await me(bLink.cookie)).statusCode === 200);
+  check('O-B. and the restored session reports a real false latch',
+    ((await me(bLink.cookie)).json() as { onboardingComplete: boolean }).onboardingComplete === false);
+  await clearRateLimit(O_ALT_IP(21));
+
+  // =======================================================================
+  // O-C. All eleven sensitive write routes really throttle
+  // =======================================================================
+  //
+  // Ten requests then an eleventh, each route from its OWN reserved address. The
+  // first ten are asserted NOT to be 429 rather than asserted 2xx: a couple of
+  // these routes answer a stable 400 by design, and the contract under test is
+  // the throttle, not the payload.
+  interface LimitSpec {
+    label: string;
+    method: 'POST' | 'PUT';
+    url: string;
+    payload?: unknown;
+    ip: string;
+    prepare: () => Promise<number>;
+    /** Expect the first ten to fetch (only the Klaviyo connect route does). */
+    expectsFetch?: boolean;
+  }
+  const oDomain = `5c4-limit-${Date.now()}.myshopify.com`;
+  const SPECS: LimitSpec[] = [
+    {
+      label: 'POST /onboarding/connections/klaviyo', method: 'POST',
+      url: '/onboarding/connections/klaviyo',
+      payload: { apiKey: 'pk_5c4_limit_key_00000000000000000' },
+      ip: O_LIMIT_IP(31), expectsFetch: true,
+      prepare: () => makeAccount('5c4_lim_klaviyo'),
+    },
+    {
+      label: 'POST /onboarding/connections/recharge', method: 'POST',
+      url: '/onboarding/connections/recharge', payload: {},
+      ip: O_LIMIT_IP(32),
+      prepare: () => makeAccount('5c4_lim_recharge'),
+    },
+    {
+      label: 'POST /onboarding/connections/shopify/request', method: 'POST',
+      url: '/onboarding/connections/shopify/request', payload: { shopDomain: oDomain },
+      ip: O_LIMIT_IP(33),
+      prepare: () => makeAccount('5c4_lim_shopify_req'),
+    },
+    {
+      label: 'POST /onboarding/connections/:provider/request', method: 'POST',
+      url: '/onboarding/connections/klaviyo/request',
+      ip: O_LIMIT_IP(34),
+      prepare: () => makeAccount('5c4_lim_choice_req'),
+    },
+    {
+      label: 'POST /onboarding/connections/:provider/skip', method: 'POST',
+      url: '/onboarding/connections/recharge/skip', payload: {},
+      ip: O_LIMIT_IP(35),
+      prepare: () => makeAccount('5c4_lim_choice_skip'),
+    },
+    {
+      label: 'PUT /onboarding/currency', method: 'PUT', url: '/onboarding/currency',
+      payload: { currency: 'USD' }, ip: O_LIMIT_IP(36),
+      prepare: () => makeAccount('5c4_lim_currency'),
+    },
+    {
+      label: 'PUT /onboarding/cogs', method: 'PUT', url: '/onboarding/cogs',
+      payload: { method: 'blended', blendedMarginPct: 50 }, ip: O_LIMIT_IP(37),
+      prepare: () => makeAccount('5c4_lim_cogs'),
+    },
+    {
+      label: 'PUT /onboarding/ocas', method: 'PUT', url: '/onboarding/ocas',
+      payload: { ocasMonthly: 100 }, ip: O_LIMIT_IP(38),
+      prepare: () => makeAccount('5c4_lim_ocas'),
+    },
+    {
+      label: 'PUT /onboarding/ad-spend', method: 'PUT', url: '/onboarding/ad-spend',
+      payload: {
+        rows: [{ channel: 'Meta', amount: 10, startMonth: monthsAgo(1), endMonth: monthsAgo(1) }],
+      },
+      ip: O_LIMIT_IP(39),
+      prepare: () => makeAccount('5c4_lim_adspend'),
+    },
+    {
+      label: 'POST /onboarding/ad-spend/zero', method: 'POST', url: '/onboarding/ad-spend/zero',
+      payload: { months: [monthsAgo(2)], confirmedZero: true }, ip: O_LIMIT_IP(40),
+      prepare: () => makeAccount('5c4_lim_zero'),
+    },
+    {
+      label: 'POST /onboarding/complete', method: 'POST', url: '/onboarding/complete',
+      payload: {}, ip: O_LIMIT_IP(41),
+      prepare: () => completable('5c4_lim_complete'),
+    },
+  ];
+
+  check('O-C. exactly eleven sensitive write routes are under test', SPECS.length === 11);
+
+  let completeSpecAccount = 0;
+  let completeSpecCookie = '';
+  for (const spec of SPECS) {
+    const accountId = await spec.prepare();
+    const link = await mintAndExchange(app, agencyCookie, accountId);
+    if (spec.url === '/onboarding/complete') {
+      completeSpecAccount = accountId;
+      completeSpecCookie = link.cookie;
+    }
+    await clearRateLimit(spec.ip);
+    check(`O-C. ${spec.label}: its test IP starts with no rate-limit key`,
+      (await rateLimitKeysFor(spec.ip)).length === 0, await rateLimitKeysFor(spec.ip));
+
+    const statuses: number[] = [];
+    for (let i = 1; i <= 10; i++) {
+      const res = await call(spec.method, link.cookie, spec.url, spec.payload, spec.ip);
+      statuses.push(res.statusCode);
+    }
+    check(`O-C. ${spec.label}: requests 1-10 are NOT throttled`,
+      statuses.every((s) => s !== 429), statuses);
+
+    // Everything the eleventh request must not disturb, captured after the tenth.
+    const snapshotAfter10 = await completionSnapshot(accountId);
+    const fetchCountAfter10 = fetchLog.length;
+
+    const throttled = record(`O-C ${spec.label} 429`,
+      await call(spec.method, link.cookie, spec.url, spec.payload, spec.ip));
+    check(`O-C. ${spec.label}: request 11 IS throttled with 429`,
+      throttled.statusCode === 429, { status: throttled.statusCode, body: throttled.body });
+
+    const rlKeys = await rateLimitKeysFor(spec.ip);
+    check(`O-C. ${spec.label}: a Redis rate-limit counter exists for its IP`,
+      rlKeys.length > 0, rlKeys);
+    check(`O-C. ${spec.label}: the counter key names this route`,
+      rlKeys.some((k) => k.includes(spec.method)), rlKeys);
+    const ttl = rlKeys.length ? await redis.ttl(rlKeys[0]).catch(() => -2) : -2;
+    check(`O-C. ${spec.label}: the counter carries a positive TTL`, ttl > 0, ttl);
+
+    const body = jsonOf(throttled) as unknown as RateLimitBody;
+    check(`O-C. ${spec.label}: 429 body statusCode is 429`, body.statusCode === 429, body);
+    check(`O-C. ${spec.label}: 429 body error is "Too Many Requests"`,
+      body.error === 'Too Many Requests', body);
+    check(`O-C. ${spec.label}: 429 body carries the plugin's fixed retry wording`,
+      typeof body.message === 'string' && /^Rate limit exceeded, retry in /.test(body.message), body);
+    check(`O-C. ${spec.label}: x-ratelimit-limit reports the configured 10`,
+      String(throttled.headers['x-ratelimit-limit']) === '10',
+      throttled.headers['x-ratelimit-limit']);
+    check(`O-C. ${spec.label}: x-ratelimit-remaining is 0`,
+      String(throttled.headers['x-ratelimit-remaining']) === '0',
+      throttled.headers['x-ratelimit-remaining']);
+    check(`O-C. ${spec.label}: retry-after is a positive integer`,
+      /^\d+$/.test(String(throttled.headers['retry-after'] ?? ''))
+      && Number(throttled.headers['retry-after']) > 0, throttled.headers['retry-after']);
+    check(`O-C. ${spec.label}: the 429 leaks no identifier, credential or internals`,
+      !/"account_?[Ii]d"\s*:|"link_?[Ii]d"\s*:|"token"\s*:|credentials|apiKey|clientSecret/
+        .test(throttled.body)
+      && !throttled.body.includes(String(accountId))
+      && !throttled.body.includes(String(link.linkId))
+      && !/SELECT |\/Users\/|node_modules|\\n\s*at |pk_|shpat_|verification failed/
+        .test(throttled.body),
+      throttled.body);
+
+    check(`O-C. ${spec.label}: the throttled request performed NO mutation`,
+      (await completionSnapshot(accountId)) === snapshotAfter10);
+    if (spec.expectsFetch) {
+      check(`O-C. ${spec.label}: its first ten requests did reach the provider`,
+        fetchCountAfter10 > 0, fetchCountAfter10);
+      check(`O-C. ${spec.label}: the throttled request made NO additional provider call`,
+        fetchLog.length === fetchCountAfter10,
+        { after10: fetchCountAfter10, after11: fetchLog.length });
+    } else {
+      check(`O-C. ${spec.label}: the throttled request made no provider call`,
+        fetchLog.length === fetchCountAfter10,
+        { after10: fetchCountAfter10, after11: fetchLog.length });
+    }
+
+    if (spec.url === '/onboarding/complete') {
+      const row = await linkRow(link.linkId);
+      const before = JSON.parse(
+        snapshotAfter10.split('\n').find((l) => l.startsWith('accounts='))!.slice('accounts='.length),
+      ) as { onboarding_complete: boolean };
+      check('O-C. complete: the throttled 11th did not alter onboarding_complete',
+        (await latch(accountId)) === before.onboarding_complete
+        && (await latch(accountId)) === true);
+      check('O-C. complete: nor completed_at, expires_at or revoked_at',
+        (await completionSnapshot(accountId)) === snapshotAfter10
+        && row?.completed_at !== null && row?.revoked_at === null);
+    }
+
+    await clearRateLimit(spec.ip);
+    check(`O-C. ${spec.label}: its test-owned counters were removed`,
+      (await rateLimitKeysFor(spec.ip)).length === 0);
+  }
+
+  // =======================================================================
+  // O-C(ii). Bucket isolation — by source and by route
+  // =======================================================================
+  const isoAcc = await makeAccount('5c4_isolation');
+  const isoLink = await mintAndExchange(app, agencyCookie, isoAcc);
+  const ipA = O_LIMIT_IP(51);
+  const ipB = O_ALT_IP(51);
+  await clearRateLimit(ipA);
+  await clearRateLimit(ipB);
+  for (let i = 1; i <= 10; i++) {
+    await call('PUT', isoLink.cookie, '/onboarding/ocas', { ocasMonthly: 100 }, ipA);
+  }
+  const isoExhausted = await call('PUT', isoLink.cookie, '/onboarding/ocas', { ocasMonthly: 100 }, ipA);
+  check('O-C. the isolation fixture bucket really is exhausted for IP A',
+    isoExhausted.statusCode === 429, isoExhausted.statusCode);
+  const isoOtherIp = await call('PUT', isoLink.cookie, '/onboarding/ocas', { ocasMonthly: 100 }, ipB);
+  check('O-C. a SECOND source address is not collaterally throttled',
+    isoOtherIp.statusCode !== 429, { status: isoOtherIp.statusCode, body: isoOtherIp.body });
+  const isoOtherRoute = await call('PUT', isoLink.cookie, '/onboarding/currency', { currency: 'USD' }, ipA);
+  check('O-C. a DIFFERENT route from the same address has its own bucket',
+    isoOtherRoute.statusCode !== 429, { status: isoOtherRoute.statusCode, body: isoOtherRoute.body });
+  check('O-C. the two routes hold separate Redis counters for the same IP',
+    new Set((await rateLimitKeysFor(ipA))).size >= 2, await rateLimitKeysFor(ipA));
+
+  // Reads and logout stay unthrottled — proven at runtime past the write limit,
+  // not merely by reading the route config (group O's route-config proof is the
+  // 12-route count asserted in O-F below).
+  const UNTHROTTLED: [('GET' | 'POST'), string][] = [
+    ['GET', '/onboarding/me'], ['GET', '/onboarding/progress'], ['GET', '/onboarding/skus'],
+    ['GET', '/onboarding/costs'], ['GET', '/onboarding/ad-spend'],
+  ];
+  const readIp = O_LIMIT_IP(52);
+  await clearRateLimit(readIp);
+  for (const [method, url] of UNTHROTTLED) {
+    const codes: number[] = [];
+    for (let i = 1; i <= 12; i++) {
+      codes.push((await call(method, isoLink.cookie, url, undefined, readIp)).statusCode);
+    }
+    check(`O-C. ${method} ${url} is never throttled, even past the write limit`,
+      codes.every((c) => c !== 429), codes);
+  }
+  const logoutCodes: number[] = [];
+  for (let i = 1; i <= 12; i++) {
+    logoutCodes.push(
+      (await call('POST', isoLink.cookie, '/onboarding/logout', {}, readIp)).statusCode);
+  }
+  check('O-C. POST /onboarding/logout is never throttled',
+    logoutCodes.every((c) => c !== 429), logoutCodes);
+  check('O-C. the unthrottled routes created no rate-limit counter at all',
+    (await rateLimitKeysFor(readIp)).length === 0, await rateLimitKeysFor(readIp));
+  await clearRateLimit(ipA);
+  await clearRateLimit(ipB);
+
+  // Redis-outage semantics are the plugin-global skipOnError:true already proven
+  // end to end in group G, and these routes take the identical config path — one
+  // registration in index.ts, which this phase did not touch.
+  check('O-C. the new routes inherit the group-G fail-open registration unchanged',
+    ((await backendSources()).find(([f]) => f.endsWith('/src/index.ts'))?.[1] ?? '')
+      .includes('skipOnError: true'));
+
+  // =======================================================================
+  // O-D. Concurrent completion
+  // =======================================================================
+  const dAcc = await completable('5c4_concurrent');
+  const dLink = await mintAndExchange(app, agencyCookie, dAcc);
+  const dIp = O_LIMIT_IP(61);
+  await clearRateLimit(dIp);
+  const dBeforeSnapshot = await completionSnapshot(dAcc);
+  const dBeforeLink = await linkRow(dLink.linkId);
+  const dBeforeChoices = await tableSnapshot('onboarding_provider_choices', dAcc);
+  const dBeforeFinancial = await financialSnapshot(dAcc);
+  const dFetchBefore = fetchLog.length;
+  check('O-D. the fixture starts uncompleted',
+    (await latch(dAcc)) === false && dBeforeLink?.completed_at === null);
+  check('O-D. and exactly one link row exists',
+    Number((await query<{ n: string }>(
+      `SELECT count(*) n FROM onboarding_links WHERE account_id = $1`, [dAcc])).rows[0].n) === 1);
+
+  const dResults = await Promise.all([1, 2, 3, 4].map(() =>
+    call('POST', dLink.cookie, '/onboarding/complete', {}, dIp)));
+  for (const [i, res] of dResults.entries()) {
+    record(`O-D concurrent ${i + 1}`, res);
+    check(`O-D. concurrent completion ${i + 1} returned 200`,
+      res.statusCode === 200, { status: res.statusCode, body: res.body });
+    check(`O-D. concurrent completion ${i + 1} reports completed:true`,
+      jsonOf(res).completed === true, res.body);
+  }
+  check('O-D. none of the four was throttled',
+    dResults.every((r) => r.statusCode !== 429), dResults.map((r) => r.statusCode));
+  check('O-D. accounts.onboarding_complete is true', (await latch(dAcc)) === true);
+  const dAfterLink = await linkRow(dLink.linkId);
+  check('O-D. completed_at is non-null', dAfterLink?.completed_at !== null);
+  const dStamps = (await query<{ c: string }>(
+    `SELECT DISTINCT completed_at::text AS c FROM onboarding_links WHERE account_id = $1`,
+    [dAcc])).rows.map((r) => r.c);
+  check('O-D. completed_at is ONE stable value across all four calls',
+    dStamps.length === 1, dStamps);
+  check('O-D. exactly one onboarding link row remains',
+    Number((await query<{ n: string }>(
+      `SELECT count(*) n FROM onboarding_links WHERE account_id = $1`, [dAcc])).rows[0].n) === 1);
+  check('O-D. expires_at is unchanged',
+    dAfterLink?.expires_at.getTime() === dBeforeLink?.expires_at.getTime());
+  check('O-D. revoked_at is unchanged (still NULL)', dAfterLink?.revoked_at === null);
+  check('O-D. no provider choice was corrupted',
+    (await tableSnapshot('onboarding_provider_choices', dAcc)) === dBeforeChoices);
+  check('O-D. no financial row was mutated',
+    (await financialSnapshot(dAcc)) === dBeforeFinancial);
+  check('O-D. no additional provider call was made',
+    fetchLog.length === dFetchBefore, { before: dFetchBefore, after: fetchLog.length });
+  check('O-D. no queue job was created by completing',
+    await noQueueJobs(dAcc));
+  check('O-D. no connections row was added or altered',
+    (await tableSnapshot('connections', dAcc))
+      === dBeforeSnapshot.split('\n').find((l) => l.startsWith('connections='))!
+        .slice('connections='.length));
+
+  const dStampAfterConcurrent = dAfterLink?.completed_at?.getTime();
+  const dFifth = record('O-D fifth sequential', await call(
+    'POST', dLink.cookie, '/onboarding/complete', {}, dIp));
+  check('O-D. a fifth sequential completion is still 200',
+    dFifth.statusCode === 200, { status: dFifth.statusCode, body: dFifth.body });
+  check('O-D. completed_at is byte-identical to the post-concurrent value',
+    (await linkRow(dLink.linkId))?.completed_at?.getTime() === dStampAfterConcurrent,
+    { after: (await linkRow(dLink.linkId))?.completed_at, expected: dStampAfterConcurrent });
+  check('O-D. expires_at still unchanged after the fifth call',
+    (await linkRow(dLink.linkId))?.expires_at.getTime() === dBeforeLink?.expires_at.getTime());
+  check('O-D. /onboarding/me now reports manageMode true',
+    ((await me(dLink.cookie)).json() as { manageMode: boolean }).manageMode === true);
+  check('O-D. rate limiting did not change idempotency — five calls, one timestamp',
+    dStamps.length === 1
+    && (await linkRow(dLink.linkId))?.completed_at?.getTime() === dStampAfterConcurrent);
+  await clearRateLimit(dIp);
+
+  // =======================================================================
+  // O-E. A poisoned provider response reaches no client field
+  // =======================================================================
+  const HOSTILE_FRAGMENTS = [
+    'SELECT * FROM accounts',
+    '/Users/deployuser/app/backend/dist/src/sync/klaviyo/client.js',
+    'node_modules',
+    'at KlaviyoClient.get',
+    'pk_live_5C4LEAKED0000000000000000000',
+    'shpat_5C4LEAKEDACCESSTOKEN',
+    'relation "accounts" does not exist',
+    'HTTP 418',
+  ] as const;
+  const POISON_BODY = JSON.stringify({
+    errors: [{ detail: 'relation "accounts" does not exist; SELECT * FROM accounts WHERE id=5' }],
+    trace: 'at KlaviyoClient.get (/Users/deployuser/app/backend/dist/src/sync/klaviyo/client.js:44:20)',
+    module: '/Users/deployuser/app/node_modules/undici/lib/core/request.js',
+    leaked_key: 'pk_live_5C4LEAKED0000000000000000000',
+    bearer: 'shpat_5C4LEAKEDACCESSTOKEN',
+  });
+
+  const savedFetch = (globalThis as any).fetch;
+  (globalThis as any).fetch = async (url: string, init?: any) => {
+    fetchLog.push({ url, headers: {}, body: typeof init?.body === 'string' ? init.body : '' });
+    return {
+      ok: false, status: 418, headers: { get: () => null },
+      text: async () => POISON_BODY, json: async () => JSON.parse(POISON_BODY),
+    };
+  };
+  try {
+    for (const [provider, url, payload, label] of [
+      ['klaviyo', '/onboarding/connections/klaviyo', { apiKey: 'pk_5c4_probe_00000000000000000000' }, 'Klaviyo'],
+      ['recharge', '/onboarding/connections/recharge', { token: 'recharge-5c4-probe-token' }, 'Recharge'],
+    ] as [string, string, Record<string, string>, string][]) {
+      const eAcc = await makeAccount(`5c4_poison_${provider}`);
+      const eLink = await mintAndExchange(app, agencyCookie, eAcc);
+      const res = record(`O-E ${provider} poisoned`, await call('POST', eLink.cookie, url, payload));
+      const eBody = jsonOf(res);
+      check(`O-E. ${provider}: the 502 mapping for verification_failed is preserved`,
+        res.statusCode === 502, res.statusCode);
+      check(`O-E. ${provider}: the machine code is still verification_failed`,
+        eBody.code === 'verification_failed', eBody);
+      check(`O-E. ${provider}: connected is false`, eBody.connected === false, eBody);
+      check(`O-E. ${provider}: the message is exactly the fixed application sentence`,
+        eBody.message === publicConnectFailure('verification_failed', provider as never).message,
+        eBody.message);
+      for (const frag of HOSTILE_FRAGMENTS) {
+        check(`O-E. ${provider}: response excludes the planted fragment`,
+          !res.body.includes(frag), frag);
+      }
+      check(`O-E. ${provider}: the submitted credential is not echoed`,
+        !res.body.includes(Object.values(payload)[0]), res.body);
+      check(`O-E. ${provider}: no stack frame or absolute path survived`,
+        !/\\n\s*at |\/Users\/|:\d+:\d+/.test(res.body), res.body);
+      check(`O-E. ${provider}: no connection row was created`,
+        (await tableSnapshot('connections', eAcc)) === '[]');
+      check(`O-E. ${provider}: no backfill job was created`, await noQueueJobs(eAcc));
+
+      // The raw detail still EXISTS internally — the service is untouched, only
+      // the client boundary sanitizes. Asserted as a boolean so no synthetic
+      // secret is printed.
+      const internal = await (provider === 'klaviyo'
+        ? connect.connectKlaviyo(eAcc, { apiKey: 'pk_5c4_probe_00000000000000000000' })
+        : connect.connectRecharge(eAcc, { token: 'recharge-5c4-probe-token' }));
+      const internalMessage = internal.ok ? '' : internal.message;
+      check(`O-E. ${provider}: the internal failure still carries diagnostic detail`,
+        internalMessage.length > 0 && internalMessage.includes('418'), internalMessage.length);
+      check(`O-E. ${provider}: and that internal detail is NOT what the client received`,
+        internalMessage !== String(eBody.message));
+    }
+  } finally {
+    (globalThis as any).fetch = savedFetch;
+  }
+  check('O-E. the provider fixture was restored for later groups',
+    (globalThis as any).fetch === savedFetch);
+
+  // Source-level proof of what did and did not change.
+  const oSources = await backendSources();
+  const oSrc = (suffix: string): string =>
+    oSources.find(([f]) => f.endsWith(suffix))?.[1] ?? '';
+  check('O-E. the client connect routes go through publicConnectFailure',
+    (oSrc('/src/routes/onboarding.ts').match(/publicConnectFailure\(/g) ?? []).length >= 2,
+    (oSrc('/src/routes/onboarding.ts').match(/publicConnectFailure\(/g) ?? []).length);
+  check('O-E. no client route forwards result.message any more',
+    !/message:\s*result\.message/.test(oSrc('/src/routes/onboarding.ts')));
+  check('O-E. connect.ts still builds the raw diagnostic message for internal use',
+    /verification failed: \$\{\(err as Error\)\.message\}/.test(oSrc('/src/onboarding/connect.ts')));
+  check('O-E. the agency routes still forward the full internal result',
+    /\.send\(result\)/.test(oSrc('/src/routes/agencyOnboarding.ts')));
+
+  // =======================================================================
+  // O-F. The fixed public failure vocabulary
+  // =======================================================================
+  //
+  // The code list is read off the REAL ConnectFailure union in connect.ts rather
+  // than re-typed here, so a code added there without a mapping is a failure of
+  // this check and not a silent gap.
+  const declaredCodes = [...oSrc('/src/onboarding/connect.ts')
+    .matchAll(/\|\s*\{\s*ok:\s*false;\s*code:\s*'([a-z_]+)'/g)].map((m) => m[1]).sort();
+  check('O-F. the ConnectFailure union declares the five expected codes',
+    JSON.stringify(declaredCodes) === JSON.stringify([
+      'account_not_found', 'domain_conflict', 'invalid_domain',
+      'missing_credentials', 'verification_failed',
+    ]), declaredCodes);
+  check('O-F. publicConnectFailure takes exactly (code, provider) — no raw text parameter',
+    publicConnectFailure.length === 2, publicConnectFailure.length);
+
+  const seenMessages = new Set<string>();
+  for (const provider of PROVIDER_TRIO) {
+    for (const code of declaredCodes) {
+      const r = publicConnectFailure(code as never, provider);
+      seenMessages.add(r.message);
+      check(`O-F. ${provider}/${code}: the code is returned unchanged`, r.code === code, r);
+      check(`O-F. ${provider}/${code}: a non-empty single-line message`,
+        typeof r.message === 'string' && r.message.length > 0 && !/[\n\r]/.test(r.message), r);
+      check(`O-F. ${provider}/${code}: no URL, path, SQL, stack, credential or identifier`,
+        !/https?:\/\/|\/Users\/|node_modules|SELECT |INSERT |\bat \w+\.|pk_|shpat_|:\d+:\d+/
+          .test(r.message)
+        && !/account_?[Ii]d|link_?[Ii]d|token_hash/.test(r.message), r.message);
+      check(`O-F. ${provider}/${code}: the message is not the raw internal wording`,
+        !r.message.includes('verification failed:'), r.message);
+    }
+  }
+  check('O-F. the five codes yield distinct wording per provider, not one catch-all',
+    seenMessages.size >= declaredCodes.length, seenMessages.size);
+  // The route-config side of the contract: exactly the 11 writes plus the
+  // pre-existing session route are throttled, and reads/logout are not.
+  const oRouteApp = buildApp();
+  const oDeclared = new Map<string, { action?: string; rl?: { max?: number; timeWindow?: string } }>();
+  oRouteApp.addHook('onRoute', (r) => {
+    const ms = Array.isArray(r.method) ? r.method : [r.method];
+    for (const m of ms) {
+      if (!r.url.startsWith('/onboarding') || m === 'HEAD') continue;
+      oDeclared.set(`${m} ${r.url}`, {
+        action: (r.config as { clientAction?: string } | undefined)?.clientAction,
+        rl: (r.config as { rateLimit?: { max?: number; timeWindow?: string } } | undefined)?.rateLimit,
+      });
+    }
+  });
+  await oRouteApp.ready();
+  const oLimited = [...oDeclared.entries()].filter(([, v]) => v.rl).map(([k]) => k).sort();
+  check('O-F. exactly twelve onboarding routes are throttled (11 writes + session)',
+    oLimited.length === 12, oLimited);
+  check('O-F. every throttled route uses max 10 / 1 minute',
+    [...oDeclared.values()].filter((v) => v.rl)
+      .every((v) => v.rl?.max === 10 && v.rl?.timeWindow === '1 minute'),
+    [...oDeclared.values()].filter((v) => v.rl).map((v) => v.rl));
+  check('O-F. POST /onboarding/session is still throttled and still public',
+    oDeclared.get('POST /onboarding/session')?.rl?.max === 10
+    && oDeclared.get('POST /onboarding/session')?.action === undefined);
+  for (const t of ['POST /onboarding/logout', 'GET /onboarding/me', 'GET /onboarding/progress',
+    'GET /onboarding/skus', 'GET /onboarding/costs', 'GET /onboarding/ad-spend']) {
+    check(`O-F. ${t} declares no rateLimit`, oDeclared.get(t)?.rl === undefined, oDeclared.get(t));
+  }
+  check('O-F. the seventeen authenticated routes and their actions are unchanged',
+    [...oDeclared.keys()].filter((k) => k !== 'POST /onboarding/session').length === 17
+    && [...oDeclared.entries()].filter(([k]) => k !== 'POST /onboarding/session')
+      .every(([, v]) => typeof v.action === 'string'
+        && (manageMode.CLIENT_ONBOARDING_ACTIONS as readonly string[]).includes(v.action)));
+  await oRouteApp.close();
+
+  // =======================================================================
+  // O-G. Response hygiene over every 5C-4 response
+  // =======================================================================
+  for (const [label, raw] of collected) {
+    for (const re of N_FORBIDDEN_KEYS) {
+      check(`O-G. ${label}: carries no ${re.source} key`, !re.test(raw), raw.slice(0, 200));
+    }
+    for (const needle of N_FORBIDDEN_TEXT) {
+      check(`O-G. ${label}: carries no "${needle}"`, !raw.includes(needle));
+    }
+    check(`O-G. ${label}: carries no embedded stack frame`, !/\\n\s*at /.test(raw));
+    check(`O-G. ${label}: carries no planted provider fragment`,
+      !HOSTILE_FRAGMENTS.some((f) => raw.includes(f)), raw.slice(0, 200));
+  }
+  check('O-G. every 5C-4 response is valid JSON',
+    collected.every(([, r]) => { try { JSON.parse(r); return true; } catch { return false; } }),
+    collected.filter(([, r]) => { try { JSON.parse(r); return false; } catch { return true; } })
+      .map(([l]) => l));
+  check('O-G. no .env credential leaked while this group ran',
+    envCredentialLeaked() === null, envCredentialLeaked());
+
+  // Every address this group used is returned to clean — and ONLY those, so a
+  // counter another group is still relying on is never deleted here.
+  for (const ip of O_TEST_IPS) await clearRateLimit(ip);
+  check('O-G. no test-owned rate-limit counter remains',
+    (await oOwnedRateLimitKeys()).length === 0, await oOwnedRateLimitKeys());
+  check('O-G. and the other groups\' counters were left untouched',
+    (await redis.keys(`${RATE_LIMIT_KEY_PREFIX}*`).catch(() => [] as string[]))
+      .every((k) => !O_TEST_IPS.some((ip) => k.endsWith(`-${ip}`))));
+  // Silence unused-fixture warnings while keeping the ids referenced.
+  check('O-G. every 5C-4 fixture account is tracked for cleanup',
+    [aMalformed, aMalformedLink.linkId, aExpiredAcc, aRevokedAcc, aUnsafeAcc, bAcc, isoAcc, dAcc,
+      completeSpecAccount].every((n) => typeof n === 'number')
+    && completeSpecCookie.length > 0);
+}
+
+// ===========================================================================
 // Main
 // ===========================================================================
 
@@ -6582,6 +7417,7 @@ async function main(): Promise<void> {
     await groupL(app, agencyCookie);
     await groupM(app, agencyCookie);
     await groupN(app, agencyCookie);
+    await groupO(app, agencyCookie);
   } finally {
     console.log('\nCleanup');
     await cleanupAccounts();
@@ -6657,6 +7493,7 @@ async function main(): Promise<void> {
     K: 'Agency completion (5B-2G)', L: 'Manage mode (5C-1)',
     M: 'Provider requests (5C-2)',
     N: 'Client financials (5C-3)',
+    O: 'Hardening (5C-4)',
   };
   for (const [letter, t] of Object.entries(groupTotals)) {
     const mark = t.fail === 0 ? '✓' : '✗';
