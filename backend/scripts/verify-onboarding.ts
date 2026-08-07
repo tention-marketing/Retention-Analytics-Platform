@@ -24,6 +24,12 @@
  *      and logout semantics, account-scoped link revocation, and the guarantee
  *      that no stack trace, filesystem path or provider credential reaches a
  *      browser-facing progress or status response.
+ *   N. Phase 5C-3 client financial routes: every §5.4.7 guarantee proved through
+ *      the authenticated /onboarding/* surface — authentication separation,
+ *      account identity from the principal alone, currency authority and
+ *      mismatch preservation, both COGS methods and their retained inactive
+ *      values, OCAS, positive and confirmed-zero ad spend, the contradictory-
+ *      state blocker, manage-mode access, and completion/readiness separation.
  *
  * Non-destructive: every account created here is a throwaway, deleted on the way
  * out. No live provider credential is used and no live provider is contacted —
@@ -5044,6 +5050,1486 @@ async function groupM(app: App, agencyCookie: string): Promise<void> {
 const PROVIDER_TRIO = ['shopify', 'klaviyo', 'recharge'] as const;
 
 // ===========================================================================
+// N. Phase 5C-3 client financial routes
+// ===========================================================================
+//
+// WHY THIS GROUP EXISTS, given verify:financial-controls already proves 494
+// assertions over the same rules: that suite drives the AGENCY routes
+// (/accounts/:id/currency, /costs, /ad-spend, …), where the account comes from
+// an authenticated staff member and a protected path. §5.4.7 makes the same
+// guarantees through a completely different principal — a bearer onboarding
+// link, with no path parameter, whose account is resolved per request from the
+// link row and which may be in restricted manage mode.
+//
+// So the subject here is the CLIENT authorization and routing boundary, not the
+// validators. Those are shared verbatim: routes/onboarding.ts delegates to
+// handleCogsWrite / handleOcasWrite / handleAdSpendWrite / handleZeroConfirm
+// exported from routes/agencyOnboarding.ts, and to setManualCurrency,
+// getSkuCoverage, getAccountCosts and listAdSpend directly. Section A pins that
+// sharing so a future divergence is a failing check rather than a second
+// implementation of "an empty field is never read as zero".
+//
+// The load-bearing proofs are negative ones: an account identifier anywhere in
+// a request cannot redirect a write; a foreign account is byte-for-byte
+// unchanged after every attempt; a Shopify-authoritative currency cannot be
+// overwritten; mismatch resolution has no client route at all; and no financial
+// call contacts a provider, enqueues a job, or touches a link's lifecycle.
+
+/** The client financial surface, exactly as routes/onboarding.ts registers it. */
+const N_FINANCIAL_ROUTES: [('GET' | 'PUT' | 'POST'), string, string, unknown][] = [
+  ['PUT', '/onboarding/currency', 'currency.update', { currency: 'USD' }],
+  ['GET', '/onboarding/skus', 'costs.read', undefined],
+  ['GET', '/onboarding/costs', 'costs.read', undefined],
+  ['PUT', '/onboarding/cogs', 'cogs.update', { method: 'blended', blendedMarginPct: 50 }],
+  ['PUT', '/onboarding/ocas', 'ocas.update', { ocasMonthly: 100 }],
+  ['GET', '/onboarding/ad-spend', 'ad_spend.read', undefined],
+  ['PUT', '/onboarding/ad-spend', 'ad_spend.update', { rows: [] }],
+  ['POST', '/onboarding/ad-spend/zero', 'ad_spend.zero_confirm', { months: [], confirmedZero: true }],
+];
+
+/** The agency financial routes a client cookie must never reach. */
+const N_AGENCY_FINANCIAL_SUFFIXES: [('GET' | 'PUT' | 'POST'), string, unknown][] = [
+  ['GET', '/currency', undefined],
+  ['PUT', '/currency', { currency: 'USD' }],
+  ['POST', '/currency/resolve-mismatch', undefined],
+  ['GET', '/skus', undefined],
+  ['GET', '/costs', undefined],
+  ['PUT', '/costs', { method: 'blended', blendedMarginPct: 50 }],
+  ['PUT', '/costs/ocas', { ocasMonthly: 100 }],
+  ['GET', '/ad-spend', undefined],
+  ['PUT', '/ad-spend', { rows: [] }],
+  ['POST', '/ad-spend/zero', { months: [], confirmedZero: true }],
+];
+
+/** The exact 17 authenticated scoped routes. A new one is a contract change. */
+const N_EXPECTED_SCOPED_ROUTES = [
+  'POST /onboarding/logout',
+  'GET /onboarding/me',
+  'GET /onboarding/progress',
+  'POST /onboarding/connections/klaviyo',
+  'POST /onboarding/connections/recharge',
+  'POST /onboarding/connections/shopify/request',
+  'POST /onboarding/connections/:provider/request',
+  'POST /onboarding/connections/:provider/skip',
+  'PUT /onboarding/currency',
+  'GET /onboarding/skus',
+  'GET /onboarding/costs',
+  'PUT /onboarding/cogs',
+  'PUT /onboarding/ocas',
+  'GET /onboarding/ad-spend',
+  'PUT /onboarding/ad-spend',
+  'POST /onboarding/ad-spend/zero',
+  'POST /onboarding/complete',
+] as const;
+
+/** The three keys rejectClientAccountId refuses, in body and in query string. */
+const N_IDENTIFIER_KEYS = ['accountId', 'account_id', 'account'] as const;
+
+/**
+ * A synthetic value submitted in an ignored body field.
+ *
+ * The financial routes take no credential, so the risk is not that one is
+ * stored — it is that an unknown field is echoed back in a validation message.
+ * Nothing may reflect this string.
+ */
+const N_SYNTHETIC_SECRET = '5c3-synthetic-not-a-credential';
+
+/**
+ * Identifier fields a 5C-3 response must never carry, matched as JSON KEYS.
+ *
+ * Structural, not substring: the account-identifier refusal's stable code is
+ * `account_identifier_not_permitted`, which contains the letters "account_id"
+ * while carrying no account id. A substring test calls that a leak and is
+ * simply wrong. What must be absent is a quoted key followed by a colon — the
+ * only shape that can actually have a value attached.
+ */
+const N_FORBIDDEN_KEYS = [
+  /"account_?[Ii]d"\s*:/, /"account"\s*:/, /"link_?[Ii]d"\s*:/,
+  /"connection_?[Ii]d"\s*:/, /"id"\s*:/, /"user_?[Ii]d"\s*:/,
+  /"token"\s*:/, /"token_?[Hh]ash"\s*:/, /"credentials?"\s*:/,
+  /"apiKey"\s*:/, /"clientSecret"\s*:/, /"jobId"\s*:/,
+] as const;
+
+/** Values and field names that can never legitimately appear at all. */
+const N_FORBIDDEN_TEXT = [
+  'credentials_encrypted', 'api_key', 'client_secret', 'clientId', 'client_id',
+  'accessToken', 'access_token', 'token_hash', 'password',
+  'jobState', 'failedReason', 'recentErrors', 'attemptsMade',
+  'backfill:', 'shopify-backfill', 'recharge-backfill', 'klaviyo-poll', 'bull:',
+  'node_modules', 'node:internal', 'file://', '/Users/', '/var/', '/opt/', '/home/',
+  'SELECT ', 'INSERT ', 'UPDATE ', 'DELETE ', 'pg_', 'postgres', 'relation ',
+  'syntax error', 'ECONNREFUSED',
+  'verify5a-not-a-credential', N_SYNTHETIC_SECRET,
+] as const;
+
+/**
+ * Every column of an account's financial state, as deterministic text.
+ *
+ * Whole rows, not counts: a mutation that swapped a value while keeping the row
+ * count would pass a count check and fail this one. Ordered by the row's own
+ * JSON so composite and text keys still serialise identically across reads.
+ */
+async function financialSnapshot(accountId: number): Promise<string> {
+  const parts: string[] = [];
+  const acct = await query<{ j: string | null }>(
+    `SELECT jsonb_build_object(
+              'currency', currency,
+              'currency_source', currency_source,
+              'shopify_currency_detected', shopify_currency_detected)::text AS j
+       FROM accounts WHERE id = $1`,
+    [accountId],
+  );
+  parts.push(`accounts=${acct.rows[0]?.j ?? 'ABSENT'}`);
+  for (const t of ['account_costs', 'sku_costs', 'ad_spend', 'ad_spend_zero_months']) {
+    parts.push(`${t}=${await tableSnapshot(t, accountId)}`);
+  }
+  return parts.join('\n');
+}
+
+/** The link-lifecycle columns a financial write must never touch. */
+async function linkLifecycleSnapshot(accountId: number): Promise<string> {
+  const { rows } = await query<{ j: string }>(
+    `SELECT COALESCE(jsonb_agg(
+              jsonb_build_object('e', expires_at, 'r', revoked_at, 'c', completed_at)
+              ORDER BY id), '[]'::jsonb)::text AS j
+       FROM onboarding_links WHERE account_id = $1`,
+    [accountId],
+  );
+  return rows[0].j;
+}
+
+async function groupN(app: App, agencyCookie: string): Promise<void> {
+  group('N', 'Phase 5C-3 client financial routes');
+
+  // -----------------------------------------------------------------------
+  // Local helpers
+  // -----------------------------------------------------------------------
+  type Res = Awaited<ReturnType<App['inject']>>;
+
+  const collected: [string, string][] = [];
+  const record = (label: string, res: Res): Res => {
+    collected.push([label, res.body]);
+    return res;
+  };
+
+  const call = (
+    method: 'GET' | 'PUT' | 'POST', cookie: string | null, url: string, payload?: unknown,
+  ): Promise<Res> => app.inject({
+    method, url, remoteAddress: nextIp(),
+    headers: {
+      ...(cookie ? { cookie } : {}),
+      ...(payload === undefined ? {} : { 'content-type': 'application/json' }),
+    },
+    ...(payload === undefined ? {} : { payload: payload as never }),
+  });
+
+  const jsonOf = (res: Res): Record<string, unknown> => {
+    try {
+      const parsed = res.json() as unknown;
+      return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+        ? (parsed as Record<string, unknown>) : {};
+    } catch { return {}; }
+  };
+  const errOf = (res: Res): string | null => {
+    const b = jsonOf(res);
+    return typeof b.error === 'string' ? b.error : null;
+  };
+
+  /** An account that satisfies Gate 1 with Klaviyo alone. */
+  const completable = async (name: string): Promise<number> => {
+    const id = await makeAccount(name);
+    await seedConnectedProvider(id, 'klaviyo');
+    await choices.setSkipped(id, 'shopify');
+    await choices.setSkipped(id, 'recharge');
+    return id;
+  };
+
+  const meOf = (cookie: string) => call('GET', cookie, '/onboarding/me');
+  const meBody = async (cookie: string) => jsonOf(await meOf(cookie));
+  const rcmCodes = async (cookie: string): Promise<string[]> =>
+    ((await meBody(cookie)).rcmBlockers as { code: string }[] ?? []).map((b) => b.code);
+  const onbCodes = async (cookie: string): Promise<string[]> =>
+    ((await meBody(cookie)).onboardingBlockers as { code: string }[] ?? []).map((b) => b.code);
+
+  const skuRowsOf = async (accountId: number) => (await query<{
+    sku: string; cogs: string; zero_confirmed: boolean;
+  }>(
+    `SELECT sku, cogs, zero_confirmed FROM sku_costs WHERE account_id = $1 ORDER BY sku`,
+    [accountId],
+  )).rows;
+  const spendRowsOf = async (accountId: number) => (await query<{
+    month: string; channel: string; spend: string; source: string;
+  }>(
+    `SELECT to_char(month,'YYYY-MM-DD') AS month, channel, spend, source
+       FROM ad_spend WHERE account_id = $1 ORDER BY month, channel`, [accountId],
+  )).rows;
+  const zeroMonthsOf = async (accountId: number) => (await query<{ month: string }>(
+    `SELECT to_char(month,'YYYY-MM-DD') AS month FROM ad_spend_zero_months
+      WHERE account_id = $1 ORDER BY month`, [accountId],
+  )).rows.map((r) => r.month);
+
+  /** No provider was contacted and no backfill job exists for this account. */
+  const noProviderSideEffects = async (accountId: number): Promise<boolean> =>
+    fetchLog.length === 0
+    && (await queues.backfillQueue().getJob(queues.backfillJobId(accountId))
+      .catch(() => null)) == null
+    && (await queues.klaviyoPollQueue().getJob(queues.klaviyoBackfillJobId(accountId))
+      .catch(() => null)) == null
+    && (await queues.rechargeBackfillQueue().getJob(queues.rechargeBackfillJobId(accountId))
+      .catch(() => null)) == null;
+
+  // =======================================================================
+  // A. Route, action and shared-handler contract
+  // =======================================================================
+  const routeApp = buildApp();
+  const declaredN = new Map<string, string | undefined>();
+  routeApp.addHook('onRoute', (r) => {
+    const methods = Array.isArray(r.method) ? r.method : [r.method];
+    for (const m of methods) {
+      if (!r.url.startsWith('/onboarding')) continue;
+      declaredN.set(`${m} ${r.url}`, (r.config as { clientAction?: string } | undefined)?.clientAction);
+    }
+  });
+  await routeApp.ready();
+  const authenticatedN = [...declaredN.entries()]
+    .filter(([k]) => !k.startsWith('HEAD ') && k !== 'POST /onboarding/session');
+
+  check('A. the 17 authenticated scoped onboarding routes are still exactly 17',
+    authenticatedN.length === 17, authenticatedN.map(([k]) => k));
+  check('A. and they are exactly the expected set — no production route was added',
+    JSON.stringify(authenticatedN.map(([k]) => k).sort())
+      === JSON.stringify([...N_EXPECTED_SCOPED_ROUTES].sort()),
+    authenticatedN.map(([k]) => k).sort());
+  for (const [method, url, action] of N_FINANCIAL_ROUTES) {
+    check(`A. ${method} ${url} still declares ${action}`,
+      declaredN.get(`${method} ${url}`) === action,
+      { expected: action, actual: declaredN.get(`${method} ${url}`) });
+    check(`A. ${method} ${url} takes no path parameter an identifier could ride in`,
+      !url.includes(':'), url);
+    check(`A. ${action} is a member of the closed vocabulary`,
+      (manageMode.CLIENT_ONBOARDING_ACTIONS as readonly string[]).includes(action));
+    check(`A. ${action} is allowlisted in manage mode`,
+      manageMode.isAllowedInManageMode(action));
+  }
+  check('A. no client-scoped currency mismatch-resolution route exists',
+    ![...declaredN.keys()].some((k) => /mismatch|resolve/i.test(k)),
+    [...declaredN.keys()].filter((k) => /mismatch|resolve/i.test(k)));
+  check('A. no client-scoped disconnect or credential-read route exists',
+    ![...declaredN.keys()].some((k) => /disconnect|credential|secret/i.test(k)),
+    [...declaredN.keys()].filter((k) => /disconnect|credential|secret/i.test(k)));
+  await routeApp.close();
+
+  // --- A. hook order, read off the source that registers them -------------
+  const onbSource = (await backendSources())
+    .find(([f]) => f.endsWith('/routes/onboarding.ts'))?.[1] ?? '';
+  const hookOrder = [...onbSource.matchAll(/scoped\.addHook\('preHandler',\s*(\w+)\)/g)]
+    .map((m) => m[1]);
+  check('A. the scoped plugin registers exactly three preHandler hooks',
+    hookOrder.length === 3, hookOrder);
+  check('A. hook order is requireOnboardingLink → rejectClientAccountId → enforceManageMode',
+    JSON.stringify(hookOrder)
+      === JSON.stringify(['requireOnboardingLink', 'rejectClientAccountId', 'enforceManageMode']),
+    hookOrder);
+
+  // --- A. shared handlers, not a second implementation --------------------
+  const agencySource = (await backendSources())
+    .find(([f]) => f.endsWith('/routes/agencyOnboarding.ts'))?.[1] ?? '';
+  for (const handler of ['handleCogsWrite', 'handleOcasWrite', 'handleAdSpendWrite', 'handleZeroConfirm']) {
+    check(`A. ${handler} is exported once, from agencyOnboarding.ts`,
+      agencySource.includes(`export async function ${handler}(`)
+      && !onbSource.includes(`function ${handler}(`),
+      { agency: agencySource.includes(`export async function ${handler}(`) });
+    check(`A. the client surface imports ${handler} rather than reimplementing it`,
+      onbSource.includes(handler), handler);
+  }
+  check('A. the client route file defines no financial validator of its own',
+    !/function\s+(validate|normalize)(Blended|SkuCost|Ocas|SpendAmount|Month|Channel)/.test(onbSource));
+  check('A. client currency writes go through the shared setManualCurrency service',
+    onbSource.includes('setManualCurrency('));
+  check('A. client cost and spend reads go through the shared services',
+    onbSource.includes('getSkuCoverage(') && onbSource.includes('getAccountCosts(')
+    && onbSource.includes('listAdSpend(') && onbSource.includes('getCoverageWindow('));
+  check('A. resolveCurrencyMismatch is never imported on the client surface',
+    !onbSource.includes('resolveCurrencyMismatch'), 'client file references mismatch resolution');
+
+  // =======================================================================
+  // B. Authentication separation
+  // =======================================================================
+  const nA = await completable('5c3_account_a');
+  const nB = await completable('5c3_account_b');
+  const nAName = (await query<{ name: string }>(
+    `SELECT name FROM accounts WHERE id = $1`, [nA])).rows[0].name;
+  const nBName = (await query<{ name: string }>(
+    `SELECT name FROM accounts WHERE id = $1`, [nB])).rows[0].name;
+  const linkA = await mintAndExchange(app, agencyCookie, nA);
+
+  // Account A order history, so the coverage window and SKU coverage are real.
+  for (let i = 1; i <= 3; i++) {
+    const o = await insertOrder(nA, monthsAgo(i), 500, true);
+    await insertLineItem(nA, o, 7_700_000 + i, `A-SKU-${i}`, 500);
+  }
+  // Account B gets its OWN financial state, so "unchanged" is a real comparison
+  // against populated rows rather than against emptiness.
+  const bOrder = await insertOrder(nB, monthsAgo(1), 900, true);
+  await insertLineItem(nB, bOrder, 7_800_001, 'B-SKU-1', 900);
+  await query(
+    `UPDATE accounts SET currency = 'JPY', currency_source = 'manual' WHERE id = $1`, [nB]);
+  await costs.setBlendedMargin(nB, 41.25);
+  await costs.setOcas(nB, 3210.99, false);
+  await costs.setCogsMethod(nB, 'per_sku');
+  await costs.upsertSkuCosts(nB, [{ sku: 'B-SKU-1', cogs: 88.88 }]);
+  await costs.setCogsMethod(nB, 'blended');
+  await adspend.writeAdSpendRanges(nB, [{
+    channel: 'Meta', amount: 1111.11, startMonth: monthsAgo(2), endMonth: monthsAgo(2),
+  }]);
+  await adspend.confirmZeroMonths(nB, [monthsAgo(3)]);
+  const bBaseline = await financialSnapshot(nB);
+  check('B. the foreign fixture account really holds financial state to protect',
+    bBaseline.includes('JPY') && bBaseline.includes('88.88')
+    && bBaseline.includes('1111.11') && bBaseline.includes('3210.99'), bBaseline.slice(0, 200));
+
+  for (const [method, url, , payload] of N_FINANCIAL_ROUTES) {
+    const anon = record(`B anon ${method} ${url}`, await call(method, null, url, payload));
+    check(`B. ${method} ${url} with no onboarding cookie is 401`,
+      anon.statusCode === 401, anon.statusCode);
+    check(`B. ${method} ${url} anonymous refusal is the neutral client failure`,
+      JSON.stringify(jsonOf(anon)) === JSON.stringify({
+        error: 'invalid_link',
+        message: 'This setup link is not valid. Ask your account manager for a new one.',
+      }), anon.body);
+
+    const withAgency = record(`B agency ${method} ${url}`,
+      await call(method, agencyCookie, url, payload));
+    check(`B. ${method} ${url} cannot be authenticated by an AGENCY cookie`,
+      withAgency.statusCode === 401, withAgency.statusCode);
+    check(`B. ${method} ${url} agency attempt is refused as neutrally as an anonymous one`,
+      withAgency.body === anon.body, { agency: withAgency.body, anon: anon.body });
+
+    const withClient = await call(method, linkA.cookie, url, payload);
+    check(`B. ${method} ${url} DOES authenticate with a valid onboarding cookie`,
+      withClient.statusCode !== 401, withClient.statusCode);
+  }
+
+  for (const [method, suffix, payload] of N_AGENCY_FINANCIAL_SUFFIXES) {
+    for (const target of [nA, nB]) {
+      const res = record(`B client→agency ${method} ${suffix}`,
+        await call(method, linkA.cookie, `/accounts/${target}${suffix}`, payload));
+      check(`B. a client cookie cannot use ${method} /accounts/:id${suffix}`
+        + `${target === nA ? ' (its own account)' : ' (a foreign account)'}`,
+        res.statusCode === 401, res.statusCode);
+    }
+  }
+  check('B. the agency-only mismatch-resolution route is unreachable from a client cookie',
+    (await call('POST', linkA.cookie, `/accounts/${nA}/currency/resolve-mismatch`)).statusCode === 401
+    && (await call('POST', linkA.cookie, `/accounts/${nB}/currency/resolve-mismatch`)).statusCode === 401);
+  check('B. an agency cookie is not mistaken for the client principal',
+    (await call('GET', agencyCookie, '/onboarding/me')).statusCode === 401);
+  check('B. the agency principal still works on its own surface',
+    (await call('GET', agencyCookie, `/accounts/${nA}/currency`)).statusCode === 200);
+  check('B. neither account was altered by any authentication probe',
+    (await financialSnapshot(nB)) === bBaseline);
+
+  // =======================================================================
+  // C. Account identity and tenant isolation
+  // =======================================================================
+  const writeProbes: [string, 'PUT' | 'POST', string, Record<string, unknown>][] = [
+    ['currency', 'PUT', '/onboarding/currency', { currency: 'GBP' }],
+    ['cogs', 'PUT', '/onboarding/cogs', { method: 'blended', blendedMarginPct: 33 }],
+    ['ocas', 'PUT', '/onboarding/ocas', { ocasMonthly: 99 }],
+    ['ad-spend', 'PUT', '/onboarding/ad-spend', {
+      rows: [{ channel: 'Meta', amount: 12.34, startMonth: monthsAgo(1), endMonth: monthsAgo(1) }],
+    }],
+    ['ad-spend/zero', 'POST', '/onboarding/ad-spend/zero', {
+      months: [monthsAgo(2)], confirmedZero: true,
+    }],
+  ];
+
+  const aBeforeIdentity = await financialSnapshot(nA);
+  for (const [label, method, url, payload] of writeProbes) {
+    for (const key of N_IDENTIFIER_KEYS) {
+      const inBody = record(`C body ${label} ${key}`,
+        await call(method, linkA.cookie, url, { ...payload, [key]: nB }));
+      check(`C. ${label}: a "${key}" in the BODY is refused with 400`,
+        inBody.statusCode === 400, inBody.statusCode);
+      check(`C. ${label}: it carries the stable account_identifier_not_permitted code`,
+        errOf(inBody) === 'account_identifier_not_permitted', inBody.body);
+      check(`C. ${label}: the named foreign account is byte-for-byte unchanged`,
+        (await financialSnapshot(nB)) === bBaseline);
+      check(`C. ${label}: the session's own account is unchanged too`,
+        (await financialSnapshot(nA)) === aBeforeIdentity);
+
+      const inQuery = record(`C query ${label} ${key}`,
+        await call(method, linkA.cookie, `${url}?${key}=${nB}`, payload));
+      check(`C. ${label}: a "${key}" in the QUERY STRING is refused with 400`,
+        inQuery.statusCode === 400, inQuery.statusCode);
+      check(`C. ${label}: the query-string refusal uses the same stable code`,
+        errOf(inQuery) === 'account_identifier_not_permitted', inQuery.body);
+      check(`C. ${label}: the query-string attempt changed neither account`,
+        (await financialSnapshot(nB)) === bBaseline
+        && (await financialSnapshot(nA)) === aBeforeIdentity);
+    }
+  }
+  for (const [, url] of N_FINANCIAL_ROUTES.filter(([m]) => m === 'GET')) {
+    for (const key of N_IDENTIFIER_KEYS) {
+      const res = record(`C read ${url} ${key}`,
+        await call('GET', linkA.cookie, `${url}?${key}=${nB}`));
+      check(`C. GET ${url} with "${key}" in the query string is refused with 400`,
+        res.statusCode === 400, res.statusCode);
+      check(`C. GET ${url} refusal carries the stable code`,
+        errOf(res) === 'account_identifier_not_permitted', res.body);
+    }
+  }
+  check('C. no foreign financial row was created, updated or deleted by any probe',
+    (await financialSnapshot(nB)) === bBaseline, await financialSnapshot(nB));
+  check('C. account identity is resolved only from the refreshed principal',
+    ((await meBody(linkA.cookie)).workspaceName) === nAName);
+
+  // =======================================================================
+  // D. Currency
+  // =======================================================================
+
+  // --- D.A manual currency ------------------------------------------------
+  const dSet = record('D currency set', await call('PUT', linkA.cookie, '/onboarding/currency',
+    { currency: 'usd' }));
+  check('D. a valid lowercase code is accepted when Shopify is not authoritative',
+    dSet.statusCode === 200, dSet.statusCode);
+  check('D. the response reports the normalized uppercase code',
+    jsonOf(dSet).currency === 'USD', dSet.body);
+  check('D. it is STORED uppercase with manual authority',
+    (await currency.getCurrencyState(nA))?.currency === 'USD'
+    && (await currency.getCurrencyState(nA))?.currency_source === 'manual');
+  check('D. the client-visible read reflects it',
+    (await meBody(linkA.cookie)).currency === 'USD'
+    && (await meBody(linkA.cookie)).currencySource === 'manual');
+  const dPadded = record('D currency padded',
+    await call('PUT', linkA.cookie, '/onboarding/currency', { currency: '  eur ' }));
+  check('D. surrounding whitespace is trimmed, not rejected and not stored',
+    dPadded.statusCode === 200 && jsonOf(dPadded).currency === 'EUR'
+    && (await currency.getCurrencyState(nA))?.currency === 'EUR', dPadded.body);
+
+  // Money values first, so "no conversion" is measured against real amounts.
+  await costs.setOcas(nA, 1500.25, false);
+  await costs.setCogsMethod(nA, 'per_sku');
+  await costs.upsertSkuCosts(nA, [{ sku: 'A-SKU-1', cogs: 123.45 }]);
+  await adspend.writeAdSpendRanges(nA, [{
+    channel: 'Meta', amount: 777.77, startMonth: monthsAgo(1), endMonth: monthsAgo(1),
+  }]);
+  const dMoneyBefore = await financialSnapshot(nA);
+
+  const badCurrencies: [string, unknown][] = [
+    ['two letters', 'US'], ['four letters', 'USDX'], ['digits', 'US1'],
+    ['empty string', ''], ['whitespace only', '   '], ['a tab', '\t'],
+    ['null', null], ['a number', 840], ['an array', ['USD']], ['an empty array', []],
+    ['an object', { code: 'USD' }], ['a boolean true', true], ['a boolean false', false],
+    ['a symbol-laden code', 'U$D'], ['a NUL-terminated value', 'USD '],
+    ['a newline-separated pair', 'USD\nEUR'],
+    ['a SQL-shaped value', "USD'; DROP TABLE accounts; --"],
+    ['an over-long value', 'U'.repeat(200)],
+  ];
+  for (const [label, value] of badCurrencies) {
+    const res = record(`D currency invalid ${label}`,
+      await call('PUT', linkA.cookie, '/onboarding/currency', { currency: value }));
+    check(`D. an invalid currency (${label}) is refused with 400`,
+      res.statusCode === 400, res.statusCode);
+    check(`D. an invalid currency (${label}) carries the stable invalid_code`,
+      errOf(res) === 'invalid_code', res.body);
+    check(`D. an invalid currency (${label}) is not coerced into a valid one`,
+      (await currency.getCurrencyState(nA))?.currency === 'EUR');
+  }
+  const dOmitted = record('D currency omitted',
+    await call('PUT', linkA.cookie, '/onboarding/currency', {}));
+  check('D. an omitted currency field is a 400, never a silent clear',
+    dOmitted.statusCode === 400 && errOf(dOmitted) === 'invalid_code', dOmitted.body);
+  check('D. the stored currency survived every rejected value',
+    (await currency.getCurrencyState(nA))?.currency === 'EUR');
+
+  await call('PUT', linkA.cookie, '/onboarding/currency', { currency: 'GBP' });
+  check('D. changing the currency converted no money value and deleted no row',
+    (await financialSnapshot(nA)).replace('"GBP"', '"EUR"') === dMoneyBefore,
+    { before: dMoneyBefore, after: await financialSnapshot(nA) });
+  check('D. COGS, OCAS and ad spend are all still exactly as entered',
+    Number((await costs.getAccountCosts(nA)).ocas_monthly) === 1500.25
+    && (await skuRowsOf(nA)).find((r) => r.sku === 'A-SKU-1')?.cogs === '123.45'
+    && (await spendRowsOf(nA)).find((r) => r.channel === 'Meta')?.spend === '777.77');
+  await call('PUT', linkA.cookie, '/onboarding/currency', { currency: 'EUR' });
+
+  // --- D.B Shopify authority ---------------------------------------------
+  const dShop = await makeAccount('5c3_shopify_currency');
+  await seedConnectedProvider(dShop, 'shopify', `5c3-cur-${Date.now()}.myshopify.com`);
+  await choices.setSkipped(dShop, 'klaviyo');
+  await choices.setSkipped(dShop, 'recharge');
+  const dShopOrder = await insertOrder(dShop, monthsAgo(1), 2000, true);
+  await insertLineItem(dShop, dShopOrder, 7_900_001, 'S-SKU-1', 2000);
+  await costs.setOcas(dShop, 500, false);
+  await adspend.writeAdSpendRanges(dShop, [{
+    channel: 'Google', amount: 250.5, startMonth: monthsAgo(1), endMonth: monthsAgo(1),
+  }]);
+  await currency.applyShopifyCurrency(dShop, 'USD');
+  const dShopLink = await mintAndExchange(app, agencyCookie, dShop);
+  const dShopBefore = await financialSnapshot(dShop);
+
+  const dRefused = record('D shopify authoritative',
+    await call('PUT', dShopLink.cookie, '/onboarding/currency', { currency: 'CAD' }));
+  check('D. a client cannot overwrite a Shopify-authoritative currency',
+    dRefused.statusCode === 400, dRefused.statusCode);
+  check('D. the refusal carries the stable shopify_authoritative code',
+    errOf(dRefused) === 'shopify_authoritative', dRefused.body);
+  check('D. currency, its authority and the detected value are all unchanged',
+    (await currency.getCurrencyState(dShop))?.currency === 'USD'
+    && (await currency.getCurrencyState(dShop))?.currency_source === 'shopify'
+    && (await currency.getCurrencyState(dShop))?.shopify_currency_detected === 'USD');
+  check('D. no money row moved when the override was refused',
+    (await financialSnapshot(dShop)) === dShopBefore);
+
+  // --- D.C mismatch preservation -----------------------------------------
+  const dMm = await makeAccount('5c3_mismatch');
+  await seedConnectedProvider(dMm, 'shopify', `5c3-mm-${Date.now()}.myshopify.com`);
+  await choices.setSkipped(dMm, 'klaviyo');
+  await choices.setSkipped(dMm, 'recharge');
+  const dMmOrder = await insertOrder(dMm, monthsAgo(1), 1000, true);
+  await insertLineItem(dMm, dMmOrder, 7_910_001, 'MM-SKU', 1000);
+  await query(`UPDATE accounts SET currency = 'CAD', currency_source = 'manual' WHERE id = $1`,
+    [dMm]);
+  await costs.setOcas(dMm, 1500.25, false);
+  await costs.setCogsMethod(dMm, 'per_sku');
+  await costs.upsertSkuCosts(dMm, [{ sku: 'MM-SKU', cogs: 333.33 }]);
+  await adspend.writeAdSpendRanges(dMm, [{
+    channel: 'Meta', amount: 777.77, startMonth: monthsAgo(1), endMonth: monthsAgo(1),
+  }]);
+  // Case 4 of Correction 1, through the service that owns it.
+  const dMmOutcome = await currency.applyShopifyCurrency(dMm, 'USD');
+  const dMmLink = await mintAndExchange(app, agencyCookie, dMm);
+  const dMmSnapshot = await financialSnapshot(dMm);
+
+  check('D. the fixture produced the preserved-mismatch outcome, not a replacement',
+    dMmOutcome.outcome === 'mismatch_preserved', dMmOutcome);
+  const dMmMe = await meBody(dMmLink.cookie);
+  check('D. the client-visible currency is still the one the money is expressed in',
+    dMmMe.currency === 'CAD', dMmMe.currency);
+  check('D. and its authority is still manual, not silently upgraded',
+    dMmMe.currencySource === 'manual', dMmMe.currencySource);
+  const dMmBlocker = (dMmMe.rcmBlockers as { code: string; detail?: Record<string, unknown> }[])
+    .find((b) => b.code === 'currency_mismatch');
+  check('D. the mismatch is reported as a DERIVED RCM blocker',
+    dMmBlocker !== undefined, (dMmMe.rcmBlockers as { code: string }[]).map((b) => b.code));
+  check('D. both currencies remain available to the client as separate facts',
+    dMmBlocker?.detail?.storedCurrency === 'CAD' && dMmBlocker?.detail?.shopifyCurrency === 'USD',
+    dMmBlocker?.detail);
+  check('D. the client is told resolution is agency-only',
+    dMmBlocker?.detail?.agencyOnlyResolution === true, dMmBlocker?.detail);
+  check('D. nothing was converted and no financial row was deleted by the mismatch',
+    (await financialSnapshot(dMm)) === dMmSnapshot
+    && Number((await costs.getAccountCosts(dMm)).ocas_monthly) === 1500.25
+    && (await skuRowsOf(dMm))[0]?.cogs === '333.33'
+    && (await spendRowsOf(dMm))[0]?.spend === '777.77');
+  check('D. reading the state repeatedly does not silently resolve the mismatch',
+    (await meBody(dMmLink.cookie)).currency === 'CAD'
+    && (await currency.getCurrencyState(dMm))?.shopify_currency_detected === 'USD');
+
+  // --- D.D resolution stays agency-only ----------------------------------
+  const dMmAttempt = record('D client mismatch resolve',
+    await call('POST', dMmLink.cookie, `/accounts/${dMm}/currency/resolve-mismatch`));
+  check('D. a client cookie cannot call the agency mismatch-resolution route',
+    dMmAttempt.statusCode === 401, dMmAttempt.statusCode);
+  // A client MAY still edit the manual side — §5.4.4 allows "update manually
+  // editable currency when Shopify is not authoritative", and during a preserved
+  // mismatch `currency_source` is still 'manual'. What it must never do is
+  // acquire Shopify authority or overwrite the detected value, so the mismatch
+  // survives a client currency write. A third code is used deliberately: writing
+  // the DETECTED code would make the two columns agree, and the derived blocker
+  // would clear because the data agrees — which is not the same thing as the
+  // client having been granted the agency-only resolution.
+  const dMmOverride = record('D client mismatch override',
+    await call('PUT', dMmLink.cookie, '/onboarding/currency', { currency: 'AUD' }));
+  check('D. a client currency write never grants Shopify authority',
+    (await currency.getCurrencyState(dMm))?.currency_source === 'manual',
+    { status: dMmOverride.statusCode, state: await currency.getCurrencyState(dMm) });
+  check('D. and never overwrites the detected Shopify currency',
+    (await currency.getCurrencyState(dMm))?.shopify_currency_detected === 'USD');
+  check('D. the mismatch therefore still stands after the client write',
+    currency.hasCurrencyMismatch((await currency.getCurrencyState(dMm))!),
+    await currency.getCurrencyState(dMm));
+  check('D. and it is still reported to the client as an RCM blocker',
+    (await rcmCodes(dMmLink.cookie)).includes('currency_mismatch'),
+    await rcmCodes(dMmLink.cookie));
+  // Restore the fixture currency so the money rows still describe CAD.
+  await query(`UPDATE accounts SET currency = 'CAD' WHERE id = $1`, [dMm]);
+  check('D. after both attempts every money row is still untouched',
+    (await skuRowsOf(dMm))[0]?.cogs === '333.33'
+    && (await spendRowsOf(dMm))[0]?.spend === '777.77'
+    && Number((await costs.getAccountCosts(dMm)).ocas_monthly) === 1500.25);
+  check('D. the mismatch was not cleared behind the client\'s back',
+    (await currency.getCurrencyState(dMm))?.currency_source !== 'shopify'
+    && (await currency.getCurrencyState(dMm))?.currency === 'CAD',
+    await currency.getCurrencyState(dMm));
+
+  // =======================================================================
+  // E. COGS
+  // =======================================================================
+  const nCogs = await completable('5c3_cogs');
+  for (let i = 1; i <= 4; i++) {
+    const o = await insertOrder(nCogs, monthsAgo(i), 1000, true);
+    await insertLineItem(nCogs, o, 7_920_000 + i, `C-SKU-${i}`, 1000);
+  }
+  const cogsLink = await mintAndExchange(app, agencyCookie, nCogs);
+  const cogsUrl = '/onboarding/cogs';
+
+  // --- E.A blended margin -------------------------------------------------
+  const eBlended = record('E blended ok',
+    await call('PUT', cogsLink.cookie, cogsUrl, { method: 'blended', blendedMarginPct: 62.5 }));
+  check('E. a valid blended margin is accepted', eBlended.statusCode === 200, eBlended.body);
+  check('E. the response reports the stored method and value',
+    jsonOf(eBlended).method === 'blended' && jsonOf(eBlended).blendedMarginPct === 62.5,
+    eBlended.body);
+  check('E. it is persisted with the blended method selected',
+    Number((await costs.getAccountCosts(nCogs)).blended_margin_pct) === 62.5
+    && (await costs.getAccountCosts(nCogs)).cogs_method === 'blended');
+  const eRead = record('E costs read', await call('GET', cogsLink.cookie, '/onboarding/costs'));
+  check('E. the subsequent client read reflects it',
+    (jsonOf(eRead).costs as Record<string, unknown>)?.cogs_method === 'blended'
+    && Number((jsonOf(eRead).costs as Record<string, unknown>)?.blended_margin_pct) === 62.5,
+    eRead.body);
+
+  const badMargins: [string, unknown, string][] = [
+    ['zero', 0, 'out_of_range'], ['negative', -5, 'out_of_range'],
+    ['exactly 100', 100, 'out_of_range'], ['above 100', 150, 'out_of_range'],
+    ['three decimals', 55.555, 'too_precise'],
+    ['blank string', '', 'not_a_number'], ['whitespace only', '   ', 'not_a_number'],
+    ['a tab', '\t', 'not_a_number'], ['null', null, 'not_a_number'],
+    ['undefined/omitted', undefined, 'not_a_number'],
+    ['an empty array', [], 'not_a_number'], ['a single-element array', [55], 'not_a_number'],
+    ['a boolean', true, 'not_a_number'], ['an object', { pct: 55 }, 'not_a_number'],
+    ['NaN as text', 'NaN', 'not_a_number'], ['Infinity as text', 'Infinity', 'not_a_number'],
+  ];
+  for (const [label, value, code] of badMargins) {
+    const res = record(`E blended invalid ${label}`, await call('PUT', cogsLink.cookie, cogsUrl,
+      { method: 'blended', blendedMarginPct: value }));
+    check(`E. a blended margin that is ${label} is refused with 400`,
+      res.statusCode === 400, res.statusCode);
+    check(`E. and carries the stable ${code} code`, errOf(res) === code, res.body);
+    check(`E. blank/invalid was never inferred as zero — the stored value survives`,
+      Number((await costs.getAccountCosts(nCogs)).blended_margin_pct) === 62.5);
+  }
+  const eBadMethod = record('E bad method',
+    await call('PUT', cogsLink.cookie, cogsUrl, { method: 'guess', blendedMarginPct: 50 }));
+  check('E. an unknown COGS method is refused with the stable bad_method code',
+    eBadMethod.statusCode === 400 && errOf(eBadMethod) === 'bad_method', eBadMethod.body);
+
+  // --- E.B per-SKU costs --------------------------------------------------
+  const ePerSku = record('E per_sku ok', await call('PUT', cogsLink.cookie, cogsUrl, {
+    method: 'per_sku',
+    skus: [{ sku: 'C-SKU-1', cogs: 10.55 }, { sku: 'C-SKU-2', cogs: 20.02 }],
+  }));
+  check('E. per-SKU costs for this account\'s own SKUs are accepted',
+    ePerSku.statusCode === 200, ePerSku.body);
+  check('E. the response reports how many were written',
+    jsonOf(ePerSku).method === 'per_sku' && jsonOf(ePerSku).written === 2, ePerSku.body);
+  check('E. exact two-decimal precision is retained',
+    (await skuRowsOf(nCogs)).map((r) => `${r.sku}=${r.cogs}`).join(',')
+      === 'C-SKU-1=10.55,C-SKU-2=20.02', await skuRowsOf(nCogs));
+
+
+  const eForeign = record('E foreign sku', await call('PUT', cogsLink.cookie, cogsUrl, {
+    method: 'per_sku', skus: [{ sku: 'B-SKU-1', cogs: 5 }],
+  }));
+  check('E. a SKU belonging to ANOTHER account is refused',
+    eForeign.statusCode === 400, eForeign.statusCode);
+  check('E. the refusal carries the stable unknown_skus code',
+    errOf(eForeign) === 'unknown_skus', eForeign.body);
+  check('E. no cost row was created for the foreign SKU in this account',
+    (await skuRowsOf(nCogs)).every((r) => r.sku !== 'B-SKU-1'));
+  check('E. and the owning account\'s own cost row is untouched',
+    (await financialSnapshot(nB)) === bBaseline);
+  check('E. the refusal does not disclose which account owns the SKU',
+    !eForeign.body.includes(nBName) && !eForeign.body.includes(String(nB)), eForeign.body);
+
+  const eUnknown = record('E unknown sku', await call('PUT', cogsLink.cookie, cogsUrl, {
+    method: 'per_sku', skus: [{ sku: 'NEVER-EXISTED-SKU', cogs: 5 }],
+  }));
+  check('E. a SKU that exists nowhere is refused the same way',
+    eUnknown.statusCode === 400 && errOf(eUnknown) === 'unknown_skus', eUnknown.body);
+
+  const badSkuCosts: [string, unknown, string][] = [
+    ['blank string', '', 'not_a_number'], ['whitespace only', '  ', 'not_a_number'],
+    ['a tab', '\t', 'not_a_number'], ['null', null, 'not_a_number'],
+    ['omitted', undefined, 'not_a_number'], ['an empty array', [], 'not_a_number'],
+    ['a boolean', true, 'not_a_number'], ['NaN as text', 'NaN', 'not_a_number'],
+    ['negative', -1, 'negative'], ['three decimals', 1.234, 'too_precise'],
+    ['above the column maximum', 99_999_999_999.99, 'too_large'],
+  ];
+  for (const [label, value, code] of badSkuCosts) {
+    const res = record(`E sku cost invalid ${label}`, await call('PUT', cogsLink.cookie, cogsUrl, {
+      method: 'per_sku', skus: [{ sku: 'C-SKU-3', cogs: value }],
+    }));
+    check(`E. a per-SKU cost that is ${label} is refused with 400`,
+      res.statusCode === 400, res.statusCode);
+    check(`E. and carries the stable ${code} code`, errOf(res) === code, res.body);
+    check(`E. no row was written for the rejected SKU (${label})`,
+      (await skuRowsOf(nCogs)).every((r) => r.sku !== 'C-SKU-3'));
+  }
+  const eZeroBare = record('E sku zero unconfirmed', await call('PUT', cogsLink.cookie, cogsUrl, {
+    method: 'per_sku', skus: [{ sku: 'C-SKU-3', cogs: 0 }],
+  }));
+  check('E. a zero per-SKU cost without confirmation is refused',
+    eZeroBare.statusCode === 400 && errOf(eZeroBare) === 'zero_unconfirmed', eZeroBare.body);
+  check('E. and blank was never quietly promoted into that confirmed zero',
+    (await skuRowsOf(nCogs)).every((r) => r.sku !== 'C-SKU-3'));
+  const eZeroOk = record('E sku zero confirmed', await call('PUT', cogsLink.cookie, cogsUrl, {
+    method: 'per_sku', skus: [{ sku: 'C-SKU-3', cogs: 0, zeroConfirmed: true }],
+  }));
+  check('E. a zero per-SKU cost IS accepted with the explicit confirmation',
+    eZeroOk.statusCode === 200, eZeroOk.body);
+  check('E. it is stored as a confirmed zero, distinguishable from absent',
+    (await skuRowsOf(nCogs)).find((r) => r.sku === 'C-SKU-3')?.cogs === '0.00'
+    && (await skuRowsOf(nCogs)).find((r) => r.sku === 'C-SKU-3')?.zero_confirmed === true);
+
+  const eDup1 = await call('PUT', cogsLink.cookie, cogsUrl, {
+    method: 'per_sku', skus: [{ sku: 'C-SKU-1', cogs: 99.99 }],
+  });
+  check('E. a duplicate write to the same SKU succeeds', eDup1.statusCode === 200, eDup1.body);
+  check('E. it UPDATED the one row rather than creating a second',
+    (await skuRowsOf(nCogs)).filter((r) => r.sku === 'C-SKU-1').length === 1
+    && (await skuRowsOf(nCogs)).find((r) => r.sku === 'C-SKU-1')?.cogs === '99.99');
+  check('E. and it did not disturb the other account\'s identically shaped data',
+    (await financialSnapshot(nB)) === bBaseline);
+
+  // --- E.C the inactive method's values are retained ----------------------
+  const eSkuSetBefore = JSON.stringify(await skuRowsOf(nCogs));
+  const eToBlended = record('E switch to blended',
+    await call('PUT', cogsLink.cookie, cogsUrl, { method: 'blended', blendedMarginPct: 44.4 }));
+  check('E. switching to blended succeeds', eToBlended.statusCode === 200, eToBlended.body);
+  check('E. the response says per-SKU values are retained but inactive',
+    /retained/i.test(String(jsonOf(eToBlended).note ?? '')), eToBlended.body);
+  check('E. every per-SKU row still exists, byte-for-byte',
+    JSON.stringify(await skuRowsOf(nCogs)) === eSkuSetBefore,
+    { before: eSkuSetBefore, after: JSON.stringify(await skuRowsOf(nCogs)) });
+  check('E. while blended is active the coverage read reports no active per-SKU cost',
+    ((jsonOf(await call('GET', cogsLink.cookie, '/onboarding/skus')).all as {
+      sku: string; cogs: number | null;
+    }[]) ?? []).every((r) => r.cogs === null));
+
+  const eBlendedUpdate = await call('PUT', cogsLink.cookie, cogsUrl,
+    { method: 'blended', blendedMarginPct: 51.75 });
+  check('E. the blended value can be updated while per-SKU stays retained',
+    eBlendedUpdate.statusCode === 200
+    && Number((await costs.getAccountCosts(nCogs)).blended_margin_pct) === 51.75
+    && JSON.stringify(await skuRowsOf(nCogs)) === eSkuSetBefore);
+
+  const eBackToSku = record('E switch back to per_sku',
+    await call('PUT', cogsLink.cookie, cogsUrl, { method: 'per_sku', skus: [] }));
+  check('E. switching back to per-SKU succeeds with no values resubmitted',
+    eBackToSku.statusCode === 200, eBackToSku.body);
+  check('E. the ORIGINAL per-SKU values are available again, unchanged',
+    JSON.stringify(await skuRowsOf(nCogs)) === eSkuSetBefore);
+  check('E. the coverage read now reports those costs as active again',
+    ((jsonOf(await call('GET', cogsLink.cookie, '/onboarding/skus')).all as {
+      sku: string; cogs: number | null;
+    }[]) ?? []).some((r) => r.sku === 'C-SKU-1' && r.cogs === 99.99));
+  check('E. the blended value ALSO remains stored while inactive',
+    Number((await costs.getAccountCosts(nCogs)).blended_margin_pct) === 51.75);
+  check('E. the response says blended is retained but inactive',
+    /retained/i.test(String(jsonOf(eBackToSku).note ?? '')), eBackToSku.body);
+  check('E. no method switch deleted the inactive value set',
+    (await skuRowsOf(nCogs)).length === 3
+    && (await costs.getAccountCosts(nCogs)).blended_margin_pct !== null);
+
+  // --- E.D reads are scoped to this account -------------------------------
+  const eSkus = record('E skus read', await call('GET', cogsLink.cookie, '/onboarding/skus'));
+  const eSkusBody = jsonOf(eSkus);
+  const eSkuNames = ((eSkusBody.all as { sku: string }[]) ?? []).map((r) => r.sku);
+  check('GET /onboarding/skus returns 200', eSkus.statusCode === 200, eSkus.statusCode);
+  check('E. it returns only this account\'s SKUs',
+    eSkuNames.every((s) => s.startsWith('C-SKU-')), eSkuNames);
+  check('E. no foreign account SKU appears', !eSkuNames.includes('B-SKU-1')
+    && !eSkuNames.some((s) => s.startsWith('A-SKU-')), eSkuNames);
+  check('E. it exposes the documented coverage shape and nothing more',
+    JSON.stringify(Object.keys(eSkusBody).sort())
+      === JSON.stringify(['all', 'cappedBelowTarget', 'costedRevenue', 'coveragePct',
+        'eligibleLineRevenue', 'missingSkus', 'required', 'unconfirmedZeroSkus']),
+    Object.keys(eSkusBody));
+  const eCosts = record('E costs read 2', await call('GET', cogsLink.cookie, '/onboarding/costs'));
+  check('GET /onboarding/costs returns 200', eCosts.statusCode === 200, eCosts.statusCode);
+  check('E. it exposes exactly costs + coverage',
+    JSON.stringify(Object.keys(jsonOf(eCosts)).sort()) === JSON.stringify(['costs', 'coverage']),
+    Object.keys(jsonOf(eCosts)));
+  check('E. neither read leaks an internal account or row identifier',
+    !/"account_?[Ii]d"\s*:/.test(eSkus.body) && !/"account_?[Ii]d"\s*:/.test(eCosts.body)
+    && !/"id"\s*:/.test(eSkus.body) && !/"id"\s*:/.test(eCosts.body));
+  check('E. and neither names the other workspace',
+    !eSkus.body.includes(nBName) && !eCosts.body.includes(nBName));
+
+  // --- E.E ORDINARY two-decimal amounts must be accepted ------------------
+  //
+  // ON ITS OWN FIXTURE ACCOUNT, so whatever it stores cannot perturb the
+  // retention assertions above.
+  //
+  // The precision rule every financial route advertises is "at most two decimal
+  // places", and the columns behind them are NUMERIC(12,2). The amounts below
+  // are canonical retail figures with exactly two decimals, so each must be
+  // storable through each route — as a JSON number and as the decimal string a
+  // browser form actually submits.
+  //
+  // They are asserted explicitly rather than assumed because the shared
+  // precision test is `Math.round(n * 100) === n * 100`, and `n * 100` is not
+  // exact in binary floating point for a large minority of two-decimal values:
+  // 19.99 * 100 is 1998.9999999999998, so the check reports "supports at most
+  // two decimal places" about a value that has exactly two.
+  const nPrec = await completable('5c3_precision');
+  for (let i = 1; i <= 2; i++) {
+    const o = await insertOrder(nPrec, monthsAgo(i), 1000, true);
+    await insertLineItem(nPrec, o, 7_950_000 + i, `P-SKU-${i}`, 1000);
+  }
+  const precLink = await mintAndExchange(app, agencyCookie, nPrec);
+  const CANONICAL_TWO_DECIMAL = [19.99, 20.01, 0.07, 1.13] as const;
+  for (const amount of CANONICAL_TWO_DECIMAL) {
+    for (const [shape, value] of [['number', amount], ['string', String(amount)]] as const) {
+      const asCogs = record(`E precision cogs ${shape} ${amount}`,
+        await call('PUT', precLink.cookie, cogsUrl, {
+          method: 'per_sku', skus: [{ sku: 'P-SKU-1', cogs: value }],
+        }));
+      check(`E. a per-SKU cost of ${amount} as a ${shape} — two decimals — is accepted`,
+        asCogs.statusCode === 200, { status: asCogs.statusCode, body: asCogs.body });
+
+      const asOcas = record(`E precision ocas ${shape} ${amount}`,
+        await call('PUT', precLink.cookie, '/onboarding/ocas', { ocasMonthly: value }));
+      check(`E. an OCAS of ${amount} as a ${shape} — two decimals — is accepted`,
+        asOcas.statusCode === 200, { status: asOcas.statusCode, body: asOcas.body });
+
+      const asSpend = record(`E precision spend ${shape} ${amount}`,
+        await call('PUT', precLink.cookie, '/onboarding/ad-spend', {
+          rows: [{ channel: 'Meta', amount: value, startMonth: monthsAgo(1), endMonth: monthsAgo(1) }],
+        }));
+      check(`E. an ad-spend amount of ${amount} as a ${shape} — two decimals — is accepted`,
+        asSpend.statusCode === 200, { status: asSpend.statusCode, body: asSpend.body });
+
+      const asMargin = record(`E precision margin ${shape} ${amount}`,
+        await call('PUT', precLink.cookie, cogsUrl,
+          { method: 'blended', blendedMarginPct: value }));
+      check(`E. a blended margin of ${amount} as a ${shape} — two decimals — is accepted`,
+        asMargin.statusCode === 200, { status: asMargin.statusCode, body: asMargin.body });
+    }
+  }
+
+  // =======================================================================
+  // F. OCAS
+  // =======================================================================
+  const nOcas = await completable('5c3_ocas');
+  const ocasLink = await mintAndExchange(app, agencyCookie, nOcas);
+  const ocasUrl = '/onboarding/ocas';
+
+  const fPositive = record('F ocas positive',
+    await call('PUT', ocasLink.cookie, ocasUrl, { ocasMonthly: 4200.75 }));
+  check('F. a positive monthly operating cost is accepted',
+    fPositive.statusCode === 200, fPositive.body);
+  check('F. it is stored exactly, to the cent',
+    (await query<{ o: string }>(
+      `SELECT ocas_monthly::text AS o FROM account_costs WHERE account_id = $1`, [nOcas],
+    )).rows[0].o === '4200.75');
+  check('F. and it is NOT flagged as a confirmed zero',
+    (await costs.getAccountCosts(nOcas)).ocas_zero_confirmed === false);
+  const fUpdate = await call('PUT', ocasLink.cookie, ocasUrl, { ocasMonthly: 5000 });
+  check('F. a valid update replaces only the intended account-level value',
+    fUpdate.statusCode === 200
+    && Number((await costs.getAccountCosts(nOcas)).ocas_monthly) === 5000
+    && (await financialSnapshot(nB)) === bBaseline);
+
+  const badOcas: [string, unknown, string][] = [
+    ['blank string', '', 'not_a_number'], ['whitespace only', '   ', 'not_a_number'],
+    ['a tab', '\t', 'not_a_number'], ['a newline', '\n', 'not_a_number'],
+    ['null', null, 'not_a_number'], ['omitted', undefined, 'not_a_number'],
+    ['an empty array', [], 'not_a_number'], ['a single-element array', [100], 'not_a_number'],
+    ['a boolean true', true, 'not_a_number'], ['a boolean false', false, 'not_a_number'],
+    ['an object', { amount: 100 }, 'not_a_number'],
+    ['NaN as text', 'NaN', 'not_a_number'], ['Infinity as text', 'Infinity', 'not_a_number'],
+    ['-Infinity as text', '-Infinity', 'not_a_number'],
+    ['negative', -1, 'negative'], ['three decimals', 10.001, 'too_precise'],
+    ['above the column maximum', 99_999_999_999.99, 'too_large'],
+  ];
+  for (const [label, value, code] of badOcas) {
+    const res = record(`F ocas invalid ${label}`,
+      await call('PUT', ocasLink.cookie, ocasUrl, { ocasMonthly: value }));
+    check(`F. an OCAS that is ${label} is refused with 400`, res.statusCode === 400, res.statusCode);
+    check(`F. and carries the stable ${code} code`, errOf(res) === code, res.body);
+    check(`F. the previously stored OCAS survived (${label})`,
+      Number((await costs.getAccountCosts(nOcas)).ocas_monthly) === 5000);
+  }
+  // The load-bearing one: blank + confirmedZero must NOT store a confirmed zero.
+  for (const blank of ['', '   ', '\t', null, undefined, []]) {
+    const res = record('F ocas blank with confirmation',
+      await call('PUT', ocasLink.cookie, ocasUrl, { ocasMonthly: blank, confirmedZero: true }));
+    check(`F. a blank OCAS with the zero box ticked is STILL refused (${JSON.stringify(blank)})`,
+      res.statusCode === 400 && errOf(res) === 'not_a_number', res.body);
+    check('F. and no confirmed zero was fabricated',
+      Number((await costs.getAccountCosts(nOcas)).ocas_monthly) === 5000
+      && (await costs.getAccountCosts(nOcas)).ocas_zero_confirmed === false);
+  }
+
+  const fZeroBare = record('F ocas zero unconfirmed',
+    await call('PUT', ocasLink.cookie, ocasUrl, { ocasMonthly: 0 }));
+  check('F. a zero OCAS without confirmation is refused with the stable code',
+    fZeroBare.statusCode === 400 && errOf(fZeroBare) === 'zero_unconfirmed', fZeroBare.body);
+  check('F. the refusal wrote nothing',
+    Number((await costs.getAccountCosts(nOcas)).ocas_monthly) === 5000);
+  const fZeroOk = record('F ocas zero confirmed',
+    await call('PUT', ocasLink.cookie, ocasUrl, { ocasMonthly: 0, confirmedZero: true }));
+  check('F. a zero OCAS IS accepted with the explicit confirmation',
+    fZeroOk.statusCode === 200 && jsonOf(fZeroOk).confirmedZero === true, fZeroOk.body);
+  check('F. a confirmed zero is distinguishable from unanswered',
+    Number((await costs.getAccountCosts(nOcas)).ocas_monthly) === 0
+    && (await costs.getAccountCosts(nOcas)).ocas_zero_confirmed === true
+    && (await costs.getAccountCosts(await completable('5c3_ocas_blank'))).ocas_monthly === null);
+  check('F. the confirmed zero clears the ocas_zero_unconfirmed readiness blocker path',
+    (await state.getRcmReadiness(nOcas)).blockers.every((b) => b.code !== 'ocas_zero_unconfirmed'),
+    (await state.getRcmReadiness(nOcas)).blockers.map((b) => b.code));
+  check('F. no COGS or ad-spend row changed while OCAS was being written',
+    (await skuRowsOf(nOcas)).length === 0 && (await spendRowsOf(nOcas)).length === 0
+    && (await zeroMonthsOf(nOcas)).length === 0);
+  check('F. the foreign account is still byte-for-byte unchanged',
+    (await financialSnapshot(nB)) === bBaseline);
+
+  // =======================================================================
+  // G. Positive ad spend
+  // =======================================================================
+  const nSpend = await completable('5c3_ad_spend');
+  for (let i = 1; i <= 5; i++) await insertOrder(nSpend, monthsAgo(i), 400, true);
+  const spendLink = await mintAndExchange(app, agencyCookie, nSpend);
+  const spendUrl = '/onboarding/ad-spend';
+
+  const gWrite = record('G spend write', await call('PUT', spendLink.cookie, spendUrl, {
+    rows: [{ channel: 'Meta', amount: 1234.56, startMonth: monthsAgo(1), endMonth: monthsAgo(1) }],
+  }));
+  check('G. valid positive spend is accepted', gWrite.statusCode === 200, gWrite.body);
+  check('G. exact decimal precision is retained',
+    (await spendRowsOf(nSpend)).find((r) => r.channel === 'Meta')?.spend === '1234.56',
+    await spendRowsOf(nSpend));
+  check('G. it is stored source-agnostically as manual',
+    (await spendRowsOf(nSpend)).every((r) => r.source === 'manual'));
+
+  const gRange = record('G spend range', await call('PUT', spendLink.cookie, spendUrl, {
+    rows: [{ channel: 'Google', amount: 100, startMonth: monthsAgo(4), endMonth: monthsAgo(2) }],
+  }));
+  check('G. a month RANGE expands to one row per month',
+    gRange.statusCode === 200 && jsonOf(gRange).monthsWritten === 3
+    && jsonOf(gRange).rowsWritten === 3, gRange.body);
+  check('G. and the expanded months are exactly the ones requested',
+    (await spendRowsOf(nSpend)).filter((r) => r.channel === 'Google').map((r) => r.month).join(',')
+      === [monthsAgo(4), monthsAgo(3), monthsAgo(2)].join(','),
+    (await spendRowsOf(nSpend)).filter((r) => r.channel === 'Google').map((r) => r.month));
+
+  const gChannels = record('G spend channels', await call('PUT', spendLink.cookie, spendUrl, {
+    rows: [{ channel: '  TikTok  ', amount: 50, startMonth: monthsAgo(1), endMonth: monthsAgo(1) }],
+  }));
+  check('G. a channel name is trimmed and stored normalized',
+    gChannels.statusCode === 200
+    && (await spendRowsOf(nSpend)).some((r) => r.channel === 'TikTok'), await spendRowsOf(nSpend));
+  check('G. two channels can coexist in the same month',
+    (await spendRowsOf(nSpend)).filter((r) => r.month === monthsAgo(1)).length === 2);
+
+  const badSpend: [string, unknown, string][] = [
+    ['blank string', '', 'not_a_number'], ['whitespace only', '   ', 'not_a_number'],
+    ['null', null, 'not_a_number'], ['omitted', undefined, 'not_a_number'],
+    ['an empty array', [], 'not_a_number'], ['a boolean', true, 'not_a_number'],
+    ['NaN as text', 'NaN', 'not_a_number'], ['Infinity as text', 'Infinity', 'not_a_number'],
+    ['negative', -10, 'negative'], ['three decimals', 1.005, 'too_precise'],
+    ['above the column maximum', 99_999_999_999.99, 'too_large'],
+  ];
+  for (const [label, value, code] of badSpend) {
+    const res = record(`G spend invalid ${label}`, await call('PUT', spendLink.cookie, spendUrl, {
+      rows: [{ channel: 'Meta', amount: value, startMonth: monthsAgo(1), endMonth: monthsAgo(1) }],
+    }));
+    check(`G. a spend amount that is ${label} is refused with 400`,
+      res.statusCode === 400, res.statusCode);
+    check(`G. and carries the stable ${code} code`, errOf(res) === code, res.body);
+  }
+  const gZero = record('G spend zero', await call('PUT', spendLink.cookie, spendUrl, {
+    rows: [{ channel: 'Meta', amount: 0, startMonth: monthsAgo(1), endMonth: monthsAgo(1) }],
+  }));
+  check('G. zero through the POSITIVE route is refused, not stored as a 0.00 row',
+    gZero.statusCode === 400, gZero.statusCode);
+  check('G. it carries the stable zero_requires_confirmation code',
+    errOf(gZero) === 'zero_requires_confirmation', gZero.body);
+  check('G. no zero-valued spend row was created',
+    (await spendRowsOf(nSpend)).every((r) => Number(r.spend) > 0), await spendRowsOf(nSpend));
+
+  const badShapes: [string, unknown, string][] = [
+    ['no rows key', undefined, 'no_rows'], ['an empty array', [], 'no_rows'],
+    ['not an array', { channel: 'Meta' }, 'no_rows'],
+  ];
+  for (const [label, rows, code] of badShapes) {
+    const res = record(`G spend shape ${label}`,
+      await call('PUT', spendLink.cookie, spendUrl, { rows }));
+    check(`G. a request with ${label} is refused with the stable ${code} code`,
+      res.statusCode === 400 && errOf(res) === code, res.body);
+  }
+  const gFuture = record('G spend future', await call('PUT', spendLink.cookie, spendUrl, {
+    rows: [{ channel: 'Meta', amount: 5, startMonth: monthsAgo(-1), endMonth: monthsAgo(-1) }],
+  }));
+  check('G. a future month is refused', gFuture.statusCode === 400
+    && errOf(gFuture) === 'future_month', gFuture.body);
+  const gBadMonth = record('G spend bad month', await call('PUT', spendLink.cookie, spendUrl, {
+    rows: [{ channel: 'Meta', amount: 5, startMonth: 'last-month', endMonth: monthsAgo(1) }],
+  }));
+  check('G. a malformed month is refused', gBadMonth.statusCode === 400
+    && errOf(gBadMonth) === 'bad_month', gBadMonth.body);
+
+  const gExistingBefore = JSON.stringify(await spendRowsOf(nSpend));
+  await call('PUT', spendLink.cookie, spendUrl, {
+    rows: [{ channel: 'Meta', amount: 4321, startMonth: monthsAgo(1), endMonth: monthsAgo(1) }],
+  });
+  check('G. updating one channel-month left every unrelated month and channel intact',
+    (await spendRowsOf(nSpend)).filter((r) => !(r.channel === 'Meta' && r.month === monthsAgo(1)))
+      .map((r) => `${r.month}|${r.channel}|${r.spend}`).join(',')
+      === JSON.parse(gExistingBefore)
+        .filter((r: { channel: string; month: string }) =>
+          !(r.channel === 'Meta' && r.month === monthsAgo(1)))
+        .map((r: { month: string; channel: string; spend: string }) =>
+          `${r.month}|${r.channel}|${r.spend}`).join(','));
+  check('G. one account still cannot write spend for another',
+    (await financialSnapshot(nB)) === bBaseline);
+
+  // --- G. transactional exclusivity: positive spend clears a zero month ---
+  const gExcl = monthsAgo(5);
+  await call('POST', spendLink.cookie, '/onboarding/ad-spend/zero',
+    { months: [gExcl], confirmedZero: true });
+  check('G. the exclusivity fixture starts as a confirmed zero month',
+    (await zeroMonthsOf(nSpend)).includes(gExcl)
+    && (await spendRowsOf(nSpend)).every((r) => r.month !== gExcl));
+  const gFlip = record('G spend over zero', await call('PUT', spendLink.cookie, spendUrl, {
+    rows: [{ channel: 'Meta', amount: 300, startMonth: gExcl, endMonth: gExcl }],
+  }));
+  check('G. writing positive spend for a zero-declared month succeeds',
+    gFlip.statusCode === 200, gFlip.body);
+  check('G. the response reports the zero confirmation it cleared',
+    jsonOf(gFlip).zeroConfirmationsCleared === 1, gFlip.body);
+  check('G. after success the month has positive spend and NO zero declaration',
+    (await spendRowsOf(nSpend)).some((r) => r.month === gExcl && Number(r.spend) === 300)
+    && !(await zeroMonthsOf(nSpend)).includes(gExcl));
+  check('G. no contradictory state remains for that month',
+    !((jsonOf(gFlip).coverage as { contradictoryMonths: string[] })?.contradictoryMonths ?? [])
+      .includes(gExcl), jsonOf(gFlip).coverage);
+
+  // =======================================================================
+  // H. Zero ad spend — POST /onboarding/ad-spend/zero
+  // =======================================================================
+  const nZero = await completable('5c3_zero_spend');
+  for (let i = 1; i <= 6; i++) await insertOrder(nZero, monthsAgo(i), 300, true);
+  const zeroLink = await mintAndExchange(app, agencyCookie, nZero);
+  const zeroUrl = '/onboarding/ad-spend/zero';
+  const mFresh = monthsAgo(1);
+  const mPositive = monthsAgo(2);
+  const mUnrelated = monthsAgo(3);
+
+  // --- H.A a new zero declaration ----------------------------------------
+  const hUnconfirmed = record('H zero unconfirmed',
+    await call('POST', zeroLink.cookie, zeroUrl, { months: [mFresh] }));
+  check('H. a zero declaration without confirmedZero is refused',
+    hUnconfirmed.statusCode === 400 && errOf(hUnconfirmed) === 'zero_unconfirmed',
+    hUnconfirmed.body);
+  const hNoMonths = record('H zero no months',
+    await call('POST', zeroLink.cookie, zeroUrl, { confirmedZero: true, months: [] }));
+  check('H. a zero declaration naming no month is refused',
+    hNoMonths.statusCode === 400 && errOf(hNoMonths) === 'months_required', hNoMonths.body);
+  const hReplaceOnly = record('H zero replace only',
+    await call('POST', zeroLink.cookie, zeroUrl, { months: [mFresh], replace: true }));
+  check('H. replace:true alone does not satisfy the zero confirmation',
+    hReplaceOnly.statusCode === 400 && errOf(hReplaceOnly) === 'zero_unconfirmed',
+    hReplaceOnly.body);
+
+  const hNew = record('H zero new',
+    await call('POST', zeroLink.cookie, zeroUrl, { months: [mFresh], confirmedZero: true }));
+  check('H. a month with no spend can be explicitly confirmed as zero',
+    hNew.statusCode === 200, hNew.body);
+  check('H. no fake ad_spend row was created',
+    (await spendRowsOf(nZero)).every((r) => r.month !== mFresh), await spendRowsOf(nZero));
+  check('H. an ad_spend_zero_months row WAS created',
+    (await zeroMonthsOf(nZero)).includes(mFresh), await zeroMonthsOf(nZero));
+  const hCov = jsonOf(hNew).coverage as { coveredMonths: string[]; missingMonths: string[] };
+  check('H. the month is now answered — covered, not missing',
+    hCov.coveredMonths.includes(mFresh) && !hCov.missingMonths.includes(mFresh), hCov);
+  check('H. blank/unanswered and a confirmed zero remain distinct states',
+    hCov.missingMonths.includes(mUnrelated) && !(await zeroMonthsOf(nZero)).includes(mUnrelated),
+    hCov.missingMonths);
+
+  // --- H.B existing positive spend: the first refusal ---------------------
+  await call('PUT', zeroLink.cookie, '/onboarding/ad-spend', {
+    rows: [
+      { channel: 'Meta', amount: 900.5, startMonth: mPositive, endMonth: mPositive },
+      { channel: 'Google', amount: 100.25, startMonth: mPositive, endMonth: mPositive },
+      { channel: 'Meta', amount: 555, startMonth: mUnrelated, endMonth: mUnrelated },
+    ],
+  });
+  const hBefore = JSON.stringify(await spendRowsOf(nZero));
+  const hZeroList = JSON.stringify(await zeroMonthsOf(nZero));
+  const hClash = record('H zero requires_replace',
+    await call('POST', zeroLink.cookie, zeroUrl, { months: [mPositive], confirmedZero: true }));
+  check('H. confirming zero over existing spend is refused with 409',
+    hClash.statusCode === 409, hClash.statusCode);
+  check('H. it carries the stable requires_replace code',
+    errOf(hClash) === 'requires_replace', hClash.body);
+  check('H. the refusal names the clashing month so the client can decide',
+    JSON.stringify(jsonOf(hClash).months) === JSON.stringify([mPositive]), hClash.body);
+  check('H. the positive spend is completely unchanged',
+    JSON.stringify(await spendRowsOf(nZero)) === hBefore,
+    { before: hBefore, after: JSON.stringify(await spendRowsOf(nZero)) });
+  check('H. no zero declaration was created for the clashing month',
+    JSON.stringify(await zeroMonthsOf(nZero)) === hZeroList);
+  check('H. no unrelated month or channel was changed',
+    (await spendRowsOf(nZero)).some((r) => r.month === mUnrelated && r.spend === '555.00'));
+  check('H. the refusal carries no SQL, stack or internal identifier',
+    !/SELECT |INSERT |DELETE |node_modules|\/Users\/|"id"\s*:|"account_?[Ii]d"\s*:/.test(hClash.body),
+    hClash.body);
+
+  // --- H.C explicit replacement ------------------------------------------
+  const hReplace = record('H zero replace', await call('POST', zeroLink.cookie, zeroUrl, {
+    months: [mPositive], confirmedZero: true, replace: true,
+  }));
+  check('H. replacement succeeds only after that explicit second decision',
+    hReplace.statusCode === 200, hReplace.body);
+  check('H. it reports how many spend rows it removed',
+    jsonOf(hReplace).spendRowsRemoved === 2, hReplace.body);
+  check('H. only the selected month\'s spend was removed',
+    (await spendRowsOf(nZero)).every((r) => r.month !== mPositive), await spendRowsOf(nZero));
+  check('H. the zero declaration was inserted for that month',
+    (await zeroMonthsOf(nZero)).includes(mPositive));
+  check('H. unrelated positive-spend months and channels are untouched',
+    (await spendRowsOf(nZero)).some((r) => r.month === mUnrelated && r.channel === 'Meta'
+      && r.spend === '555.00'), await spendRowsOf(nZero));
+  check('H. no silent or broad deletion occurred — the other month survives',
+    (await spendRowsOf(nZero)).length === 1, await spendRowsOf(nZero));
+  check('H. and the foreign account lost nothing to the replacement',
+    (await financialSnapshot(nB)) === bBaseline);
+
+  // --- H.D reverse transition --------------------------------------------
+  const hReverse = record('H zero reverse', await call('PUT', zeroLink.cookie, '/onboarding/ad-spend', {
+    rows: [{ channel: 'Meta', amount: 42.5, startMonth: mPositive, endMonth: mPositive }],
+  }));
+  check('H. positive spend can be written back over a zero month',
+    hReverse.statusCode === 200, hReverse.body);
+  check('H. the positive spend exists',
+    (await spendRowsOf(nZero)).some((r) => r.month === mPositive && r.spend === '42.50'));
+  check('H. the zero declaration was removed in the same transaction',
+    !(await zeroMonthsOf(nZero)).includes(mPositive)
+    && jsonOf(hReverse).zeroConfirmationsCleared === 1, hReverse.body);
+  check('H. the two states never survive together',
+    ((jsonOf(hReverse).coverage as { contradictoryMonths: string[] }).contradictoryMonths).length === 0,
+    jsonOf(hReverse).coverage);
+
+  // --- H.E idempotency ----------------------------------------------------
+  const hIdemBefore = (await zeroMonthsOf(nZero)).length;
+  const hSpendBefore = JSON.stringify(await spendRowsOf(nZero));
+  const hRepeat = record('H zero repeat',
+    await call('POST', zeroLink.cookie, zeroUrl, { months: [mFresh], confirmedZero: true }));
+  check('H. repeating an already-valid zero declaration succeeds',
+    hRepeat.statusCode === 200, hRepeat.body);
+  check('H. it created no duplicate row',
+    (await zeroMonthsOf(nZero)).length === hIdemBefore
+    && (await zeroMonthsOf(nZero)).filter((m) => m === mFresh).length === 1);
+  check('H. and altered no unrelated data',
+    JSON.stringify(await spendRowsOf(nZero)) === hSpendBefore);
+  const hBadMonth = record('H zero bad month',
+    await call('POST', zeroLink.cookie, zeroUrl, { months: ['2026-13'], confirmedZero: true }));
+  check('H. an out-of-range month is refused with the stable bad_month code',
+    hBadMonth.statusCode === 400 && errOf(hBadMonth) === 'bad_month', hBadMonth.body);
+
+  // =======================================================================
+  // I. Contradictory-state defence
+  // =======================================================================
+  const nContra = await makeAccount('5c3_contradictory');
+  await seedConnectedProvider(nContra, 'shopify', `5c3-contra-${Date.now()}.myshopify.com`);
+  await choices.setSkipped(nContra, 'klaviyo');
+  await choices.setSkipped(nContra, 'recharge');
+  for (let i = 1; i <= 3; i++) {
+    const o = await insertOrder(nContra, monthsAgo(i), 1000, true);
+    await insertLineItem(nContra, o, 7_930_000 + i, `X-SKU-${i}`, 1000);
+  }
+  await query(`UPDATE accounts SET currency = 'USD', currency_source = 'manual' WHERE id = $1`,
+    [nContra]);
+  const contraLink = await mintAndExchange(app, agencyCookie, nContra);
+  const mContra = monthsAgo(1);
+
+  const iCleanCodes = await rcmCodes(contraLink.cookie);
+  check('I. before the fixture, no contradiction is reported',
+    !iCleanCodes.includes('contradictory_ad_spend_state'), iCleanCodes);
+  const iOnbBefore = await onbCodes(contraLink.cookie);
+
+  // The impossible state, built with test-owned direct writes only. The routes
+  // above have just proven they cannot produce it.
+  await query(
+    `INSERT INTO ad_spend (account_id, month, channel, spend, source)
+     VALUES ($1, $2, '5c3-forced', 500, 'manual')`, [nContra, mContra]);
+  await query(
+    `INSERT INTO ad_spend_zero_months (account_id, month) VALUES ($1, $2)
+     ON CONFLICT (account_id, month) DO NOTHING`, [nContra, mContra]);
+  check('I. fixture precondition: both states exist for the same account-month',
+    (await spendRowsOf(nContra)).some((r) => r.month === mContra)
+    && (await zeroMonthsOf(nContra)).includes(mContra));
+
+  const iMe = await meBody(contraLink.cookie);
+  const iCodes = (iMe.rcmBlockers as { code: string; detail?: Record<string, unknown> }[]);
+  check('I. RCM readiness reports the existing contradictory_ad_spend_state blocker',
+    iCodes.some((b) => b.code === 'contradictory_ad_spend_state'), iCodes.map((b) => b.code));
+  check('I. the blocker names the offending month',
+    ((iCodes.find((b) => b.code === 'contradictory_ad_spend_state')?.detail?.months) as string[])
+      ?.includes(mContra),
+    iCodes.find((b) => b.code === 'contradictory_ad_spend_state')?.detail);
+  const iSpendRead = record('I contradictory ad-spend read',
+    await call('GET', contraLink.cookie, '/onboarding/ad-spend'));
+  check('I. the client ad-spend read reports the month as contradictory',
+    ((jsonOf(iSpendRead).coverage as { contradictoryMonths: string[] }).contradictoryMonths)
+      .includes(mContra), jsonOf(iSpendRead).coverage);
+  check('I. coverage is not reported complete while a contradiction stands',
+    (jsonOf(iSpendRead).coverage as { complete: boolean }).complete === false);
+  check('I. basic onboarding completion semantics stay separate and unaffected',
+    JSON.stringify(await onbCodes(contraLink.cookie)) === JSON.stringify(iOnbBefore),
+    { before: iOnbBefore, after: await onbCodes(contraLink.cookie) });
+  check('I. the two blocker lists remain separate arrays with disjoint vocabularies',
+    Array.isArray(iMe.onboardingBlockers) && Array.isArray(iMe.rcmBlockers)
+    && !(iMe.onboardingBlockers as { code: string }[])
+      .some((b) => b.code === 'contradictory_ad_spend_state'));
+  check('I. no client route silently hid or auto-repaired the contradiction',
+    (await spendRowsOf(nContra)).some((r) => r.month === mContra)
+    && (await zeroMonthsOf(nContra)).includes(mContra));
+  check('I. the contradictory response exposes no raw database detail',
+    !/SELECT |INSERT |ON CONFLICT|pg_|relation |node_modules|\/Users\//.test(iSpendRead.body),
+    iSpendRead.body.slice(0, 240));
+
+  // The blocker is DERIVED: removing the offending row clears it with no flag write.
+  await query(`DELETE FROM ad_spend WHERE account_id = $1 AND channel = '5c3-forced'`, [nContra]);
+  await query(`DELETE FROM ad_spend_zero_months WHERE account_id = $1 AND month = $2`,
+    [nContra, mContra]);
+  check('I. the fixture was cleaned up exactly',
+    (await spendRowsOf(nContra)).length === 0 && (await zeroMonthsOf(nContra)).length === 0);
+  check('I. and the blocker cleared itself — it is derived, never a stored flag',
+    !(await rcmCodes(contraLink.cookie)).includes('contradictory_ad_spend_state'),
+    await rcmCodes(contraLink.cookie));
+
+  // =======================================================================
+  // J. Manage-mode financial access
+  // =======================================================================
+  const nManage = await completable('5c3_manage');
+  for (let i = 1; i <= 3; i++) {
+    const o = await insertOrder(nManage, monthsAgo(i), 800, true);
+    await insertLineItem(nManage, o, 7_940_000 + i, `M-SKU-${i}`, 800);
+  }
+  const manageLink = await mintAndExchange(app, agencyCookie, nManage);
+  const agencyComplete = (id: number) => app.inject({
+    method: 'POST', url: `/accounts/${id}/onboarding/complete`,
+    headers: { cookie: agencyCookie }, remoteAddress: nextIp(), payload: {},
+  });
+  check('J. the agency route completed the account', (await agencyComplete(nManage)).statusCode === 200);
+  const jMe = await meBody(manageLink.cookie);
+  check('J. the same link is now in restricted manage mode, without re-exchange',
+    jMe.manageMode === true && jMe.onboardingComplete === true, jMe);
+  check('J. and it does not claim THIS link completed anything',
+    jMe.completedByThisLink === false, jMe);
+
+  fetchLog = [];
+  const jLinkBefore = await linkLifecycleSnapshot(nManage);
+  const jConnBefore = await tableSnapshot('connections', nManage);
+  const jChoiceBefore = await tableSnapshot('onboarding_provider_choices', nManage);
+
+  const jAllowed: [string, 'GET' | 'PUT' | 'POST', string, unknown][] = [
+    ['currency update', 'PUT', '/onboarding/currency', { currency: 'usd' }],
+    ['COGS update', 'PUT', '/onboarding/cogs', { method: 'per_sku', skus: [{ sku: 'M-SKU-1', cogs: 11.11 }] }],
+    ['OCAS update', 'PUT', '/onboarding/ocas', { ocasMonthly: 2500.5 }],
+    ['positive ad spend', 'PUT', '/onboarding/ad-spend', {
+      rows: [{ channel: 'Meta', amount: 600, startMonth: monthsAgo(1), endMonth: monthsAgo(1) }],
+    }],
+    ['zero ad spend confirmation', 'POST', '/onboarding/ad-spend/zero', {
+      months: [monthsAgo(3)], confirmedZero: true,
+    }],
+    ['GET /onboarding/skus', 'GET', '/onboarding/skus', undefined],
+    ['GET /onboarding/costs', 'GET', '/onboarding/costs', undefined],
+    ['GET /onboarding/ad-spend', 'GET', '/onboarding/ad-spend', undefined],
+  ];
+  for (const [label, method, url, payload] of jAllowed) {
+    const res = record(`J ${label}`, await call(method, manageLink.cookie, url, payload));
+    check(`J. ${label} is permitted in manage mode`, res.statusCode === 200,
+      { status: res.statusCode, body: res.body });
+    check(`J. ${label} needed no token re-exchange — no new cookie was issued`,
+      res.headers['set-cookie'] === undefined, res.headers['set-cookie']);
+  }
+  check('J. the manage-mode writes really persisted',
+    (await currency.getCurrencyState(nManage))?.currency === 'USD'
+    && Number((await costs.getAccountCosts(nManage)).ocas_monthly) === 2500.5
+    && (await skuRowsOf(nManage)).some((r) => r.sku === 'M-SKU-1' && r.cogs === '11.11')
+    && (await spendRowsOf(nManage)).some((r) => r.channel === 'Meta' && r.spend === '600.00')
+    && (await zeroMonthsOf(nManage)).includes(monthsAgo(3)));
+  check('J. no provider was contacted and no queue job was created',
+    await noProviderSideEffects(nManage), fetchLog.map((f) => f.url));
+  check('J. no provider credential, connection or choice changed',
+    (await tableSnapshot('connections', nManage)) === jConnBefore
+    && (await tableSnapshot('onboarding_provider_choices', nManage)) === jChoiceBefore);
+  check('J. link expiry, revocation and completed_at were never stamped by a financial write',
+    (await linkLifecycleSnapshot(nManage)) === jLinkBefore,
+    { before: jLinkBefore, after: await linkLifecycleSnapshot(nManage) });
+  check('J. and completed_at is still null — a saved value is not a completion',
+    (await links.getLinkById(manageLink.linkId))?.completed_at === null);
+  check('J. the manage-mode allowlist was not widened by this group',
+    manageMode.CLIENT_ONBOARDING_ACTIONS.filter((a) => manageMode.isAllowedInManageMode(a)).length
+      === manageMode.CLIENT_ONBOARDING_ACTIONS.length);
+
+  // Shopify-authoritative currency stays refused in manage mode.
+  await currency.applyShopifyCurrency(nManage, 'USD');
+  const jShopRefusal = record('J manage shopify currency',
+    await call('PUT', manageLink.cookie, '/onboarding/currency', { currency: 'CAD' }));
+  check('J. Shopify-authoritative currency remains refused in manage mode',
+    jShopRefusal.statusCode === 400 && errOf(jShopRefusal) === 'shopify_authoritative',
+    jShopRefusal.body);
+  check('J. and the stored currency did not move',
+    (await currency.getCurrencyState(nManage))?.currency === 'USD');
+  check('J. currency mismatch resolution remains unavailable to the client',
+    (await call('POST', manageLink.cookie,
+      `/accounts/${nManage}/currency/resolve-mismatch`)).statusCode === 401);
+
+  // Revocation ends the manage-mode financial surface on the next request.
+  const jRevokeSnapshot = await financialSnapshot(nManage);
+  await app.inject({
+    method: 'DELETE', url: `/accounts/${nManage}/onboarding-links/${manageLink.linkId}`,
+    headers: { cookie: agencyCookie }, remoteAddress: nextIp(),
+  });
+  for (const [, method, url, payload] of jAllowed) {
+    const res = await call(method, manageLink.cookie, url, payload);
+    check(`J. revocation ends ${method} ${url} on the very next request`,
+      res.statusCode === 401, res.statusCode);
+  }
+  check('J. the revoked attempts wrote nothing',
+    (await financialSnapshot(nManage)) === jRevokeSnapshot);
+
+  const nExpired = await completable('5c3_manage_expired');
+  const expiredLink = await mintAndExchange(app, agencyCookie, nExpired);
+  await agencyComplete(nExpired);
+  check('J. the expiry fixture works while live',
+    (await call('PUT', expiredLink.cookie, '/onboarding/ocas', { ocasMonthly: 10 })).statusCode === 200);
+  await query(`UPDATE onboarding_links SET expires_at = now() - interval '1 second' WHERE id = $1`,
+    [expiredLink.linkId]);
+  const jExpiredSnapshot = await financialSnapshot(nExpired);
+  for (const [, method, url, payload] of jAllowed) {
+    const res = await call(method, expiredLink.cookie, url, payload);
+    check(`J. expiry ends ${method} ${url} on the very next request`,
+      res.statusCode === 401, res.statusCode);
+  }
+  check('J. the expired attempts wrote nothing',
+    (await financialSnapshot(nExpired)) === jExpiredSnapshot);
+
+  // =======================================================================
+  // K. Completion and readiness separation
+  // =======================================================================
+  const nSep = await completable('5c3_separation');
+  const sepLink = await mintAndExchange(app, agencyCookie, nSep);
+  const kInitial = await meBody(sepLink.cookie);
+  check('K. an account with NO financial input at all can already complete',
+    (kInitial.onboardingBlockers as unknown[]).length === 0, kInitial.onboardingBlockers);
+  check('K. while RCM readiness is separately blocked',
+    kInitial.rcmReady === false
+    && (kInitial.rcmBlockers as { code: string }[]).some((b) => b.code === 'shopify_not_connected'),
+    kInitial.rcmBlockers);
+  check('K. financial inputs are absent from the completion blocker vocabulary',
+    (kInitial.onboardingBlockers as { code: string }[])
+      .every((b) => !/cogs|ocas|ad_spend|currency/.test(b.code)));
+  check('K. and no financial row exists for the account that just qualified',
+    !(await hasAnyFinancialInput(nSep)));
+
+  const kComplete = record('K client completion',
+    await call('POST', sepLink.cookie, '/onboarding/complete', {}));
+  check('K. completion succeeds with no cost figures present',
+    kComplete.statusCode === 200 && jsonOf(kComplete).completed === true, kComplete.body);
+  check('K. and the response still reports RCM as not ready',
+    jsonOf(kComplete).rcmReady === false, kComplete.body);
+
+  const kProvidersBefore = await tableSnapshot('connections', nSep);
+  const kChoicesBefore = await tableSnapshot('onboarding_provider_choices', nSep);
+  for (const [, method, url, payload] of [
+    ['', 'PUT', '/onboarding/currency', { currency: 'USD' }],
+    ['', 'PUT', '/onboarding/ocas', { ocasMonthly: 100 }],
+    ['', 'PUT', '/onboarding/cogs', { method: 'blended', blendedMarginPct: 40 }],
+  ] as [string, 'PUT', string, unknown][]) {
+    check(`K. ${url} is still writable after completion`,
+      (await call(method, sepLink.cookie, url, payload)).statusCode === 200);
+  }
+  const kAfter = await meBody(sepLink.cookie);
+  check('K. changing financial inputs did not clear onboarding_complete',
+    kAfter.onboardingComplete === true && (await state.isOnboardingComplete(nSep)) === true);
+  check('K. onboarding_complete remains a historical latch once set',
+    (await state.isOnboardingComplete(nSep)) === true);
+  check('K. adding financial inputs did not falsely connect any provider',
+    (await tableSnapshot('connections', nSep)) === kProvidersBefore
+    && (await tableSnapshot('onboarding_provider_choices', nSep)) === kChoicesBefore);
+  check('K. and no provider is reported connected that was not before',
+    (kAfter.providers as { provider: string; state: string }[])
+      .filter((p) => p.state === 'connected').map((p) => p.provider).join(',') === 'klaviyo',
+    kAfter.providers);
+  check('K. the two blocker lists are still reported separately',
+    Array.isArray(kAfter.onboardingBlockers) && Array.isArray(kAfter.rcmBlockers)
+    && (kAfter.onboardingBlockers as unknown[]).length === 0
+    && (kAfter.rcmBlockers as unknown[]).length > 0);
+  check('K. RCM readiness changed independently as financial blockers were satisfied',
+    !(kAfter.rcmBlockers as { code: string }[]).some((b) => b.code === 'ocas_missing')
+      || (kAfter.rcmBlockers as { code: string }[]).some((b) => b.code === 'shopify_not_connected'),
+    (kAfter.rcmBlockers as { code: string }[]).map((b) => b.code));
+
+  // A currency mismatch is an RCM concern only — it never reverts completion.
+  await agencyComplete(dMm);
+  check('K. the mismatched account can still complete basic onboarding',
+    await state.isOnboardingComplete(dMm));
+  const kMmMe = await meBody(dMmLink.cookie);
+  check('K. a currency mismatch never reverts basic onboarding completion',
+    kMmMe.onboardingComplete === true
+    && (kMmMe.onboardingBlockers as unknown[]).length === 0, kMmMe.onboardingBlockers);
+  check('K. it appears only in the RCM list',
+    (kMmMe.rcmBlockers as { code: string }[]).some((b) => b.code === 'currency_mismatch')
+    && !(kMmMe.onboardingBlockers as { code: string }[])
+      .some((b) => b.code === 'currency_mismatch'));
+
+  // =======================================================================
+  // L. Response hygiene and side-effect freedom
+  // =======================================================================
+  fetchLog = [];
+  const lProbeAccount = await completable('5c3_hygiene');
+  const lProbeLink = await mintAndExchange(app, agencyCookie, lProbeAccount);
+  // An unknown, credential-shaped field alongside a valid value: the handler
+  // ignores it, and nothing may echo it back.
+  const lEcho = record('L ignored extra field',
+    await call('PUT', lProbeLink.cookie, '/onboarding/ocas',
+      { ocasMonthly: 250, apiKey: N_SYNTHETIC_SECRET, clientSecret: N_SYNTHETIC_SECRET }));
+  check('L. an ignored credential-shaped field does not break the write',
+    lEcho.statusCode === 200, lEcho.body);
+  check('L. and the submitted synthetic secret is never echoed',
+    !lEcho.body.includes(N_SYNTHETIC_SECRET), lEcho.body);
+  check('L. nor is it stored anywhere on the account',
+    !(await financialSnapshot(lProbeAccount)).includes(N_SYNTHETIC_SECRET));
+  const lEchoBad = record('L ignored extra field on refusal',
+    await call('PUT', lProbeLink.cookie, '/onboarding/ocas',
+      { ocasMonthly: '', apiKey: N_SYNTHETIC_SECRET }));
+  check('L. a REFUSAL does not echo it either',
+    lEchoBad.statusCode === 400 && !lEchoBad.body.includes(N_SYNTHETIC_SECRET), lEchoBad.body);
+
+  for (const [label, raw] of collected) {
+    for (const re of N_FORBIDDEN_KEYS) {
+      check(`L. ${label}: carries no ${re.source} key`, !re.test(raw), raw.slice(0, 240));
+    }
+    for (const needle of N_FORBIDDEN_TEXT) {
+      check(`L. ${label}: carries no "${needle}"`, !raw.includes(needle));
+    }
+    check(`L. ${label}: carries no embedded stack frame`, !/\\n\s*at /.test(raw));
+    check(`L. ${label}: names no foreign workspace`,
+      !raw.includes(nBName) && !raw.includes(nAName) || label.startsWith('B '),
+      raw.slice(0, 240));
+  }
+  check('L. every collected response is valid JSON with no trailing diagnostic text',
+    collected.every(([, raw]) => { try { JSON.parse(raw); return true; } catch { return false; } }),
+    collected.filter(([, raw]) => { try { JSON.parse(raw); return false; } catch { return true; } })
+      .map(([l]) => l));
+  check('L. no financial call contacted a provider API',
+    fetchLog.length === 0, fetchLog.map((f) => f.url));
+  check('L. no financial call enqueued a job for any 5C-3 fixture account',
+    (await Promise.all([nA, nB, nCogs, nOcas, nSpend, nZero, nContra, nManage, nSep]
+      .map((id) => noProviderSideEffects(id)))).every(Boolean));
+  check('L. no .env credential leaked while this group ran',
+    envCredentialLeaked() === null, envCredentialLeaked());
+}
+
+// ===========================================================================
 // Main
 // ===========================================================================
 
@@ -5095,6 +6581,7 @@ async function main(): Promise<void> {
     await groupK(app, agencyCookie);
     await groupL(app, agencyCookie);
     await groupM(app, agencyCookie);
+    await groupN(app, agencyCookie);
   } finally {
     console.log('\nCleanup');
     await cleanupAccounts();
@@ -5169,6 +6656,7 @@ async function main(): Promise<void> {
     I: 'Fastify 5 regressions', J: 'Agency API hardening',
     K: 'Agency completion (5B-2G)', L: 'Manage mode (5C-1)',
     M: 'Provider requests (5C-2)',
+    N: 'Client financials (5C-3)',
   };
   for (const [letter, t] of Object.entries(groupTotals)) {
     const mark = t.fail === 0 ? '✓' : '✗';
